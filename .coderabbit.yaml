@@ -1,0 +1,43 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+
+language: "en-US"
+early_access: false
+
+reviews:
+  profile: "chill"
+  request_changes_workflow: false
+  high_level_summary: true
+  review_status: true
+  review_details: false
+  auto_review:
+    enabled: true
+    drafts: false
+  path_filters:
+    - "!Package.resolved"
+    - "!Resources/*.icns"
+  path_instructions:
+    - path: "Sources/**/*.swift"
+      instructions: |
+        Focus on correctness under Swift 6 strict concurrency, actor isolation,
+        Sendable boundaries, and keeping blocking work off the main actor.
+        Flag unsafe persistence, process, network, or filesystem behavior and
+        violations of macOS privacy or sandbox expectations.
+    - path: "Tests/**/*.swift"
+      instructions: |
+        Check that tests are deterministic, isolate global state and user
+        defaults, clean up temporary files and ports, and cover failure paths.
+    - path: "BrowserExtension/**"
+      instructions: |
+        Treat browser data as sensitive. Flag unnecessary permissions,
+        untrusted-message handling, page-data leakage, or native-messaging
+        behavior that bypasses the documented opt-in and token boundaries.
+    - path: ".github/workflows/**"
+      instructions: |
+        Check least-privilege permissions, secret handling, pinned tool inputs,
+        shell injection risks, and reproducible build and release behavior.
+  tools:
+    swiftlint:
+      enabled: true
+
+chat:
+  auto_reply: true
