@@ -1,0 +1,213 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build, notarize, and publish
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      DEVELOPER_ID_CERTIFICATE_BASE64: ${{ secrets.DEVELOPER_ID_CERTIFICATE_BASE64 }}
+      DEVELOPER_ID_CERTIFICATE_PASSWORD: ${{ secrets.DEVELOPER_ID_CERTIFICATE_PASSWORD }}
+      APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+      NOTARY_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+      NOTARY_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+      SPARKLE_PUBLIC_ED_KEY: ${{ vars.SPARKLE_PUBLIC_ED_KEY }}
+      SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+      SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+      SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+      SENTRY_ORG: ${{ vars.SENTRY_ORG }}
+      SENTRY_PROJECT: ${{ vars.SENTRY_PROJECT }}
+      SENTRY_ENVIRONMENT: production
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Derive release metadata
+        shell: zsh {0}
+        run: |
+          set -euo pipefail
+          release_version="${GITHUB_REF_NAME#v}"
+          if [[ ! "$release_version" =~ '^[0-9]+[.][0-9]+[.][0-9]+$' ]]; then
+            print -u2 -r -- "Invalid release tag: ${GITHUB_REF_NAME}"
+            exit 1
+          fi
+          version_parts=(${(s:.:)release_version})
+          for version_part in "${version_parts[@]}"; do
+            if (( version_part > 999 )); then
+              print -u2 -r -- "Version components must not exceed 999"
+              exit 1
+            fi
+          done
+          build_number=$((
+            version_parts[1] * 1000000
+            + version_parts[2] * 1000
+            + version_parts[3]
+          ))
+
+          repository_url="https://github.com/${GITHUB_REPOSITORY}"
+          print -r -- "RELEASE_VERSION=${release_version}" >> "$GITHUB_ENV"
+          print -r -- "BUILD_NUMBER=${build_number}" >> "$GITHUB_ENV"
+          print -r -- "RELEASE_TAG=${GITHUB_REF_NAME}" >> "$GITHUB_ENV"
+          print -r -- "SPARKLE_FEED_URL=${repository_url}/releases/latest/download/appcast.xml" >> "$GITHUB_ENV"
+          print -r -- "DOWNLOAD_URL_PREFIX=${repository_url}/releases/download/${GITHUB_REF_NAME}/" >> "$GITHUB_ENV"
+          print -r -- "RELEASE_NOTES_URL=${repository_url}/releases/tag/${GITHUB_REF_NAME}" >> "$GITHUB_ENV"
+          print -r -- "SENTRY_RELEASE=com.notchrouter.app@${release_version}+${build_number}" >> "$GITHUB_ENV"
+
+      - name: Validate release configuration
+        shell: zsh {0}
+        run: |
+          set -euo pipefail
+          required_values=(
+            DEVELOPER_ID_CERTIFICATE_BASE64
+            DEVELOPER_ID_CERTIFICATE_PASSWORD
+            APPLE_API_KEY
+            NOTARY_KEY_ID
+            NOTARY_ISSUER_ID
+            SPARKLE_PUBLIC_ED_KEY
+            SPARKLE_PRIVATE_KEY
+            SENTRY_DSN
+            SENTRY_AUTH_TOKEN
+            SENTRY_ORG
+            SENTRY_PROJECT
+          )
+          for variable_name in "${required_values[@]}"; do
+            if [[ -z ${(P)variable_name:-} ]]; then
+              print -u2 -r -- "Missing GitHub Actions configuration: ${variable_name}"
+              exit 1
+            fi
+          done
+
+      - name: Run test suite
+        run: swift test
+
+      - name: Import Developer ID certificate
+        shell: zsh {0}
+        run: |
+          set -euo pipefail
+          certificate_path="${RUNNER_TEMP}/developer-id-application.p12"
+          release_keychain="${RUNNER_TEMP}/notchrouter-release.keychain-db"
+          keychain_password=$(uuidgen)
+
+          print -rn -- "$DEVELOPER_ID_CERTIFICATE_BASE64" \
+            | base64 --decode > "$certificate_path"
+          security create-keychain -p "$keychain_password" "$release_keychain"
+          security set-keychain-settings -lut 21600 "$release_keychain"
+          security unlock-keychain -p "$keychain_password" "$release_keychain"
+          security import "$certificate_path" \
+            -P "$DEVELOPER_ID_CERTIFICATE_PASSWORD" \
+            -A \
+            -t cert \
+            -f pkcs12 \
+            -k "$release_keychain"
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s \
+            -k "$keychain_password" \
+            "$release_keychain"
+          security list-keychains -d user -s "$release_keychain"
+
+          signing_identity=$(security find-identity \
+            -v \
+            -p codesigning \
+            "$release_keychain" \
+            | awk '/Developer ID Application/ { print $2; exit }')
+          if [[ -z "$signing_identity" ]]; then
+            print -u2 -r -- "No Developer ID Application identity was imported"
+            exit 1
+          fi
+
+          print -r -- "::add-mask::${keychain_password}"
+          print -r -- "CODESIGN_IDENTITY=${signing_identity}" >> "$GITHUB_ENV"
+          print -r -- "RELEASE_KEYCHAIN=${release_keychain}" >> "$GITHUB_ENV"
+
+      - name: Install App Store Connect API key
+        shell: zsh {0}
+        run: |
+          set -euo pipefail
+          notary_key_path="${RUNNER_TEMP}/AuthKey_${NOTARY_KEY_ID}.p8"
+          print -rn -- "$APPLE_API_KEY" > "$notary_key_path"
+          chmod 600 "$notary_key_path"
+          print -r -- "NOTARY_KEY_PATH=${notary_key_path}" >> "$GITHUB_ENV"
+
+      - name: Build, sign, notarize, and generate appcast
+        shell: zsh {0}
+        run: ./scripts/release.sh
+
+      - name: Install pinned Sentry CLI
+        shell: zsh {0}
+        env:
+          SENTRY_CLI_VERSION: "3.6.2"
+          SENTRY_CLI_SHA256: d1339bc39b2c681496d70fc0cb5263a6f4ff93939de21b1f34cffb310643ef1c
+        run: |
+          set -euo pipefail
+          sentry_cli_path="${RUNNER_TEMP}/sentry-cli"
+          curl -fsSL \
+            "https://github.com/getsentry/sentry-cli/releases/download/${SENTRY_CLI_VERSION}/sentry-cli-Darwin-universal" \
+            -o "$sentry_cli_path"
+          print -r -- "${SENTRY_CLI_SHA256}  ${sentry_cli_path}" \
+            | shasum -a 256 -c -
+          chmod 755 "$sentry_cli_path"
+          print -r -- "$RUNNER_TEMP" >> "$GITHUB_PATH"
+
+      - name: Upload crash symbols to Sentry
+        shell: zsh {0}
+        run: ./scripts/upload-symbols.sh dist/dSYMs
+
+      - name: Retain dSYMs as a workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: NotchRouter-${{ env.RELEASE_VERSION }}-dSYMs
+          path: dist/NotchRouter-${{ env.RELEASE_VERSION }}-dSYMs.zip
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Publish GitHub release
+        shell: zsh {0}
+        run: |
+          set -euo pipefail
+          assets=(
+            "dist/NotchRouter-${RELEASE_VERSION}-universal.dmg"
+            "dist/appcast.xml"
+            "dist/SHA256SUMS"
+          )
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "${assets[@]}" --clobber
+          else
+            gh release create "$RELEASE_TAG" \
+              "${assets[@]}" \
+              --verify-tag \
+              --title "NotchRouter ${RELEASE_VERSION}" \
+              --generate-notes
+          fi
+
+      - name: Remove temporary signing keychain
+        if: always()
+        shell: zsh {0}
+        run: |
+          if [[ -n ${RELEASE_KEYCHAIN:-} && -f "$RELEASE_KEYCHAIN" ]]; then
+            security delete-keychain "$RELEASE_KEYCHAIN"
+          fi
+          certificate_path="${RUNNER_TEMP}/developer-id-application.p12"
+          if [[ -f "$certificate_path" ]]; then
+            rm -- "$certificate_path"
+          fi
+          if [[ -n ${NOTARY_KEY_PATH:-} && -f "$NOTARY_KEY_PATH" ]]; then
+            rm -- "$NOTARY_KEY_PATH"
+          fi
