@@ -14,6 +14,7 @@ enum NotchSection: String, CaseIterable, Identifiable {
   case files
   case music
   case clipboard
+  case system
 
   var id: String { rawValue }
 
@@ -24,6 +25,7 @@ enum NotchSection: String, CaseIterable, Identifiable {
     case .files: "Files"
     case .music: "Music"
     case .clipboard: "Clipboard"
+    case .system: "System"
     }
   }
 
@@ -34,6 +36,7 @@ enum NotchSection: String, CaseIterable, Identifiable {
     case .files: "tray.full"
     case .music: "music.note"
     case .clipboard: "list.clipboard"
+    case .system: "gauge.with.dots.needle.33percent"
     }
   }
 

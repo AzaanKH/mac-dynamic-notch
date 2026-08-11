@@ -9,16 +9,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
 
   private var store: ActivityStore!
   private var fileShelf: FileShelfStore!
+  private var downloads: BrowserDownloadStore!
+  private var battery: BatteryMonitor!
   private var clipboard: ClipboardStore!
   private var music: MusicController!
   private var focusTimer: FocusTimerController!
+  private var systemMonitor: SystemMonitorController!
   private var panelController: NotchPanelController!
   private var server: ActivityHTTPServer?
   private var notificationService: ActivityNotificationService!
   private var launchAtLogin: LaunchAtLoginController!
   private var displaySelection: DisplaySelectionController!
   private var integrations: IntegrationSettingsController!
-  private var statusItem: NSStatusItem!
   private var globalHotKey: GlobalHotKey?
   private var integrationToken = ""
   private var softwareUpdater: SoftwareUpdateController!
@@ -54,9 +56,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
 
     store = ActivityStore()
     fileShelf = FileShelfStore()
+    downloads = BrowserDownloadStore()
+    battery = BatteryMonitor()
     clipboard = ClipboardStore()
     music = MusicController()
     focusTimer = FocusTimerController()
+    systemMonitor = SystemMonitorController()
     notificationService = ActivityNotificationService()
     softwareUpdater = SoftwareUpdateController()
     launchAtLogin = LaunchAtLoginController()
@@ -82,6 +87,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
           }
           return try music.ingestBrowserMedia(event)
         }
+      },
+      browserDownloadHandler: { [weak downloads] event in
+        try await MainActor.run {
+          guard let downloads else {
+            throw AppRuntimeError.storeUnavailable
+          }
+          return try downloads.ingest(event)
+        }
       }
     )
     self.server = server
@@ -89,11 +102,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     panelController = NotchPanelController(
       store: store,
       fileShelf: fileShelf,
+      downloads: downloads,
+      battery: battery,
       clipboard: clipboard,
       music: music,
       focusTimer: focusTimer,
       notificationService: notificationService,
       server: server,
+      systemMonitor: systemMonitor,
       displaySelection: displaySelection
     )
 
@@ -106,6 +122,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
       launchAtLogin: launchAtLogin,
       displaySelection: displaySelection,
       activityStore: store,
+      systemMonitor: systemMonitor,
       clipboard: clipboard,
       music: music,
       notifications: notificationService,
@@ -142,7 +159,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     self.activityExpiryTimer = activityExpiryTimer
 
     configureGlobalShortcut()
-    configureStatusItem()
   }
 
   func applicationWillTerminate(_ notification: Notification) {
@@ -162,7 +178,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     displaySelection?.refreshDisplays()
   }
 
-  @objc private func showNotch() {
+  func showNotch() {
     panelController.show(.activity)
   }
 
@@ -171,23 +187,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     panelController.refreshLayout()
   }
 
-  @objc private func showFiles() {
+  func showFiles() {
     panelController.show(.files)
   }
 
-  @objc private func showFocus() {
+  func showFocus() {
     panelController.show(.focus)
   }
 
-  @objc private func showMusic() {
+  func showMusic() {
     panelController.show(.music)
   }
 
-  @objc private func showClipboard() {
+  func showClipboard() {
     panelController.show(.clipboard)
   }
 
-  @objc private func sendDemoActivity() {
+  func sendDemoActivity() {
     let event = ActivityEventRequest(
       activityID: "notchrouter-demo",
       source: "Demo Agent",
@@ -199,94 +215,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     _ = try? store.ingest(event)
   }
 
-  @objc private func checkForUpdates() {
+  var canCheckForUpdates: Bool {
+    softwareUpdater?.isConfigured == true
+  }
+
+  func checkForUpdates() {
     softwareUpdater.checkForUpdates()
   }
 
-  @objc private func showSettings() {
-    NSApp.activate(ignoringOtherApps: true)
-    NSApp.sendAction(
-      Selector(("showSettingsWindow:")),
-      to: nil,
-      from: nil
-    )
-  }
-
-  @objc private func openDataFolder() {
+  func openDataFolder() {
     NSWorkspace.shared.open(AppPaths.applicationSupportDirectory)
   }
 
-  @objc private func quit() {
+  func quit() {
     NSApp.terminate(nil)
-  }
-
-  private func configureStatusItem() {
-    statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-    statusItem.button?.image = NSImage(
-      systemSymbolName: "sparkles.rectangle.stack",
-      accessibilityDescription: "NotchRouter"
-    )
-
-    let menu = NSMenu()
-    let showItem = menu.addItem(
-      withTitle: "Show Activity",
-      action: #selector(showNotch),
-      keyEquivalent: " "
-    )
-    showItem.keyEquivalentModifierMask = [.option]
-    menu.addItem(
-      withTitle: "Show Files",
-      action: #selector(showFiles),
-      keyEquivalent: ""
-    )
-    menu.addItem(
-      withTitle: "Show Focus Timer",
-      action: #selector(showFocus),
-      keyEquivalent: ""
-    )
-    menu.addItem(
-      withTitle: "Show Music",
-      action: #selector(showMusic),
-      keyEquivalent: ""
-    )
-    menu.addItem(
-      withTitle: "Show Clipboard",
-      action: #selector(showClipboard),
-      keyEquivalent: ""
-    )
-    menu.addItem(
-      withTitle: "Send Demo Activity",
-      action: #selector(sendDemoActivity),
-      keyEquivalent: ""
-    )
-    let updateItem = menu.addItem(
-      withTitle: "Check for Updates…",
-      action: #selector(checkForUpdates),
-      keyEquivalent: ""
-    )
-    updateItem.isEnabled = softwareUpdater.isConfigured
-    menu.addItem(.separator())
-    menu.addItem(
-      withTitle: "Settings…",
-      action: #selector(showSettings),
-      keyEquivalent: ","
-    )
-    menu.addItem(
-      withTitle: "Open Data Folder",
-      action: #selector(openDataFolder),
-      keyEquivalent: ""
-    )
-    menu.addItem(.separator())
-    menu.addItem(
-      withTitle: "Quit NotchRouter",
-      action: #selector(quit),
-      keyEquivalent: "q"
-    )
-
-    for item in menu.items {
-      item.target = self
-    }
-    statusItem.menu = menu
   }
 
   private func configureGlobalShortcut() {

@@ -1,5 +1,12 @@
 import Foundation
 
+enum URLSchemeValidation {
+  static func allows(_ url: URL, schemes: Set<String>) -> Bool {
+    guard let scheme = url.scheme?.lowercased() else { return false }
+    return schemes.contains(scheme)
+  }
+}
+
 public enum ActivityState: String, Codable, CaseIterable, Sendable {
   case queued
   case running
@@ -97,10 +104,10 @@ public struct ActivityEventRequest: Codable, Sendable {
       copy.progress = min(max(progress, 0), 1)
     }
     if let actionURL = copy.actionURL {
-      let allowedSchemes = ["https", "http", "file", "x-apple.systempreferences"]
-      guard let scheme = actionURL.scheme?.lowercased(),
-        allowedSchemes.contains(scheme) || scheme.contains("-")
-      else {
+      guard URLSchemeValidation.allows(
+        actionURL,
+        schemes: ["https", "http", "file", "x-apple.systempreferences"]
+      ) else {
         throw ActivityValidationError.invalidActionURL
       }
     }

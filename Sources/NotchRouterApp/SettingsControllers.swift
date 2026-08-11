@@ -131,8 +131,12 @@ final class DisplaySelectionController: ObservableObject {
     guard behavior != self.behavior else { return }
     self.behavior = behavior
     defaults.set(behavior.rawValue, forKey: Self.behaviorPreferenceKey)
-    if behavior == .pinned, pinnedDisplayIdentifier == nil {
-      setPinnedDisplay(displays.first(where: \.isMain)?.id ?? displays.first?.id)
+    if behavior == .pinned,
+      pinnedDisplayIdentifier == nil,
+      let defaultIdentifier = displays.first(where: \.isMain)?.id ?? displays.first?.id
+    {
+      setPinnedDisplay(defaultIdentifier)
+      return
     }
     onSelectionChange?()
   }
@@ -171,8 +175,7 @@ final class DisplaySelectionController: ObservableObject {
       pinnedDisplayIdentifier == nil,
       let defaultIdentifier = displays.first(where: \.isMain)?.id ?? displays.first?.id
     {
-      pinnedDisplayIdentifier = defaultIdentifier
-      defaults.set(defaultIdentifier, forKey: Self.preferenceKey)
+      setPinnedDisplay(defaultIdentifier)
     }
   }
 
@@ -393,7 +396,7 @@ final class IntegrationSettingsController: ObservableObject {
     }
   }
 
-  nonisolated private static func run(
+  nonisolated static func run(
     executableURL: URL,
     arguments: [String]
   ) -> CommandResult {
@@ -406,14 +409,20 @@ final class IntegrationSettingsController: ObservableObject {
     process.standardError = errorPipe
 
     do {
+      let outputBuffer = CommandOutputBuffer()
+      let errorBuffer = CommandOutputBuffer()
+      let drainGroup = DispatchGroup()
+      drain(outputPipe, into: outputBuffer, group: drainGroup)
+      drain(errorPipe, into: errorBuffer, group: drainGroup)
       try process.run()
       process.waitUntilExit()
+      drainGroup.wait()
       let output = String(
-        data: outputPipe.fileHandleForReading.readDataToEndOfFile(),
+        data: outputBuffer.data,
         encoding: .utf8
       )?.trimmingCharacters(in: .whitespacesAndNewlines)
       let error = String(
-        data: errorPipe.fileHandleForReading.readDataToEndOfFile(),
+        data: errorBuffer.data,
         encoding: .utf8
       )?.trimmingCharacters(in: .whitespacesAndNewlines)
       if process.terminationStatus == 0 {
@@ -425,7 +434,28 @@ final class IntegrationSettingsController: ObservableObject {
           : "notchctl exited with status \(process.terminationStatus)."
       )
     } catch {
+      outputPipe.fileHandleForReading.readabilityHandler = nil
+      errorPipe.fileHandleForReading.readabilityHandler = nil
       return CommandResult(message: error.localizedDescription)
+    }
+  }
+
+  nonisolated private static func drain(
+    _ pipe: Pipe,
+    into buffer: CommandOutputBuffer,
+    group: DispatchGroup
+  ) {
+    group.enter()
+    pipe.fileHandleForReading.readabilityHandler = { handle in
+      let data = handle.availableData
+      guard !data.isEmpty else {
+        handle.readabilityHandler = nil
+        if buffer.finish() {
+          group.leave()
+        }
+        return
+      }
+      buffer.append(data)
     }
   }
 
@@ -468,14 +498,39 @@ final class IntegrationSettingsController: ObservableObject {
   }
 }
 
-private struct CommandResult: Sendable {
+struct CommandResult: Sendable {
   let message: String
+}
+
+private final class CommandOutputBuffer: @unchecked Sendable {
+  private let lock = NSLock()
+  private var storage = Data()
+  private var isFinished = false
+
+  var data: Data {
+    lock.withLock { storage }
+  }
+
+  func append(_ data: Data) {
+    lock.withLock {
+      storage.append(data)
+    }
+  }
+
+  func finish() -> Bool {
+    lock.withLock {
+      guard !isFinished else { return false }
+      isFinished = true
+      return true
+    }
+  }
 }
 
 struct SettingsDependencies {
   let launchAtLogin: LaunchAtLoginController
   let displaySelection: DisplaySelectionController
   let activityStore: ActivityStore
+  let systemMonitor: SystemMonitorController
   let clipboard: ClipboardStore
   let music: MusicController
   let notifications: ActivityNotificationService

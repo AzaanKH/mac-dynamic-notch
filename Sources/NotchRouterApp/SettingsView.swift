@@ -29,6 +29,7 @@ private struct NotchRouterSettingsView: View {
         launchAtLogin: dependencies.launchAtLogin,
         displaySelection: dependencies.displaySelection,
         activityStore: dependencies.activityStore,
+        systemMonitor: dependencies.systemMonitor,
         clipboard: dependencies.clipboard,
         integrations: dependencies.integrations
       )
@@ -65,6 +66,7 @@ private struct GeneralSettingsView: View {
   @ObservedObject var launchAtLogin: LaunchAtLoginController
   @ObservedObject var displaySelection: DisplaySelectionController
   @ObservedObject var activityStore: ActivityStore
+  @ObservedObject var systemMonitor: SystemMonitorController
   @ObservedObject var clipboard: ClipboardStore
   @ObservedObject var integrations: IntegrationSettingsController
 
@@ -193,6 +195,21 @@ private struct GeneralSettingsView: View {
           integrations.openDataFolder()
         }
         .controlSize(.small)
+      }
+
+      SettingsCard(title: "System section", symbol: "gauge.with.dots.needle.33percent") {
+        Toggle(
+          "Show local system and network metrics",
+          isOn: Binding(
+            get: { systemMonitor.isEnabled },
+            set: { systemMonitor.setEnabled($0) }
+          )
+        )
+
+        SettingsMessage(
+          "Uses local aggregate statistics only. It samples every two seconds while compact and every second while expanded. The connection test contacts Apple only when you click it.",
+          color: .secondary
+        )
       }
     }
   }
@@ -325,11 +342,14 @@ private struct NotificationSettingsView: View {
 private struct PermissionSettingsView: View {
   @ObservedObject var music: MusicController
   @ObservedObject var clipboard: ClipboardStore
+  @AppStorage(CrashReporter.consentPreferenceKey)
+  private var crashReportingEnabled = false
+  @State private var confirmsClipboardClear = false
 
   var body: some View {
     SettingsPage(
       title: "Privacy",
-      subtitle: "Music, browser media, and clipboard access remain opt-in."
+      subtitle: "Music, browser media, clipboard access, and crash reporting remain opt-in."
     ) {
       SettingsCard(title: "Music controls", symbol: "music.note") {
         Toggle(
@@ -438,11 +458,32 @@ private struct PermissionSettingsView: View {
             .foregroundStyle(.secondary)
           Spacer()
           Button("Clear Clipboard History", role: .destructive) {
-            clipboard.clear()
+            confirmsClipboardClear = true
           }
           .disabled(clipboard.entries.isEmpty)
         }
         .controlSize(.small)
+      }
+      .confirmationDialog(
+        "Clear all clipboard history?",
+        isPresented: $confirmsClipboardClear,
+        titleVisibility: .visible
+      ) {
+        Button("Clear History", role: .destructive) {
+          clipboard.clear()
+        }
+        Button("Cancel", role: .cancel) {}
+      } message: {
+        Text("All saved clips and clipboard image files will be removed.")
+      }
+
+      SettingsCard(title: "Crash reporting", symbol: "waveform.path.ecg") {
+        Toggle("Share crash reports", isOn: $crashReportingEnabled)
+
+        SettingsMessage(
+          "When enabled, NotchRouter sends crash diagnostics to Sentry without default personal information. Changes take effect after restarting NotchRouter.",
+          color: .secondary
+        )
       }
     }
   }
@@ -458,7 +499,7 @@ private struct IntegrationSettingsView: View {
   var body: some View {
     SettingsPage(
       title: "Integrations",
-      subtitle: "Connect local agents and supported browser media."
+      subtitle: "Connect local agents and the optional Chromium browser bridge."
     ) {
       SettingsCard(title: "Local activity server", symbol: "network") {
         HStack(spacing: 8) {
@@ -570,7 +611,7 @@ private struct IntegrationSettingsView: View {
         }
       }
 
-      SettingsCard(title: "Browser media", symbol: "play.rectangle.on.rectangle") {
+      SettingsCard(title: "Browser bridge", symbol: "play.rectangle.on.rectangle") {
         HStack(spacing: 8) {
           Image(
             systemName: controller.browserExtensionInstalled
@@ -593,13 +634,13 @@ private struct IntegrationSettingsView: View {
         }
 
         SettingsMessage(
-          "Supports Chrome, Edge, Brave, and Chromium. Active media metadata stays on this Mac; the extension cannot read the local API token.",
+          "Supports Chrome, Edge, Brave, and Chromium. Media metadata and opted-in download status stay on this Mac; the extension cannot read the local API token.",
           color: .secondary
         )
 
         if controller.browserExtensionInstalled {
           Text(
-            "Turn on Developer mode, choose Load unpacked, then select the installed extension folder."
+            "Turn on Developer mode, choose Load unpacked, then select the installed extension folder. Click its toolbar icon once to grant download access; click again to revoke it."
           )
           .font(.caption.weight(.medium))
 

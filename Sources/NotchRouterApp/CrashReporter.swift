@@ -2,7 +2,13 @@ import Foundation
 import Sentry
 
 enum CrashReporter {
-  static func start(bundle: Bundle = .main) {
+  static let consentPreferenceKey = "crashReportingEnabled"
+
+  static func start(
+    bundle: Bundle = .main,
+    defaults: UserDefaults = .standard
+  ) {
+    guard defaults.bool(forKey: consentPreferenceKey) else { return }
     guard
       let dsn = bundle.object(forInfoDictionaryKey: "SentryDSN") as? String,
       !dsn.isEmpty

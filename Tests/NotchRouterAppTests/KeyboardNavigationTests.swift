@@ -22,8 +22,8 @@ func panelKeyboardActionsMapNavigationAndNumberKeys() {
       == .selectNextSection
   )
 
-  let topRowKeyCodes: [UInt16] = [18, 19, 20, 21, 23]
-  let keypadKeyCodes: [UInt16] = [83, 84, 85, 86, 87]
+  let topRowKeyCodes: [UInt16] = [18, 19, 20, 21, 23, 22]
+  let keypadKeyCodes: [UInt16] = [83, 84, 85, 86, 87, 88]
   for (index, keyCode) in topRowKeyCodes.enumerated() {
     #expect(
       PanelKeyboardAction.resolve(keyCode: keyCode, modifierFlags: [])
@@ -69,7 +69,7 @@ func numberShortcutsOpenTheirMatchingSections() {
   }
 
   #expect(!viewModel.selectSection(keyboardNumber: 0))
-  #expect(!viewModel.selectSection(keyboardNumber: 6))
+  #expect(!viewModel.selectSection(keyboardNumber: 7))
 }
 
 @MainActor
@@ -81,7 +81,7 @@ func arrowNavigationCyclesAndWrapsExpandedSections() {
   viewModel.show(.activity)
 
   #expect(viewModel.selectAdjacentSection(offset: -1))
-  #expect(viewModel.selectedSection == .clipboard)
+  #expect(viewModel.selectedSection == .system)
   #expect(viewModel.selectAdjacentSection(offset: 1))
   #expect(viewModel.selectedSection == .activity)
   #expect(viewModel.selectAdjacentSection(offset: 1))

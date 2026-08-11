@@ -69,6 +69,27 @@ public struct BrowserMediaEvent: Codable, Equatable, Sendable {
     case supportsPrevious = "supports_previous"
     case supportsNext = "supports_next"
   }
+
+  public func validated() throws -> BrowserMediaEvent {
+    guard pageURL.map({
+      URLSchemeValidation.allows($0, schemes: ["https", "http"])
+    }) ?? true,
+      artworkURL.map({
+        URLSchemeValidation.allows($0, schemes: ["https", "http"])
+      }) ?? true
+    else {
+      throw BrowserMediaEventValidationError.invalidURL
+    }
+    return self
+  }
+}
+
+public enum BrowserMediaEventValidationError: LocalizedError, Sendable {
+  case invalidURL
+
+  public var errorDescription: String? {
+    "page_url and artwork_url must use http or https"
+  }
 }
 
 public enum BrowserMediaCommand: String, Codable, Sendable {

@@ -56,7 +56,7 @@ enum BrowserExtensionInstaller {
 
     let manifest: [String: Any] = [
       "name": hostName,
-      "description": "Passes active browser media to NotchRouter.",
+      "description": "Passes browser media and opted-in download status to NotchRouter.",
       "path": installedHostURL.path,
       "type": "stdio",
       "allowed_origins": ["chrome-extension://\(extensionID)/"],
@@ -106,14 +106,20 @@ enum BrowserExtensionInstaller {
     let executableURL =
       Bundle.main.executableURL
       ?? URL(fileURLWithPath: CommandLine.arguments[0]).standardizedFileURL
-    let candidates = [
+    var candidates = [
       executableURL.deletingLastPathComponent()
         .appendingPathComponent("notchrouter-browser-host"),
-      URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-        .appendingPathComponent(".build/debug/notchrouter-browser-host"),
-      URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-        .appendingPathComponent(".build/release/notchrouter-browser-host"),
     ]
+    #if DEBUG
+      candidates.append(
+        contentsOf: [
+          URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appendingPathComponent(".build/debug/notchrouter-browser-host"),
+          URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appendingPathComponent(".build/release/notchrouter-browser-host"),
+        ]
+      )
+    #endif
     guard
       let result = candidates.first(where: {
         FileManager.default.isExecutableFile(atPath: $0.path)
@@ -128,12 +134,16 @@ enum BrowserExtensionInstaller {
     let executableURL =
       Bundle.main.executableURL
       ?? URL(fileURLWithPath: CommandLine.arguments[0]).standardizedFileURL
-    let candidates = [
+    var candidates = [
       executableURL.deletingLastPathComponent().deletingLastPathComponent()
         .appendingPathComponent("BrowserExtension", isDirectory: true),
-      URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-        .appendingPathComponent("BrowserExtension", isDirectory: true),
     ]
+    #if DEBUG
+      candidates.append(
+        URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+          .appendingPathComponent("BrowserExtension", isDirectory: true)
+      )
+    #endif
     guard
       let result = candidates.first(where: {
         FileManager.default.fileExists(

@@ -2,6 +2,7 @@ import SwiftUI
 
 struct FileShelfSectionView: View {
   @ObservedObject var store: FileShelfStore
+  @ObservedObject var downloads: BrowserDownloadStore
   let isDropTargeted: Bool
   @Environment(\.colorSchemeContrast) private var contrast
 
@@ -10,6 +11,17 @@ struct FileShelfSectionView: View {
   ]
 
   var body: some View {
+    VStack(spacing: 8) {
+      if !downloads.items.isEmpty {
+        BrowserDownloadHistoryView(store: downloads)
+          .padding(.horizontal, 13)
+      }
+
+      fileShelf
+    }
+  }
+
+  private var fileShelf: some View {
     ZStack {
       RoundedRectangle(cornerRadius: 16, style: .continuous)
         .strokeBorder(

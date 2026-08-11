@@ -8,36 +8,47 @@ final class NotchPanelController {
   private let panel: NotchPanel
   private let store: ActivityStore
   private let fileShelf: FileShelfStore
+  private let downloads: BrowserDownloadStore
+  private let battery: BatteryMonitor
   private let clipboard: ClipboardStore
   private let music: MusicController
   private let focusTimer: FocusTimerController
   private let notificationService: ActivityNotificationService
   private let server: ActivityHTTPServer
+  private let systemMonitor: SystemMonitorController
   private let displaySelection: DisplaySelectionController
-  private var screenObserver: NSObjectProtocol?
-  private var outsideClickMonitor: Any?
-  private var localClickMonitor: Any?
-  private var dynamicDisplayTrackingTimer: Timer?
+  nonisolated(unsafe) private var screenObserver: NSObjectProtocol?
+  nonisolated(unsafe) private var outsideClickMonitor: Any?
+  nonisolated(unsafe) private var localClickMonitor: Any?
+  nonisolated(unsafe) private var dynamicDisplayTrackingTimer: Timer?
+  private var lastResolvedScreenIdentifier: CGDirectDisplayID?
+  private var lastResolvedMode: SurfaceMode?
   private var previouslyActiveApplication: NSRunningApplication?
   private var isPanelSuppressed = false
 
   init(
     store: ActivityStore,
     fileShelf: FileShelfStore,
+    downloads: BrowserDownloadStore,
+    battery: BatteryMonitor,
     clipboard: ClipboardStore,
     music: MusicController,
     focusTimer: FocusTimerController,
     notificationService: ActivityNotificationService,
     server: ActivityHTTPServer,
+    systemMonitor: SystemMonitorController,
     displaySelection: DisplaySelectionController
   ) {
     self.store = store
     self.fileShelf = fileShelf
+    self.downloads = downloads
+    self.battery = battery
     self.clipboard = clipboard
     self.music = music
     self.focusTimer = focusTimer
     self.notificationService = notificationService
     self.server = server
+    self.systemMonitor = systemMonitor
     self.displaySelection = displaySelection
     panel = NotchPanel(
       contentRect: .zero,
@@ -50,10 +61,13 @@ final class NotchPanelController {
     let rootView = NotchRootView(
       store: store,
       fileShelf: fileShelf,
+      downloads: downloads,
+      battery: battery,
       clipboard: clipboard,
       music: music,
       focusTimer: focusTimer,
       server: server,
+      systemMonitor: systemMonitor,
       viewModel: viewModel
     )
     panel.contentView = NSHostingView(rootView: rootView)
@@ -64,6 +78,7 @@ final class NotchPanelController {
 
     viewModel.onModeChange = { [weak self] mode in
       guard let self else { return }
+      self.systemMonitor.setSurfaceMode(mode)
       self.updateFrame(for: mode, animated: true)
       if mode == .compact {
         if self.panel.isKeyWindow {
@@ -102,6 +117,14 @@ final class NotchPanelController {
       }
       self.updateFrame(for: self.viewModel.mode, animated: true)
     }
+    downloads.onChange = { [weak self] in
+      guard let self else { return }
+      self.updateFrame(for: self.viewModel.mode, animated: true)
+    }
+    battery.onChange = { [weak self] in
+      guard let self else { return }
+      self.updateFrame(for: self.viewModel.mode, animated: true)
+    }
 
     screenObserver = NotificationCenter.default.addObserver(
       forName: NSApplication.didChangeScreenParametersNotification,
@@ -119,16 +142,22 @@ final class NotchPanelController {
     }
 
     let dynamicDisplayTrackingTimer = Timer(
-      timeInterval: 0.4,
+      timeInterval: 1,
       repeats: true
     ) { [weak self] _ in
       Task { @MainActor [weak self] in
         guard let self, self.displaySelection.behavior != .pinned else {
           return
         }
-        self.updateFrame(for: self.viewModel.mode, animated: true)
+        guard let screen = self.targetScreen() else { return }
+        let mode = self.viewModel.mode
+        guard self.displayID(for: screen) != self.lastResolvedScreenIdentifier
+          || mode != self.lastResolvedMode
+        else { return }
+        self.updateFrame(for: mode, animated: true)
       }
     }
+    dynamicDisplayTrackingTimer.tolerance = 0.25
     RunLoop.main.add(dynamicDisplayTrackingTimer, forMode: .common)
     self.dynamicDisplayTrackingTimer = dynamicDisplayTrackingTimer
 
@@ -159,6 +188,19 @@ final class NotchPanelController {
     updateFrame(for: .compact, animated: false)
     if !isPanelSuppressed {
       panel.orderFrontRegardless()
+    }
+  }
+
+  deinit {
+    dynamicDisplayTrackingTimer?.invalidate()
+    if let screenObserver {
+      NotificationCenter.default.removeObserver(screenObserver)
+    }
+    if let outsideClickMonitor {
+      NSEvent.removeMonitor(outsideClickMonitor)
+    }
+    if let localClickMonitor {
+      NSEvent.removeMonitor(localClickMonitor)
     }
   }
 
@@ -241,6 +283,8 @@ final class NotchPanelController {
 
   private func updateFrame(for mode: SurfaceMode, animated: Bool) {
     guard let screen = targetScreen() else { return }
+    lastResolvedScreenIdentifier = displayID(for: screen)
+    lastResolvedMode = mode
     let geometry = NotchGeometry(screen: screen)
 
     viewModel.hardwareNotchWidth = geometry.hardwareWidth
@@ -261,16 +305,29 @@ final class NotchPanelController {
     let size: CGSize
     let isFocusPresentation =
       store.activeActivity == nil
+      && downloads.activeDownload == nil
       && focusTimer.isPresented
+    let isDownloadPresentation =
+      store.activeActivity == nil
+      && downloads.activeDownload != nil
     let isMusicPresentation =
       store.activeActivity == nil
+      && !isDownloadPresentation
       && !isFocusPresentation
       && music.nowPlaying != nil
+    let isBatteryPresentation =
+      store.activeActivity == nil
+      && !isDownloadPresentation
+      && !isFocusPresentation
+      && !isMusicPresentation
+      && battery.charging != nil
     switch mode {
     case .compact:
       if store.currentActivity == nil,
+        !isDownloadPresentation,
         !isFocusPresentation,
-        music.nowPlaying == nil
+        !isMusicPresentation,
+        !isBatteryPresentation
       {
         size = CGSize(
           width: geometry.restingWidth,
@@ -282,6 +339,13 @@ final class NotchPanelController {
             ? max(geometry.restingWidth + 80, 278)
             : 238,
           height: max(geometry.restingHeight, 34)
+        )
+      } else if isDownloadPresentation || isBatteryPresentation {
+        size = CGSize(
+          width: geometry.hasPhysicalNotch
+            ? max(geometry.restingWidth + 150, 350)
+            : 330,
+          height: max(geometry.restingHeight, 42)
         )
       } else {
         size = CGSize(
@@ -494,6 +558,7 @@ enum PanelKeyboardAction: Equatable {
     case 20, 85: .selectSection(3)
     case 21, 86: .selectSection(4)
     case 23, 87: .selectSection(5)
+    case 22, 88: .selectSection(6)
     default: nil
     }
   }

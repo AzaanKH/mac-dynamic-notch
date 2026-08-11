@@ -17,26 +17,13 @@ jobs:
     name: Build, notarize, and publish
     runs-on: macos-15
     timeout-minutes: 60
-    env:
-      DEVELOPER_ID_CERTIFICATE_BASE64: ${{ secrets.DEVELOPER_ID_CERTIFICATE_BASE64 }}
-      DEVELOPER_ID_CERTIFICATE_PASSWORD: ${{ secrets.DEVELOPER_ID_CERTIFICATE_PASSWORD }}
-      APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
-      NOTARY_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
-      NOTARY_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
-      SPARKLE_PUBLIC_ED_KEY: ${{ vars.SPARKLE_PUBLIC_ED_KEY }}
-      SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
-      SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
-      SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
-      SENTRY_ORG: ${{ vars.SENTRY_ORG }}
-      SENTRY_PROJECT: ${{ vars.SENTRY_PROJECT }}
-      SENTRY_ENVIRONMENT: production
-      GH_TOKEN: ${{ github.token }}
 
     steps:
       - name: Check out tagged source
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Derive release metadata
         shell: zsh {0}
@@ -69,35 +56,14 @@ jobs:
           print -r -- "RELEASE_NOTES_URL=${repository_url}/releases/tag/${GITHUB_REF_NAME}" >> "$GITHUB_ENV"
           print -r -- "SENTRY_RELEASE=com.notchrouter.app@${release_version}+${build_number}" >> "$GITHUB_ENV"
 
-      - name: Validate release configuration
-        shell: zsh {0}
-        run: |
-          set -euo pipefail
-          required_values=(
-            DEVELOPER_ID_CERTIFICATE_BASE64
-            DEVELOPER_ID_CERTIFICATE_PASSWORD
-            APPLE_API_KEY
-            NOTARY_KEY_ID
-            NOTARY_ISSUER_ID
-            SPARKLE_PUBLIC_ED_KEY
-            SPARKLE_PRIVATE_KEY
-            SENTRY_DSN
-            SENTRY_AUTH_TOKEN
-            SENTRY_ORG
-            SENTRY_PROJECT
-          )
-          for variable_name in "${required_values[@]}"; do
-            if [[ -z ${(P)variable_name:-} ]]; then
-              print -u2 -r -- "Missing GitHub Actions configuration: ${variable_name}"
-              exit 1
-            fi
-          done
-
       - name: Run test suite
         run: swift test
 
       - name: Import Developer ID certificate
         shell: zsh {0}
+        env:
+          DEVELOPER_ID_CERTIFICATE_BASE64: ${{ secrets.DEVELOPER_ID_CERTIFICATE_BASE64 }}
+          DEVELOPER_ID_CERTIFICATE_PASSWORD: ${{ secrets.DEVELOPER_ID_CERTIFICATE_PASSWORD }}
         run: |
           set -euo pipefail
           certificate_path="${RUNNER_TEMP}/developer-id-application.p12"
@@ -138,15 +104,24 @@ jobs:
 
       - name: Install App Store Connect API key
         shell: zsh {0}
+        env:
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
         run: |
           set -euo pipefail
-          notary_key_path="${RUNNER_TEMP}/AuthKey_${NOTARY_KEY_ID}.p8"
+          notary_key_path="${RUNNER_TEMP}/app-store-connect-api-key.p8"
           print -rn -- "$APPLE_API_KEY" > "$notary_key_path"
           chmod 600 "$notary_key_path"
           print -r -- "NOTARY_KEY_PATH=${notary_key_path}" >> "$GITHUB_ENV"
 
       - name: Build, sign, notarize, and generate appcast
         shell: zsh {0}
+        env:
+          NOTARY_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+          SPARKLE_PUBLIC_ED_KEY: ${{ vars.SPARKLE_PUBLIC_ED_KEY }}
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+          SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+          SENTRY_ENVIRONMENT: production
         run: ./scripts/release.sh
 
       - name: Install pinned Sentry CLI
@@ -167,6 +142,10 @@ jobs:
 
       - name: Upload crash symbols to Sentry
         shell: zsh {0}
+        env:
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+          SENTRY_ORG: ${{ vars.SENTRY_ORG }}
+          SENTRY_PROJECT: ${{ vars.SENTRY_PROJECT }}
         run: ./scripts/upload-symbols.sh dist/dSYMs
 
       - name: Retain dSYMs as a workflow artifact
@@ -179,6 +158,8 @@ jobs:
 
       - name: Publish GitHub release
         shell: zsh {0}
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           assets=(
