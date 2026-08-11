@@ -394,7 +394,6 @@ private struct CodexHookStateStore {
     .appendingPathComponent("codex-adapter-state", isDirectory: true)
 
   func recordedState(for activityID: String) throws -> ActivityState? {
-    cleanupExpiredFiles()
     guard
       let rawValue = try? String(
         contentsOf: stateURL(for: activityID),
@@ -433,6 +432,7 @@ private struct CodexHookStateStore {
       at: directory,
       withIntermediateDirectories: true
     )
+    cleanupExpiredFiles()
     let url = stateURL(for: activityID)
     try Data("\(state.rawValue)\n".utf8).write(to: url, options: .atomic)
     try FileManager.default.setAttributes(

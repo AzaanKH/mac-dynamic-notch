@@ -154,7 +154,8 @@ private func makeServer(port: UInt16) -> ActivityHTTPServer {
     token: "test-token",
     ingestHandler: { event in AIActivity(event: event) },
     listHandler: { [] },
-    browserMediaHandler: { _ in BrowserMediaBridgeResponse(status: "ok") }
+    browserMediaHandler: { _ in BrowserMediaBridgeResponse(status: "ok") },
+    browserDownloadHandler: { _ in BrowserDownloadBridgeResponse(status: "ok") }
   )
 }
 

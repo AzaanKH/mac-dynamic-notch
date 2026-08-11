@@ -4,10 +4,13 @@ import SwiftUI
 struct NotchRootView: View {
   @ObservedObject var store: ActivityStore
   @ObservedObject var fileShelf: FileShelfStore
+  @ObservedObject var downloads: BrowserDownloadStore
+  @ObservedObject var battery: BatteryMonitor
   @ObservedObject var clipboard: ClipboardStore
   @ObservedObject var music: MusicController
   @ObservedObject var focusTimer: FocusTimerController
   @ObservedObject var server: ActivityHTTPServer
+  @ObservedObject var systemMonitor: SystemMonitorController
   @ObservedObject var viewModel: NotchViewModel
 
   @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -66,10 +69,12 @@ struct NotchRootView: View {
       ExpandedDashboardView(
         store: store,
         fileShelf: fileShelf,
+        downloads: downloads,
         clipboard: clipboard,
         music: music,
         focusTimer: focusTimer,
         server: server,
+        systemMonitor: systemMonitor,
         viewModel: viewModel
       )
     }
@@ -87,6 +92,15 @@ struct NotchRootView: View {
         currentSection: .activity,
         onSelectSection: viewModel.show
       )
+    } else if let download = downloads.activeDownload {
+      CompactDownloadView(
+        item: download,
+        store: downloads,
+        hardwareNotchWidth: viewModel.hardwareNotchWidth,
+        hasPhysicalNotch: viewModel.hasPhysicalNotch,
+        isPeek: isPeek,
+        onSelectSection: viewModel.show
+      )
     } else if focusTimer.isPresented {
       CompactFocusTimerView(
         timer: focusTimer,
@@ -101,6 +115,14 @@ struct NotchRootView: View {
         controller: music,
         hardwareNotchWidth: viewModel.hardwareNotchWidth,
         hardwareNotchHeight: viewModel.hardwareNotchHeight,
+        hasPhysicalNotch: viewModel.hasPhysicalNotch,
+        isPeek: isPeek,
+        onSelectSection: viewModel.show
+      )
+    } else if let charging = battery.charging {
+      CompactBatteryView(
+        charging: charging,
+        hardwareNotchWidth: viewModel.hardwareNotchWidth,
         hasPhysicalNotch: viewModel.hasPhysicalNotch,
         isPeek: isPeek,
         onSelectSection: viewModel.show

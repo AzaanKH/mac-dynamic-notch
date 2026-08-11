@@ -87,6 +87,32 @@ func validationClampsProgressAndRejectsEmptyIdentity() throws {
 }
 
 @Test
+func validationAllowsOnlyApprovedActionURLs() throws {
+  for scheme in ["https", "http", "file", "x-apple.systempreferences"] {
+    let event = ActivityEventRequest(
+      activityID: "agent-url",
+      source: "Local Agent",
+      title: "Open result",
+      state: .succeeded,
+      actionURL: URL(string: "\(scheme)://example.com/result")
+    )
+    #expect(try event.validated().actionURL == event.actionURL)
+  }
+
+  for scheme in ["custom-scheme", "javascript", "data"] {
+    #expect(throws: ActivityValidationError.self) {
+      try ActivityEventRequest(
+        activityID: "agent-url",
+        source: "Local Agent",
+        title: "Open result",
+        state: .succeeded,
+        actionURL: URL(string: "\(scheme)://example.com/result")
+      ).validated()
+    }
+  }
+}
+
+@Test
 func eventJSONUsesIntegrationFriendlyKeys() throws {
   let event = ActivityEventRequest(
     activityID: "agent-3",

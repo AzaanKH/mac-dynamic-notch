@@ -4,10 +4,12 @@ import SwiftUI
 struct ExpandedDashboardView: View {
   @ObservedObject var store: ActivityStore
   @ObservedObject var fileShelf: FileShelfStore
+  @ObservedObject var downloads: BrowserDownloadStore
   @ObservedObject var clipboard: ClipboardStore
   @ObservedObject var music: MusicController
   @ObservedObject var focusTimer: FocusTimerController
   @ObservedObject var server: ActivityHTTPServer
+  @ObservedObject var systemMonitor: SystemMonitorController
   @ObservedObject var viewModel: NotchViewModel
   @FocusState private var focusedSection: NotchSection?
   @Environment(\.accessibilityDifferentiateWithoutColor) private var differentiateWithoutColor
@@ -33,11 +35,17 @@ struct ExpandedDashboardView: View {
         case .focus:
           FocusTimerSectionView(timer: focusTimer)
         case .files:
-          FileShelfSectionView(store: fileShelf, isDropTargeted: viewModel.isFileDropTargeted)
+          FileShelfSectionView(
+            store: fileShelf,
+            downloads: downloads,
+            isDropTargeted: viewModel.isFileDropTargeted
+          )
         case .music:
           MusicSectionView(controller: music)
         case .clipboard:
           ClipboardSectionView(store: clipboard)
+        case .system:
+          SystemSectionView(monitor: systemMonitor)
         }
       }
       .id(viewModel.selectedSection)
@@ -215,11 +223,22 @@ struct ExpandedDashboardView: View {
         ? "\(focusTimer.selectedDurationMinutes)-minute focus session"
         : focusTimer.stateLabel
     case .files:
-      return fileShelf.items.isEmpty ? "Drop anything here" : "Your temporary file shelf"
+      if downloads.activeCount > 0 {
+        return downloads.activeCount == 1
+          ? "1 download in progress"
+          : "\(downloads.activeCount) downloads in progress"
+      }
+      return fileShelf.items.isEmpty && downloads.items.isEmpty
+        ? "Drop anything here"
+        : "Files and downloads"
     case .music:
       return music.nowPlaying?.title ?? "Music controls"
     case .clipboard:
       return clipboard.isEnabled ? "Recent clipboard" : "Clipboard history is off"
+    case .system:
+      return systemMonitor.isEnabled
+        ? "System and network"
+        : "System monitoring is off"
     }
   }
 
@@ -230,11 +249,13 @@ struct ExpandedDashboardView: View {
     case .focus:
       focusTimer.phase != .idle
     case .files:
-      !fileShelf.items.isEmpty
+      !fileShelf.items.isEmpty || downloads.items.contains(where: { !$0.isActive })
     case .music:
       false
     case .clipboard:
       !clipboard.entries.isEmpty
+    case .system:
+      false
     }
   }
 
@@ -245,6 +266,7 @@ struct ExpandedDashboardView: View {
     case .files: "Clear shelf"
     case .clipboard: "Clear history"
     case .music: "Clear"
+    case .system: "Clear"
     }
   }
 
@@ -256,9 +278,12 @@ struct ExpandedDashboardView: View {
       focusTimer.reset()
     case .files:
       fileShelf.clear()
+      downloads.clearHistory()
     case .clipboard:
       clipboard.clear()
     case .music:
+      break
+    case .system:
       break
     }
   }
@@ -276,6 +301,10 @@ struct ExpandedDashboardView: View {
     case .files: viewModel.isFileDropTargeted ? .orange : .blue
     case .music: music.nowPlaying?.isPlaying == true ? .pink : .gray
     case .clipboard: clipboard.isEnabled ? .purple : .gray
+    case .system:
+      systemMonitor.isEnabled
+        ? (systemMonitor.network.isOnline ? .green : .orange)
+        : .gray
     }
   }
 
@@ -298,6 +327,10 @@ struct ExpandedDashboardView: View {
     case .files: "Drag files in or back out · bookmarks stay local"
     case .music: "Apple Music, Spotify, and opt-in browser media"
     case .clipboard: "Local text & image history · sensitive types excluded"
+    case .system:
+      systemMonitor.isEnabled
+        ? "Local metrics only · connection test runs on demand"
+        : "Enable in General settings or from this section"
     }
   }
 
@@ -314,6 +347,10 @@ struct ExpandedDashboardView: View {
     case .files: viewModel.isFileDropTargeted ? "arrow.down" : "tray"
     case .music: music.nowPlaying?.isPlaying == true ? "waveform" : "pause.fill"
     case .clipboard: clipboard.isEnabled ? "list.clipboard" : "nosign"
+    case .system:
+      systemMonitor.isEnabled
+        ? (systemMonitor.network.isOnline ? "network" : "wifi.slash")
+        : "nosign"
     }
   }
 
@@ -324,11 +361,13 @@ struct ExpandedDashboardView: View {
     case .focus:
       focusTimer.phase == .idle ? "ready" : focusTimer.formattedRemaining
     case .files:
-      "\(fileShelf.items.count) items"
+      "\(fileShelf.items.count) files · \(downloads.items.count) downloads"
     case .music:
       music.isEnabled || music.hasBrowserSession ? "enabled" : "off"
     case .clipboard:
       clipboard.isEnabled ? "\(clipboard.entries.count) clips" : "off"
+    case .system:
+      systemMonitor.isEnabled ? systemMonitor.network.interfaceName : "off"
     }
   }
 }

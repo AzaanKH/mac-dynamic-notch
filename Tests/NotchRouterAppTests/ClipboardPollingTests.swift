@@ -43,6 +43,39 @@ func clipboardPollingUsesLowerFrequency() {
 
 @MainActor
 @Test
+func clipboardCreatesItsStorageDirectoryWithPrivatePermissions() throws {
+  let suiteName = "ClipboardDirectoryPermissionsTests.\(UUID().uuidString)"
+  let defaults = UserDefaults(suiteName: suiteName)!
+  defer { defaults.removePersistentDomain(forName: suiteName) }
+  let rootURL = FileManager.default.temporaryDirectory
+    .appendingPathComponent("ClipboardDirectoryPermissionsTests-\(UUID().uuidString)")
+  let storageDirectoryURL = rootURL.appendingPathComponent("history")
+  let storageURL = storageDirectoryURL.appendingPathComponent("clipboard.json")
+  defer { try? FileManager.default.removeItem(at: rootURL) }
+
+  let pasteboard = NSPasteboard(
+    name: NSPasteboard.Name("ClipboardDirectoryPermissionsTests.\(UUID().uuidString)")
+  )
+  let store = ClipboardStore(
+    storageURL: storageURL,
+    pasteboard: pasteboard,
+    defaults: defaults
+  )
+  store.setEnabled(true)
+  pasteboard.clearContents()
+  pasteboard.setString("Private clip", forType: .string)
+  store.captureIfChanged()
+  store.setEnabled(false)
+
+  let attributes = try FileManager.default.attributesOfItem(
+    atPath: storageDirectoryURL.path
+  )
+  let permissions = try #require(attributes[.posixPermissions] as? NSNumber)
+  #expect(permissions.intValue & 0o777 == 0o700)
+}
+
+@MainActor
+@Test
 func clipboardPreservesWhitespaceAndMarksTruncatedText() throws {
   let suiteName = "ClipboardTextTests.\(UUID().uuidString)"
   let defaults = UserDefaults(suiteName: suiteName)!
@@ -113,7 +146,7 @@ func clipboardPreservesWhitespaceAndMarksTruncatedText() throws {
 
 @MainActor
 @Test
-func clipboardCapturesPersistsAndCopiesImages() throws {
+func clipboardCapturesPersistsAndCopiesImages() async throws {
   let suiteName = "ClipboardImageTests.\(UUID().uuidString)"
   let defaults = UserDefaults(suiteName: suiteName)!
   defer { defaults.removePersistentDomain(forName: suiteName) }
@@ -141,12 +174,14 @@ func clipboardCapturesPersistsAndCopiesImages() throws {
   pasteboard.clearContents()
   pasteboard.setData(imageData, forType: .png)
   store.captureIfChanged()
+  try await waitForClipboardImage(in: store)
 
   let entry = try #require(store.entries.first)
   #expect(entry.isImage)
   #expect(entry.text == nil)
   #expect(entry.imagePixelWidth == 4)
   #expect(entry.imagePixelHeight == 3)
+  #expect(entry.imageByteCount != nil)
   #expect(store.image(for: entry) != nil)
 
   let reloadedStore = ClipboardStore(
@@ -159,6 +194,7 @@ func clipboardCapturesPersistsAndCopiesImages() throws {
   #expect(reloadedEntry.imageFileName == entry.imageFileName)
   #expect(reloadedEntry.imagePixelWidth == entry.imagePixelWidth)
   #expect(reloadedEntry.imagePixelHeight == entry.imagePixelHeight)
+  #expect(reloadedEntry.imageByteCount == entry.imageByteCount)
   #expect(reloadedStore.image(for: reloadedEntry) != nil)
 
   reloadedStore.copy(reloadedEntry)
@@ -382,6 +418,74 @@ func clipboardAutoExpiryPreservesPinnedEntries() throws {
 
 @MainActor
 @Test
+func clipboardStartupPurgesAndTrimsBeforePersisting() throws {
+  let suiteName = "ClipboardStartupCleanupTests.\(UUID().uuidString)"
+  let defaults = UserDefaults(suiteName: suiteName)!
+  defer { defaults.removePersistentDomain(forName: suiteName) }
+  defaults.set(2, forKey: ClipboardStore.retentionPreferenceKey)
+  defaults.set(
+    ClipboardAutoExpiry.oneDay.rawValue,
+    forKey: ClipboardStore.autoExpiryPreferenceKey
+  )
+
+  let rootURL = FileManager.default.temporaryDirectory
+    .appendingPathComponent("ClipboardStartupCleanupTests-\(UUID().uuidString)")
+  try FileManager.default.createDirectory(at: rootURL, withIntermediateDirectories: true)
+  defer { try? FileManager.default.removeItem(at: rootURL) }
+  let storageURL = rootURL.appendingPathComponent("clipboard.json")
+  let now = Date()
+  let entries = [
+    ClipboardEntry(
+      id: UUID(),
+      text: "Expired",
+      sourceApplication: "Notes",
+      createdAt: now.addingTimeInterval(-172_800)
+    ),
+    ClipboardEntry(
+      id: UUID(),
+      text: "Recent 1",
+      sourceApplication: "Notes",
+      createdAt: now.addingTimeInterval(-4)
+    ),
+    ClipboardEntry(
+      id: UUID(),
+      text: "Recent 2",
+      sourceApplication: "Notes",
+      createdAt: now.addingTimeInterval(-3)
+    ),
+    ClipboardEntry(
+      id: UUID(),
+      text: "Recent 3",
+      sourceApplication: "Notes",
+      createdAt: now.addingTimeInterval(-2)
+    ),
+    ClipboardEntry(
+      id: UUID(),
+      text: "Recent 4",
+      sourceApplication: "Notes",
+      createdAt: now.addingTimeInterval(-1)
+    ),
+  ]
+  try ActivityCoding.makeEncoder().encode(entries).write(to: storageURL)
+
+  let store = ClipboardStore(
+    storageURL: storageURL,
+    pasteboard: NSPasteboard(
+      name: NSPasteboard.Name("ClipboardStartupCleanupTests.\(UUID().uuidString)")
+    ),
+    defaults: defaults
+  )
+
+  #expect(store.entries.compactMap(\.text) == ["Recent 4", "Recent 3"])
+  let persistedEntries = try ActivityCoding.makeDecoder().decode(
+    [ClipboardEntry].self,
+    from: Data(contentsOf: storageURL)
+  )
+  #expect(persistedEntries.compactMap(\.text) == ["Recent 4", "Recent 3"])
+}
+
+@MainActor
+@Test
 func clipboardAppExclusionsPersistByBundleIdentifier() {
   let suiteName = "ClipboardExclusionTests.\(UUID().uuidString)"
   let defaults = UserDefaults(suiteName: suiteName)!
@@ -445,4 +549,17 @@ private func makeTestPNG() -> Data? {
     }
   }
   return bitmap.representation(using: .png, properties: [:])
+}
+
+@MainActor
+private func waitForClipboardImage(in store: ClipboardStore) async throws {
+  for _ in 0..<200 {
+    if store.entries.first?.isImage == true { return }
+    try await Task.sleep(for: .milliseconds(10))
+  }
+  throw ClipboardPollingTestError.timedOut
+}
+
+private enum ClipboardPollingTestError: Error {
+  case timedOut
 }

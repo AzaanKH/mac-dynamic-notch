@@ -41,6 +41,7 @@ struct ClipboardEntry: Codable, Identifiable, Equatable {
   let imageFileName: String?
   let imagePixelWidth: Int?
   let imagePixelHeight: Int?
+  let imageByteCount: Int?
   let sourceApplication: String?
   let sourceApplicationBundleIdentifier: String?
   let createdAt: Date
@@ -65,6 +66,7 @@ struct ClipboardEntry: Codable, Identifiable, Equatable {
     imageFileName = nil
     imagePixelWidth = nil
     imagePixelHeight = nil
+    imageByteCount = nil
     self.sourceApplication = sourceApplication
     self.sourceApplicationBundleIdentifier = sourceApplicationBundleIdentifier
     self.createdAt = createdAt
@@ -77,6 +79,7 @@ struct ClipboardEntry: Codable, Identifiable, Equatable {
     imageFileName: String,
     imagePixelWidth: Int,
     imagePixelHeight: Int,
+    imageByteCount: Int? = nil,
     sourceApplication: String?,
     sourceApplicationBundleIdentifier: String? = nil,
     createdAt: Date,
@@ -87,6 +90,7 @@ struct ClipboardEntry: Codable, Identifiable, Equatable {
     self.imageFileName = imageFileName
     self.imagePixelWidth = imagePixelWidth
     self.imagePixelHeight = imagePixelHeight
+    self.imageByteCount = imageByteCount
     self.sourceApplication = sourceApplication
     self.sourceApplicationBundleIdentifier = sourceApplicationBundleIdentifier
     self.createdAt = createdAt
@@ -116,6 +120,7 @@ struct ClipboardEntry: Codable, Identifiable, Equatable {
     case imageFileName
     case imagePixelWidth
     case imagePixelHeight
+    case imageByteCount
     case sourceApplication
     case sourceApplicationBundleIdentifier
     case createdAt
@@ -133,6 +138,7 @@ struct ClipboardEntry: Codable, Identifiable, Equatable {
     )
     imagePixelWidth = try container.decodeIfPresent(Int.self, forKey: .imagePixelWidth)
     imagePixelHeight = try container.decodeIfPresent(Int.self, forKey: .imagePixelHeight)
+    imageByteCount = try container.decodeIfPresent(Int.self, forKey: .imageByteCount)
     sourceApplication = try container.decodeIfPresent(
       String.self,
       forKey: .sourceApplication
@@ -160,9 +166,9 @@ final class ClipboardStore: NSObject, ObservableObject {
   static let maximumEntryCount = 30
   static let availableRetentionLimits = [10, 30, 50, 100]
   static let maximumTextLength = 10_000
-  static let maximumImageBytes = 20_000_000
-  static let maximumImageDimension = 4_096
-  static let fallbackImageDimension = 2_048
+  nonisolated static let maximumImageBytes = 20_000_000
+  nonisolated static let maximumImageDimension = 4_096
+  nonisolated static let fallbackImageDimension = 2_048
 
   @Published private(set) var entries: [ClipboardEntry] = []
   @Published private(set) var isEnabled: Bool
@@ -181,6 +187,7 @@ final class ClipboardStore: NSObject, ObservableObject {
   private var lastChangeCount: Int
   private var timer: Timer?
   private var expiryTimer: Timer?
+  private var imageCaptureGeneration: UInt = 0
   private let imageCache = NSCache<NSString, NSImage>()
 
   init(
@@ -206,7 +213,8 @@ final class ClipboardStore: NSObject, ObservableObject {
     load()
     let didRemoveExpiredEntries = purgeExpiredEntries(now: Date()) > 0
     sortEntries()
-    if didRemoveExpiredEntries || trimEntriesIfNeeded() {
+    let didTrimEntries = trimEntriesIfNeeded()
+    if didRemoveExpiredEntries || didTrimEntries {
       persist()
     }
     scheduleExpiryTimer()
@@ -223,6 +231,7 @@ final class ClipboardStore: NSObject, ObservableObject {
     if enabled {
       startPolling()
     } else {
+      imageCaptureGeneration &+= 1
       stopPolling()
     }
   }
@@ -273,6 +282,7 @@ final class ClipboardStore: NSObject, ObservableObject {
   }
 
   func clear() {
+    imageCaptureGeneration &+= 1
     entries.removeAll()
     imageCache.removeAllObjects()
     do {
@@ -415,8 +425,9 @@ final class ClipboardStore: NSObject, ObservableObject {
     let types = pasteboard.types ?? []
     guard Self.shouldCapture(types: types) else { return }
 
-    if let capturedImage = capturedImage() {
-      addImage(capturedImage, sourceApplication: source)
+    if let capturedImageData = capturedImageData() {
+      addImage(capturedImageData, sourceApplication: source)
+      return
     } else if let originalText = pasteboard.string(forType: .string) {
       let emptinessCheck = originalText.trimmingCharacters(
         in: .whitespacesAndNewlines
@@ -497,7 +508,8 @@ final class ClipboardStore: NSObject, ObservableObject {
     do {
       try FileManager.default.createDirectory(
         at: storageURL.deletingLastPathComponent(),
-        withIntermediateDirectories: true
+        withIntermediateDirectories: true,
+        attributes: [.posixPermissions: 0o700]
       )
       let data = try ActivityCoding.makeEncoder(prettyPrinted: true)
         .encode(entries)
@@ -526,69 +538,117 @@ final class ClipboardStore: NSObject, ObservableObject {
     )
   }
 
-  private func capturedImage() -> NSImage? {
-    if let data = pasteboard.data(forType: .png),
-      let image = NSImage(data: data)
-    {
-      return image
+  private func capturedImageData() -> Data? {
+    if let data = pasteboard.data(forType: .png), !data.isEmpty {
+      return data
     }
-    if let data = pasteboard.data(forType: .tiff),
-      let image = NSImage(data: data)
-    {
-      return image
+    if let data = pasteboard.data(forType: .tiff), !data.isEmpty {
+      return data
     }
     return nil
   }
 
   private func addImage(
-    _ image: NSImage,
+    _ capturedData: Data,
     sourceApplication: ClipboardSourceApplication?
   ) {
-    guard let encoded = encodedImage(image) else { return }
-    if let first = mostRecentEntry,
-      first.isImage,
-      let existingURL = imageURL(for: first),
-      let existingData = try? Data(contentsOf: existingURL),
-      existingData == encoded.data
-    {
-      return
-    }
-
     let id = UUID()
     let fileName = "\(id.uuidString).png"
-    do {
-      try FileManager.default.createDirectory(
-        at: imageDirectoryURL,
-        withIntermediateDirectories: true,
-        attributes: [.posixPermissions: 0o700]
-      )
-      let fileURL = imageDirectoryURL.appendingPathComponent(fileName)
-      try encoded.data.write(to: fileURL, options: .atomic)
-      try FileManager.default.setAttributes(
-        [.posixPermissions: 0o600],
-        ofItemAtPath: fileURL.path
-      )
-      entries.insert(
-        ClipboardEntry(
-          id: id,
-          imageFileName: fileName,
-          imagePixelWidth: encoded.pixelWidth,
-          imagePixelHeight: encoded.pixelHeight,
-          sourceApplication: sourceApplication?.name,
-          sourceApplicationBundleIdentifier: sourceApplication?.bundleIdentifier,
-          createdAt: Date()
-        ),
-        at: 0
-      )
-      if let storedImage = NSImage(data: encoded.data) {
-        imageCache.setObject(storedImage, forKey: id.uuidString as NSString)
+    let fileURL = imageDirectoryURL.appendingPathComponent(fileName)
+    let directoryURL = imageDirectoryURL
+    let createdAt = Date()
+    let generation = imageCaptureGeneration
+    let existingImage: ExistingClipboardImage? = mostRecentEntry.flatMap { entry in
+      guard entry.isImage,
+        let byteCount = entry.imageByteCount,
+        let url = imageURL(for: entry)
+      else { return nil }
+      return ExistingClipboardImage(url: url, byteCount: byteCount)
+    }
+
+    Task { @MainActor [weak self] in
+      do {
+        let persistedImage = try await Task.detached(priority: .utility) {
+          try Self.encodeAndPersistImage(
+            capturedData,
+            existingImage: existingImage,
+            imageDirectoryURL: directoryURL,
+            fileURL: fileURL
+          )
+        }.value
+        guard let persistedImage else { return }
+        guard let self, generation == self.imageCaptureGeneration else {
+          Task.detached(priority: .utility) {
+            try? FileManager.default.removeItem(at: persistedImage.fileURL)
+          }
+          return
+        }
+
+        self.entries.insert(
+          ClipboardEntry(
+            id: id,
+            imageFileName: fileName,
+            imagePixelWidth: persistedImage.pixelWidth,
+            imagePixelHeight: persistedImage.pixelHeight,
+            imageByteCount: persistedImage.data.count,
+            sourceApplication: sourceApplication?.name,
+            sourceApplicationBundleIdentifier: sourceApplication?.bundleIdentifier,
+            createdAt: createdAt
+          ),
+          at: 0
+        )
+        if let storedImage = NSImage(data: persistedImage.data) {
+          self.imageCache.setObject(storedImage, forKey: id.uuidString as NSString)
+        }
+        self.trimEntriesIfNeeded()
+        self.sortEntries()
+        self.persist()
+        self.scheduleExpiryTimer()
+      } catch {
+        NSLog("NotchRouter could not persist clipboard image: \(error)")
       }
-    } catch {
-      NSLog("NotchRouter could not persist clipboard image: \(error)")
     }
   }
 
-  private func encodedImage(_ image: NSImage) -> EncodedClipboardImage? {
+  nonisolated private static func encodeAndPersistImage(
+    _ capturedData: Data,
+    existingImage: ExistingClipboardImage?,
+    imageDirectoryURL: URL,
+    fileURL: URL
+  ) throws -> PersistedClipboardImage? {
+    guard let image = NSImage(data: capturedData),
+      let encoded = encodedImage(image)
+    else { return nil }
+
+    if let existingImage,
+      existingImage.byteCount == encoded.data.count,
+      let existingData = try? Data(contentsOf: existingImage.url),
+      existingData == encoded.data
+    {
+      return nil
+    }
+
+    try FileManager.default.createDirectory(
+      at: imageDirectoryURL,
+      withIntermediateDirectories: true,
+      attributes: [.posixPermissions: 0o700]
+    )
+    try encoded.data.write(to: fileURL, options: .atomic)
+    try FileManager.default.setAttributes(
+      [.posixPermissions: 0o600],
+      ofItemAtPath: fileURL.path
+    )
+    return PersistedClipboardImage(
+      fileURL: fileURL,
+      data: encoded.data,
+      pixelWidth: encoded.pixelWidth,
+      pixelHeight: encoded.pixelHeight
+    )
+  }
+
+  nonisolated private static func encodedImage(
+    _ image: NSImage
+  ) -> EncodedClipboardImage? {
     guard
       let initial = renderPNG(
         image,
@@ -604,7 +664,7 @@ final class ClipboardStore: NSObject, ObservableObject {
     )
   }
 
-  private func renderPNG(
+  nonisolated private static func renderPNG(
     _ image: NSImage,
     maximumDimension: Int
   ) -> EncodedClipboardImage? {
@@ -657,7 +717,7 @@ final class ClipboardStore: NSObject, ObservableObject {
     )
   }
 
-  private func imagePixelSize(_ image: NSImage) -> CGSize {
+  nonisolated private static func imagePixelSize(_ image: NSImage) -> CGSize {
     let representationSize = image.representations.reduce(CGSize.zero) {
       current, representation in
       CGSize(
@@ -816,12 +876,24 @@ final class ClipboardStore: NSObject, ObservableObject {
   }
 }
 
-private struct ClipboardSourceApplication {
+private struct ClipboardSourceApplication: Sendable {
   let name: String
   let bundleIdentifier: String?
 }
 
-private struct EncodedClipboardImage {
+private struct ExistingClipboardImage: Sendable {
+  let url: URL
+  let byteCount: Int
+}
+
+private struct EncodedClipboardImage: Sendable {
+  let data: Data
+  let pixelWidth: Int
+  let pixelHeight: Int
+}
+
+private struct PersistedClipboardImage: Sendable {
+  let fileURL: URL
   let data: Data
   let pixelWidth: Int
   let pixelHeight: Int

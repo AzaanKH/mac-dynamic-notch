@@ -33,6 +33,45 @@ func displaySelectionPersistsBehaviorAndPinnedDisplay() {
 
 @MainActor
 @Test
+func displaySelectionNotifiesOnceWhenPinningSelectsADefaultDisplay() {
+  let suiteName = "DisplaySelectionCallbackTests.\(UUID().uuidString)"
+  let defaults = UserDefaults(suiteName: suiteName)!
+  defer { defaults.removePersistentDomain(forName: suiteName) }
+
+  let controller = DisplaySelectionController(defaults: defaults)
+  var callbackCount = 0
+  controller.onSelectionChange = { callbackCount += 1 }
+
+  controller.setBehavior(.pinned)
+  #expect(callbackCount == 1)
+
+  controller.setPinnedDisplay("different-display")
+  #expect(callbackCount == 2)
+}
+
+@Test
+func commandRunnerDrainsLargeStandardOutputAndErrorStreams() {
+  let script = """
+    i=0
+    while [ "$i" -lt 10000 ]; do
+      printf 'stdout-data\n'
+      printf 'stderr-data\n' >&2
+      i=$((i + 1))
+    done
+    exit 7
+    """
+
+  let result = IntegrationSettingsController.run(
+    executableURL: URL(fileURLWithPath: "/bin/sh"),
+    arguments: ["-c", script]
+  )
+
+  #expect(result.message.hasPrefix("stderr-data"))
+  #expect(result.message.utf8.count > 65_536)
+}
+
+@MainActor
+@Test
 func displaySelectionMigratesExistingPinnedDisplayPreference() {
   let suiteName = "DisplaySelectionMigrationTests.\(UUID().uuidString)"
   let defaults = UserDefaults(suiteName: suiteName)!
@@ -75,6 +114,24 @@ func externalDisplayVisibilityPreferencePersists() {
 
   let reloadedController = DisplaySelectionController(defaults: defaults)
   #expect(reloadedController.hidesOnExternalDisplays)
+}
+
+@MainActor
+@Test
+func systemSectionDefaultsOffAndPersistsOptIn() {
+  let suiteName = "SystemSectionPreferenceTests.\(UUID().uuidString)"
+  let defaults = UserDefaults(suiteName: suiteName)!
+  defer { defaults.removePersistentDomain(forName: suiteName) }
+
+  let controller = SystemMonitorController(defaults: defaults)
+  #expect(!controller.isEnabled)
+
+  controller.setEnabled(true)
+  #expect(controller.isEnabled)
+  #expect(defaults.bool(forKey: SystemMonitorController.enabledPreferenceKey))
+
+  controller.setEnabled(false)
+  #expect(!controller.isEnabled)
 }
 
 @MainActor

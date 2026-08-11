@@ -9,6 +9,8 @@ final class ActivityHTTPServer: ObservableObject, @unchecked Sendable {
   typealias ListHandler = @Sendable () async -> [AIActivity]
   typealias BrowserMediaHandler =
     @Sendable (BrowserMediaEvent) async throws -> BrowserMediaBridgeResponse
+  typealias BrowserDownloadHandler =
+    @Sendable (BrowserDownloadEvent) async throws -> BrowserDownloadBridgeResponse
 
   enum State: Equatable, Sendable {
     case stopped
@@ -35,6 +37,7 @@ final class ActivityHTTPServer: ObservableObject, @unchecked Sendable {
   private let ingestHandler: IngestHandler
   private let listHandler: ListHandler
   private let browserMediaHandler: BrowserMediaHandler
+  private let browserDownloadHandler: BrowserDownloadHandler
   private var listener: NWListener?
 
   init(
@@ -42,13 +45,15 @@ final class ActivityHTTPServer: ObservableObject, @unchecked Sendable {
     token: String,
     ingestHandler: @escaping IngestHandler,
     listHandler: @escaping ListHandler,
-    browserMediaHandler: @escaping BrowserMediaHandler
+    browserMediaHandler: @escaping BrowserMediaHandler,
+    browserDownloadHandler: @escaping BrowserDownloadHandler
   ) {
     self.port = port
     self.token = token
     self.ingestHandler = ingestHandler
     self.listHandler = listHandler
     self.browserMediaHandler = browserMediaHandler
+    self.browserDownloadHandler = browserDownloadHandler
   }
 
   func start() {
@@ -76,6 +81,7 @@ final class ActivityHTTPServer: ObservableObject, @unchecked Sendable {
     let ingestHandler = ingestHandler
     let listHandler = listHandler
     let browserMediaHandler = browserMediaHandler
+    let browserDownloadHandler = browserDownloadHandler
     let queue = queue
 
     newListener.stateUpdateHandler = { [weak self, weak newListener] newState in
@@ -92,7 +98,8 @@ final class ActivityHTTPServer: ObservableObject, @unchecked Sendable {
         token: token,
         ingestHandler: ingestHandler,
         listHandler: listHandler,
-        browserMediaHandler: browserMediaHandler
+        browserMediaHandler: browserMediaHandler,
+        browserDownloadHandler: browserDownloadHandler
       ).start(on: queue)
     }
     listener = newListener
@@ -172,6 +179,7 @@ private final class HTTPConnection: @unchecked Sendable {
   private let ingestHandler: ActivityHTTPServer.IngestHandler
   private let listHandler: ActivityHTTPServer.ListHandler
   private let browserMediaHandler: ActivityHTTPServer.BrowserMediaHandler
+  private let browserDownloadHandler: ActivityHTTPServer.BrowserDownloadHandler
   private var buffer = Data()
   private var queue: DispatchQueue?
 
@@ -180,13 +188,15 @@ private final class HTTPConnection: @unchecked Sendable {
     token: String,
     ingestHandler: @escaping ActivityHTTPServer.IngestHandler,
     listHandler: @escaping ActivityHTTPServer.ListHandler,
-    browserMediaHandler: @escaping ActivityHTTPServer.BrowserMediaHandler
+    browserMediaHandler: @escaping ActivityHTTPServer.BrowserMediaHandler,
+    browserDownloadHandler: @escaping ActivityHTTPServer.BrowserDownloadHandler
   ) {
     self.connection = connection
     self.token = token
     self.ingestHandler = ingestHandler
     self.listHandler = listHandler
     self.browserMediaHandler = browserMediaHandler
+    self.browserDownloadHandler = browserDownloadHandler
   }
 
   func start(on queue: DispatchQueue) {
@@ -242,6 +252,8 @@ private final class HTTPConnection: @unchecked Sendable {
       ingest(request.body)
     } else if request.method == "POST", request.path == "/v1/browser-media" {
       ingestBrowserMedia(request.body)
+    } else if request.method == "POST", request.path == "/v1/browser-downloads" {
+      ingestBrowserDownload(request.body)
     } else if request.method == "GET", request.path == "/v1/activities" {
       list()
     } else {
@@ -275,10 +287,14 @@ private final class HTTPConnection: @unchecked Sendable {
   private func ingestBrowserMedia(_ body: Data) {
     let event: BrowserMediaEvent
     do {
-      event = try ActivityCoding.makeDecoder().decode(
+      let decodedEvent = try ActivityCoding.makeDecoder().decode(
         BrowserMediaEvent.self,
         from: body
       )
+      event = try decodedEvent.validated()
+    } catch let error as BrowserMediaEventValidationError {
+      send(.text(status: 422, message: error.localizedDescription))
+      return
     } catch {
       send(.text(status: 400, message: "Invalid browser media JSON"))
       return
@@ -287,6 +303,33 @@ private final class HTTPConnection: @unchecked Sendable {
     Task {
       do {
         let response = try await browserMediaHandler(event)
+        let data = try ActivityCoding.makeEncoder().encode(response)
+        send(.data(status: 200, contentType: "application/json", body: data))
+      } catch {
+        send(.text(status: 422, message: error.localizedDescription))
+      }
+    }
+  }
+
+  private func ingestBrowserDownload(_ body: Data) {
+    let event: BrowserDownloadEvent
+    do {
+      let decodedEvent = try ActivityCoding.makeDecoder().decode(
+        BrowserDownloadEvent.self,
+        from: body
+      )
+      event = try decodedEvent.validated()
+    } catch let error as BrowserDownloadValidationError {
+      send(.text(status: 422, message: error.localizedDescription))
+      return
+    } catch {
+      send(.text(status: 400, message: "Invalid browser download JSON"))
+      return
+    }
+
+    Task {
+      do {
+        let response = try await browserDownloadHandler(event)
         let data = try ActivityCoding.makeEncoder().encode(response)
         send(.data(status: 200, contentType: "application/json", body: data))
       } catch {

@@ -1,12 +1,14 @@
 {
   "manifest_version": 3,
-  "name": "NotchRouter Browser Media",
-  "version": "0.1.0",
-  "description": "Shows active browser media in NotchRouter and relays supported playback controls.",
+  "name": "NotchRouter Browser Bridge",
+  "version": "0.2.0",
+  "description": "Shows active browser media and optional download progress in NotchRouter.",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA1EiqsPTNNFiv72qLQ+akaXMUijVAacAbD6TVgAQLUAbvtgXYKpq+Yo06/0tr1EEV2YchpLCWdXpcUt1rMMYDDIJozrCqdmvtdPaYPHVqKZ5Nz/7saMlkKTDIkWP2CH3Ou5jumrkhbwcr9gf6DK9UlD5pP1ND0JKSRtpwEA56VsPopC6FqxJfafhjNFprhEP589WmufrqNVbPy6inXyYxq2CiUDcvhh95+MwhBGEDVg/a08sitXWzSasz4fwg4rd3IRjcjnNm5C2Dl3IU1b1KEV3+/mYpBhBUlJa0OzKop/8UHLcNqDurm0d8jfBbcyI9MNrxA8yZBu1MrY3AzmYRlQIDAQAB",
   "permissions": [
-    "nativeMessaging",
-    "tabs"
+    "nativeMessaging"
+  ],
+  "optional_permissions": [
+    "downloads"
   ],
   "background": {
     "service_worker": "background.js"
@@ -19,6 +21,6 @@
     }
   ],
   "action": {
-    "default_title": "NotchRouter Browser Media"
+    "default_title": "Enable NotchRouter download progress"
   }
 }

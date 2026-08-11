@@ -63,8 +63,12 @@ enum NotchBrowserHost {
   }
 
   private static func forward(_ body: Data) async throws -> Data {
+    let kind = try JSONDecoder().decode(MessageEnvelope.self, from: body).kind
+    let path = kind.hasPrefix("download") || kind == "downloads_heartbeat"
+      ? "/v1/browser-downloads"
+      : "/v1/browser-media"
     var request = URLRequest(
-      url: URL(string: "http://127.0.0.1:48271/v1/browser-media")!
+      url: URL(string: "http://127.0.0.1:48271\(path)")!
     )
     request.httpMethod = "POST"
     request.httpBody = body
@@ -83,6 +87,10 @@ enum NotchBrowserHost {
     }
     return data
   }
+}
+
+private struct MessageEnvelope: Decodable {
+  let kind: String
 }
 
 private enum BrowserHostError: Error {

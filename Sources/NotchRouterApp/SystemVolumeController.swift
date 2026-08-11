@@ -10,14 +10,49 @@ final class SystemVolumeController: ObservableObject {
   @Published private(set) var isAvailable = false
 
   private var observedDevice = AudioDeviceID(kAudioObjectUnknown)
-  private var defaultDeviceListener: AudioObjectPropertyListenerBlock?
-  private var volumeListener: AudioObjectPropertyListenerBlock?
-  private var muteListener: AudioObjectPropertyListenerBlock?
+  nonisolated(unsafe) private var defaultDeviceListener:
+    AudioObjectPropertyListenerBlock?
+  nonisolated(unsafe) private var volumeListener: AudioObjectPropertyListenerBlock?
+  nonisolated(unsafe) private var muteListener: AudioObjectPropertyListenerBlock?
   private var lastAudibleLevel = 0.5
 
   init() {
     refresh()
     observeDefaultOutputDevice()
+  }
+
+  deinit {
+    if let defaultDeviceListener {
+      var address = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain
+      )
+      AudioObjectRemovePropertyListenerBlock(
+        AudioObjectID(kAudioObjectSystemObject),
+        &address,
+        .main,
+        defaultDeviceListener
+      )
+    }
+    if observedDevice != kAudioObjectUnknown, let volumeListener {
+      var address = Self.volumeAddress
+      AudioObjectRemovePropertyListenerBlock(
+        observedDevice,
+        &address,
+        .main,
+        volumeListener
+      )
+    }
+    if observedDevice != kAudioObjectUnknown, let muteListener {
+      var address = Self.muteAddress
+      AudioObjectRemovePropertyListenerBlock(
+        observedDevice,
+        &address,
+        .main,
+        muteListener
+      )
+    }
   }
 
   var effectiveLevel: Double {
@@ -179,7 +214,7 @@ final class SystemVolumeController: ObservableObject {
     }
   }
 
-  private static var volumeAddress: AudioObjectPropertyAddress {
+  nonisolated private static var volumeAddress: AudioObjectPropertyAddress {
     AudioObjectPropertyAddress(
       mSelector: kAudioHardwareServiceDeviceProperty_VirtualMainVolume,
       mScope: kAudioDevicePropertyScopeOutput,
@@ -187,7 +222,7 @@ final class SystemVolumeController: ObservableObject {
     )
   }
 
-  private static var muteAddress: AudioObjectPropertyAddress {
+  nonisolated private static var muteAddress: AudioObjectPropertyAddress {
     AudioObjectPropertyAddress(
       mSelector: kAudioDevicePropertyMute,
       mScope: kAudioDevicePropertyScopeOutput,

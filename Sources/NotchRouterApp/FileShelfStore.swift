@@ -38,7 +38,8 @@ struct ShelfItem: Codable, Identifiable, Equatable {
 @MainActor
 final class FileShelfStore: NSObject, ObservableObject,
   @preconcurrency QLPreviewPanelDataSource,
-  QLPreviewPanelDelegate
+  QLPreviewPanelDelegate,
+  NSSharingServiceDelegate
 {
   @Published private(set) var items: [ShelfItem] = []
   @Published private(set) var lastError: String?
@@ -47,6 +48,9 @@ final class FileShelfStore: NSObject, ObservableObject,
   private var previewedItemID: UUID?
   private var previewURL: URL?
   private var previewIsAccessingSecurityScope = false
+  private var resolvedURLCache: [UUID: URL] = [:]
+  private var activeAirDropURLs: [ObjectIdentifier: URL] = [:]
+  private var activeAirDropServices: [ObjectIdentifier: NSSharingService] = [:]
 
   init(storageURL: URL = AppPaths.fileShelfFile) {
     self.storageURL = storageURL
@@ -60,6 +64,7 @@ final class FileShelfStore: NSObject, ObservableObject,
 
   func add(_ urls: [URL]) {
     lastError = nil
+    resolvedURLCache.removeAll()
 
     for url in urls {
       guard url.isFileURL else { continue }
@@ -85,18 +90,21 @@ final class FileShelfStore: NSObject, ObservableObject,
     if previewedItemID == id {
       closePreview()
     }
+    resolvedURLCache[id] = nil
     items.removeAll { $0.id == id }
     persist()
   }
 
   func clear() {
     closePreview()
+    resolvedURLCache.removeAll()
     items.removeAll()
     persist()
   }
 
   @discardableResult
   func removeMissingItems() -> Int {
+    resolvedURLCache.removeAll()
     let missingIDs = Set(
       items.filter { resolvedURL(for: $0) == nil }.map(\.id)
     )
@@ -142,13 +150,23 @@ final class FileShelfStore: NSObject, ObservableObject,
   }
 
   func airDrop(_ item: ShelfItem) {
-    withResolvedURL(for: item) { url in
-      guard let service = NSSharingService(named: .sendViaAirDrop) else {
-        self.lastError = "AirDrop is unavailable on this Mac."
-        return
-      }
-      service.perform(withItems: [url])
+    guard let url = resolvedURL(for: item) else {
+      lastError = "\(item.name) is no longer available."
+      return
     }
+    guard let service = NSSharingService(named: .sendViaAirDrop) else {
+      lastError = "AirDrop is unavailable on this Mac."
+      return
+    }
+
+    let identifier = ObjectIdentifier(service)
+    if url.startAccessingSecurityScopedResource() {
+      activeAirDropURLs[identifier] = url
+    }
+    activeAirDropServices[identifier] = service
+    service.delegate = self
+    lastError = nil
+    service.perform(withItems: [url])
   }
 
   func quickLook(_ item: ShelfItem) {
@@ -174,20 +192,68 @@ final class FileShelfStore: NSObject, ObservableObject,
   }
 
   func resolvedURL(for item: ShelfItem) -> URL? {
-    var isStale = false
-    if let url = try? URL(
-      resolvingBookmarkData: item.bookmark,
-      options: [.withSecurityScope, .withoutUI],
-      relativeTo: nil,
-      bookmarkDataIsStale: &isStale
-    ) {
-      if FileManager.default.fileExists(atPath: url.path) {
-        return url
+    if let cachedURL = resolvedURLCache[item.id] {
+      guard FileManager.default.fileExists(atPath: cachedURL.path) else {
+        resolvedURLCache[item.id] = nil
+        return nil
       }
+      return cachedURL
     }
 
-    let fallback = URL(fileURLWithPath: item.path)
-    return FileManager.default.fileExists(atPath: fallback.path) ? fallback : nil
+    var isStale = false
+    do {
+      let url = try URL(
+        resolvingBookmarkData: item.bookmark,
+        options: [.withSecurityScope, .withoutUI],
+        relativeTo: nil,
+        bookmarkDataIsStale: &isStale
+      )
+      guard FileManager.default.fileExists(atPath: url.path) else { return nil }
+
+      if isStale {
+        let didAccess = url.startAccessingSecurityScopedResource()
+        defer {
+          if didAccess {
+            url.stopAccessingSecurityScopedResource()
+          }
+        }
+        guard
+          let refreshedBookmark = try? url.bookmarkData(
+            options: [.withSecurityScope, .securityScopeAllowOnlyReadAccess],
+            includingResourceValuesForKeys: [.nameKey, .isDirectoryKey],
+            relativeTo: nil
+          ),
+          let index = items.firstIndex(where: { $0.id == item.id })
+        else { return nil }
+        items[index].bookmark = refreshedBookmark
+        persist()
+      }
+
+      resolvedURLCache[item.id] = url
+      return url
+    } catch {
+      let fallback = URL(fileURLWithPath: item.path)
+      guard FileManager.default.fileExists(atPath: fallback.path) else {
+        return nil
+      }
+      resolvedURLCache[item.id] = fallback
+      return fallback
+    }
+  }
+
+  func sharingService(
+    _ sharingService: NSSharingService,
+    didShareItems items: [Any]
+  ) {
+    finishAirDrop(using: sharingService)
+  }
+
+  func sharingService(
+    _ sharingService: NSSharingService,
+    didFailToShareItems items: [Any],
+    error: any Error
+  ) {
+    finishAirDrop(using: sharingService)
   }
 
   func icon(for item: ShelfItem) -> NSImage {
@@ -232,6 +298,13 @@ final class FileShelfStore: NSObject, ObservableObject,
     endPreviewAccess()
   }
 
+  private func finishAirDrop(using service: NSSharingService) {
+    let identifier = ObjectIdentifier(service)
+    activeAirDropURLs.removeValue(forKey: identifier)?
+      .stopAccessingSecurityScopedResource()
+    activeAirDropServices[identifier] = nil
+  }
+
   private func endPreviewAccess() {
     if previewIsAccessingSecurityScope {
       previewURL?.stopAccessingSecurityScopedResource()
@@ -242,6 +315,7 @@ final class FileShelfStore: NSObject, ObservableObject,
   }
 
   private func load() {
+    resolvedURLCache.removeAll()
     do {
       let data = try Data(contentsOf: storageURL)
       items = try ActivityCoding.makeDecoder().decode(
@@ -260,7 +334,8 @@ final class FileShelfStore: NSObject, ObservableObject,
     do {
       try FileManager.default.createDirectory(
         at: storageURL.deletingLastPathComponent(),
-        withIntermediateDirectories: true
+        withIntermediateDirectories: true,
+        attributes: [.posixPermissions: 0o700]
       )
       let data = try ActivityCoding.makeEncoder(prettyPrinted: true)
         .encode(items)

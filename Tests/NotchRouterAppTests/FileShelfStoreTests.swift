@@ -6,6 +6,31 @@ import Testing
 
 @MainActor
 @Test
+func fileShelfCreatesItsStorageDirectoryWithPrivatePermissions() throws {
+  let rootURL = FileManager.default.temporaryDirectory
+    .appendingPathComponent("FileShelfDirectoryPermissionsTests-\(UUID().uuidString)")
+  let storageDirectoryURL = rootURL.appendingPathComponent("shelf-data")
+  let storageURL = storageDirectoryURL.appendingPathComponent("shelf.json")
+  let fileURL = rootURL.appendingPathComponent("document.txt")
+  try FileManager.default.createDirectory(
+    at: rootURL,
+    withIntermediateDirectories: true
+  )
+  try Data("document".utf8).write(to: fileURL)
+  defer { try? FileManager.default.removeItem(at: rootURL) }
+
+  let store = FileShelfStore(storageURL: storageURL)
+  store.add([fileURL])
+
+  let attributes = try FileManager.default.attributesOfItem(
+    atPath: storageDirectoryURL.path
+  )
+  let permissions = try #require(attributes[.posixPermissions] as? NSNumber)
+  #expect(permissions.intValue & 0o777 == 0o700)
+}
+
+@MainActor
+@Test
 func fileShelfRemovesMissingItemsAndPersistsCleanup() throws {
   let rootURL = FileManager.default.temporaryDirectory
     .appendingPathComponent("FileShelfTests-\(UUID().uuidString)")

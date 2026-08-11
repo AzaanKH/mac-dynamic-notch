@@ -109,9 +109,10 @@ also supports a local `notarytool` keychain profile through
 
 ## Crash reporting and privacy
 
-Sentry starts before AppKit finishes launching only when the packaged plist has
-a `SentryDSN`. Local source builds therefore do not send reports. Release builds
-set `sendDefaultPii` to `false`, attach the exact
+Sentry starts before AppKit finishes launching only when the user has enabled
+Share crash reports and the packaged plist has a `SentryDSN`. Consent defaults
+off, and local source builds do not include a DSN. Release builds set
+`sendDefaultPii` to `false`, attach the exact
 `com.notchrouter.app@VERSION+BUILD` release, and upload matching universal
 dSYMs so native crashes can be symbolicated.
 

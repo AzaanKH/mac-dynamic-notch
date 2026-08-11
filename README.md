@@ -1,11 +1,12 @@
 # NotchRouter
 
-NotchRouter is a native macOS notch hub for live AI work, files, music, and
-clipboard history. It uses a transparent AppKit panel at the top center of the
-active display and hosts a restrained SwiftUI interface inside it.
+NotchRouter is a native macOS notch hub for live AI work, files, music,
+clipboard history, and local system status. It uses a transparent AppKit panel
+at the top center of the active display and hosts a restrained SwiftUI
+interface inside it.
 
 The compact surface prioritizes one live signal at a time. The expanded surface
-provides five focused sections instead of turning the notch into a dense
+provides six focused sections instead of turning the notch into a dense
 control-center dashboard.
 
 ## What is implemented
@@ -14,7 +15,7 @@ control-center dashboard.
   regions, with a software-notch fallback on external displays.
 - A borderless `NSPanel` across Spaces and full-screen apps.
 - Keyboard-first operation: Option-Space opens Activity globally, Escape
-  collapses, Left/Right Arrow cycles sections, 1–5 jumps directly to a
+  collapses, Left/Right Arrow cycles sections, 1–6 jumps directly to a
   section, and Tab/Shift-Tab traverses controls.
 - Compact, hover/peek, and expanded states with reduced-motion support.
 - Contextual hover shortcuts for jumping directly to Activity, Files, Music,
@@ -34,8 +35,14 @@ control-center dashboard.
 - Opt-in Apple Music and Spotify metadata and controls using bounded,
   background Apple Events. No private MediaRemote framework is loaded.
 - An opt-in Manifest V3 extension for Chrome, Edge, Brave, and Chromium that
-  relays active audio/video metadata and supported controls through an
-  authenticated native-messaging host.
+  relays active audio/video metadata and, with a separate optional Downloads
+  permission, download progress and controls through an authenticated
+  native-messaging host.
+- Event-driven Mac charging percentage and time-to-full status from IOKit,
+  shown contextually on the compact surface while charging.
+- An opt-in combined System section for aggregate CPU and memory usage, memory
+  pressure, free disk space, thermal state, Low Power Mode, local connection
+  state, Wi-Fi signal, VPN detection, and network throughput.
 - System output volume and mute controls in both the hover mini-player and the
   expanded Music section, implemented with public Core Audio APIs.
 - A native Settings window for launch-at-login, pointer/active-window/pinned
@@ -73,7 +80,7 @@ symbol upload, and Sparkle's signed appcast are handled by the tag-driven
 release workflow. See [Releasing NotchRouter](docs/RELEASING.md) for required
 credentials and verification commands.
 
-## Focus, files, music, and clipboard
+## Focus, files, music, clipboard, and system status
 
 Click the notch and choose a section from the navigation strip.
 
@@ -101,6 +108,12 @@ Items can be dragged back into another app, previewed with Quick Look, opened
 with a double-click, revealed in Finder, or deliberately sent through AirDrop.
 Unavailable items are marked as missing; **Clean Missing** removes only those
 stale shelf entries and never deletes files from disk.
+
+Chromium download history also appears inside Files when the browser bridge's
+optional Downloads permission is enabled. Active downloads take over the
+compact surface when no AI activity has priority. Pause, resume, cancel, and
+Finder reveal commands are returned to the browser through native messaging;
+the app never performs or proxies the download itself.
 
 ### Music
 
@@ -135,15 +148,21 @@ NotchRouter also holds a per-user process lock. Launching another installed or
 development copy brings the existing instance forward instead of creating a
 second panel over the notch.
 
-#### Browser media
+#### Browser media and downloads
 
 The packaged app includes an opt-in browser extension for Google Chrome,
 Microsoft Edge, Brave, and Chromium. Open **Settings → Integrations → Browser
-media** and choose **Install Browser Bridge**. Then:
+bridge** and choose **Install Browser Bridge**. Then:
 
 1. Open the browser's Extensions page and enable Developer mode.
 2. Choose **Load unpacked**.
 3. Select the extension folder opened by NotchRouter.
+
+Media support is then active. To add downloads, pin or open the extension and
+click its toolbar icon, then approve the Downloads permission. An **ON** badge
+indicates access is enabled; clicking again revokes the permission. Download
+updates add no internet traffic because the browser already performs the
+transfer and sends only small local status messages.
 
 Playing audio or video then supplies the page title, creator, site, artwork,
 playback state, position, and duration to the Music surface. Play/pause works on
@@ -167,6 +186,22 @@ The same setup is available from the CLI:
 Safari requires a separately signed Safari app extension, and persistent
 Firefox installation requires a signed add-on, so neither is advertised as
 supported by this local package. No private MediaRemote framework is loaded.
+
+### Battery and System
+
+While the Mac is charging, the compact surface can show battery percentage and
+the IOKit time-to-full estimate. It displays **Calculating…** when macOS has not
+yet stabilized the estimate. Accessory batteries are intentionally not
+advertised because macOS has no single reliable public API for AirPods, Magic
+accessories, and other Bluetooth devices.
+
+Choose **System**, or enable it under **Settings → General → System section**,
+for aggregate CPU, memory pressure and use, disk, thermal, Low Power Mode, and
+network information. Sampling runs every two seconds while compact and every
+second while expanded, and stops when the feature is disabled. The metrics use
+local APIs and interface counters. **Test connection** is the only action that
+contacts the internet; it sends an on-demand HEAD request to Apple's small
+connectivity endpoint and reports elapsed time.
 
 ### Clipboard
 
@@ -327,8 +362,8 @@ clipboard history under:
 
 Clipboard and file-shelf files are written with mode `0600`. The music
 integration stores no listening history; only the latest in-memory snapshot is
-shown. System Notifications, Music, and Clipboard are all disabled until the
-user enables the relevant capability.
+shown. System Notifications, Music, Clipboard, browser downloads, and System
+metrics are disabled until the user enables the relevant capability.
 
 ## Recommended adapter contract
 
