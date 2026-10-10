@@ -101,6 +101,9 @@ final class MusicController: NSObject {
     .milliseconds(480),
   ]
   static let browserSessionTimeout: TimeInterval = 12
+  /// Hidden, silent tabs can have timers throttled to once a minute. Closed
+  /// tabs and unloaded pages still end their sessions explicitly.
+  static let backgroundBrowserSessionTimeout: TimeInterval = 90
   static let artworkPaletteCacheLimit = 12
 
   private(set) var isEnabled: Bool
@@ -116,24 +119,44 @@ final class MusicController: NSObject {
   private var browserExpiryTimer: Timer?
   private var refreshTask: Task<Void, Never>?
   private var transportRefreshTask: Task<Void, Never>?
+  /// Native controls run one at a time, in order. Each is a separate
+  /// `osascript` process, so unordered runs could finish out of order.
+  @ObservationIgnored private var nativeControlChain: Task<Void, Never>?
+  /// Newest seek target not yet sent. Seeks queued behind a running command
+  /// collapse into one, so scrubbing does not build a backlog of scripts.
+  @ObservationIgnored private var pendingNativeSeek: Double?
   private var refreshAfterCurrentTask = false
   private var nativeSnapshots: [NowPlayingSnapshot] = []
   private var browserSessions: [String: BrowserSession] = [:]
   private var pendingBrowserCommands: [String: [PendingBrowserControl]] = [:]
   private var artworkPaletteCache: [ArtworkSource: MusicArtworkPalette] = [:]
-  private var artworkPaletteFailures: Set<ArtworkSource> = []
+  /// Failed covers are retried with bounded backoff. The loader cannot tell a
+  /// network timeout from an undecodable image, so neither is permanent.
+  private var artworkPaletteFailures: [ArtworkSource: PaletteFailure] = [:]
   private var artworkPaletteTask: Task<Void, Never>?
   private var artworkPaletteRequestURL: ArtworkSource?
   private let artworkPaletteLoader: @Sendable (ArtworkSource) async -> MusicArtworkPalette?
   private let defaults: UserDefaults
+  private let dateProvider: () -> Date
+
+  struct PaletteFailure {
+    var attempts: Int
+    var retryAt: Date
+
+    static func retryDelay(afterAttempts attempts: Int) -> TimeInterval {
+      min(15 * pow(2, Double(max(attempts, 1) - 1)), 600)
+    }
+  }
 
   init(
     defaults: UserDefaults = .standard,
     artworkPaletteLoader: @escaping @Sendable (ArtworkSource) async -> MusicArtworkPalette? = {
       await MusicArtworkPalette.load(source: $0)
-    }
+    },
+    dateProvider: @escaping () -> Date = Date.init
   ) {
     self.artworkPaletteLoader = artworkPaletteLoader
+    self.dateProvider = dateProvider
     self.defaults = defaults
     isEnabled = defaults.bool(forKey: Self.preferenceKey)
     super.init()
@@ -255,7 +278,10 @@ final class MusicController: NSObject {
       snapshot.sampledAt = now
       browserSessions[event.sessionID] = BrowserSession(
         snapshot: snapshot,
-        lastSeenAt: now
+        lastSeenAt: now,
+        timeout: event.isBackground == true
+          ? Self.backgroundBrowserSessionTimeout
+          : Self.browserSessionTimeout
       )
     }
 
@@ -322,7 +348,7 @@ final class MusicController: NSObject {
     browserExpiryTimer = nil
     guard
       let nextExpiry = browserSessions.values
-        .map({ $0.lastSeenAt.addingTimeInterval(Self.browserSessionTimeout) })
+        .map({ $0.lastSeenAt.addingTimeInterval($0.timeout) })
         .min()
     else { return }
 
@@ -373,22 +399,29 @@ final class MusicController: NSObject {
 
   private func updateArtworkPalette() {
     let url = nowPlaying?.artworkSource
-    // Heartbeats update playback position without changing the artwork request.
-    guard url != artworkPaletteRequestURL else { return }
-    artworkPaletteTask?.cancel()
-    artworkPaletteTask = nil
-    artworkPaletteRequestURL = url
-    guard let url else {
+    let now = dateProvider()
+    if url == artworkPaletteRequestURL {
+      // Heartbeats keep the same request. Only a failed cover whose backoff has
+      // elapsed is requested again.
+      guard let url, artworkPaletteTask == nil, artworkPalette == nil,
+        let failure = artworkPaletteFailures[url], now >= failure.retryAt
+      else { return }
+    } else {
+      artworkPaletteTask?.cancel()
+      artworkPaletteTask = nil
+      artworkPaletteRequestURL = url
+      guard let url else {
+        if artworkPalette != nil { artworkPalette = nil }
+        return
+      }
+      if let cached = artworkPaletteCache[url] {
+        if artworkPalette != cached { artworkPalette = cached }
+        return
+      }
       if artworkPalette != nil { artworkPalette = nil }
-      return
+      if let failure = artworkPaletteFailures[url], now < failure.retryAt { return }
     }
-
-    if let cached = artworkPaletteCache[url] {
-      if artworkPalette != cached { artworkPalette = cached }
-      return
-    }
-    if artworkPalette != nil { artworkPalette = nil }
-    if artworkPaletteFailures.contains(url) { return }
+    guard let url else { return }
 
     let loader = artworkPaletteLoader
     artworkPaletteTask = Task { [weak self] in
@@ -397,12 +430,21 @@ final class MusicController: NSObject {
       self.artworkPaletteTask = nil
       guard self.artworkPaletteRequestURL == url else { return }
       guard let palette else {
-        if self.artworkPaletteFailures.count >= Self.artworkPaletteCacheLimit {
+        let attempts = (self.artworkPaletteFailures[url]?.attempts ?? 0) + 1
+        if self.artworkPaletteFailures[url] == nil,
+          self.artworkPaletteFailures.count >= Self.artworkPaletteCacheLimit
+        {
           self.artworkPaletteFailures.removeAll(keepingCapacity: true)
         }
-        self.artworkPaletteFailures.insert(url)
+        self.artworkPaletteFailures[url] = PaletteFailure(
+          attempts: attempts,
+          retryAt: self.dateProvider().addingTimeInterval(
+            PaletteFailure.retryDelay(afterAttempts: attempts)
+          )
+        )
         return
       }
+      self.artworkPaletteFailures[url] = nil
       if self.artworkPaletteCache.count >= Self.artworkPaletteCacheLimit {
         self.artworkPaletteCache.removeAll(keepingCapacity: true)
       }
@@ -452,13 +494,27 @@ final class MusicController: NSObject {
       || control == .previous
       || (control == .playPause && nowPlaying?.isPlaying != true)
 
-    Task { [weak self] in
+    if case .seek(let position) = control {
+      let isQueued = pendingNativeSeek != nil
+      pendingNativeSeek = position
+      if isQueued { return }
+    }
+    let previous = nativeControlChain
+    nativeControlChain = Task { [weak self] in
+      await previous?.value
+      guard let self else { return }
+      var control = control
+      if case .seek = control {
+        guard let target = self.pendingNativeSeek else { return }
+        self.pendingNativeSeek = nil
+        control = .seek(target)
+      }
       let error = await MusicScriptRunner.control(
         control,
         source: source,
         timeout: 2
       )
-      guard let self, !Task.isCancelled else { return }
+      guard !Task.isCancelled else { return }
       self.permissionMessage = error
       if error == nil, requestsPeek {
         self.onChange?(.userTransport)
@@ -513,7 +569,7 @@ final class MusicController: NSObject {
 
   private func pruneBrowserSessions(now: Date) {
     let expiredIDs = browserSessions.compactMap { id, session in
-      now.timeIntervalSince(session.lastSeenAt) > Self.browserSessionTimeout
+      now.timeIntervalSince(session.lastSeenAt) > session.timeout
         ? id
         : nil
     }
@@ -616,6 +672,7 @@ private struct PendingBrowserControl {
 private struct BrowserSession: Sendable {
   let snapshot: NowPlayingSnapshot
   let lastSeenAt: Date
+  let timeout: TimeInterval
 }
 
 private enum BrowserMediaValidationError: LocalizedError {

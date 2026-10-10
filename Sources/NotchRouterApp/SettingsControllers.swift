@@ -216,6 +216,11 @@ final class IntegrationSettingsController {
   private(set) var browserOperationMessage: String?
   private(set) var isRunningBrowserSetup = false
   private(set) var browserExtensionInstalled = false
+  /// Installed integrations keep running the helper copied at install time.
+  /// After an app update that copy can be outdated (for example still using
+  /// TCP), so offer an explicit update instead of failing silently.
+  private(set) var codexHooksNeedUpdate = false
+  private(set) var browserBridgeNeedsUpdate = false
 
   let endpoint: String
 
@@ -386,10 +391,51 @@ final class IntegrationSettingsController {
 
   private func refreshCodexHookStatus() {
     codexHooksInstalled = Self.codexHooksAreInstalled()
+    let installed = codexHooksInstalled
+    Task { [weak self] in
+      let stale = await Task.detached(priority: .utility) {
+        installed && Self.helperIsStale(
+          installed: Self.installedHelperURL("notchctl"),
+          bundled: Self.notchCLIURL()
+        )
+      }.value
+      self?.codexHooksNeedUpdate = stale
+    }
   }
 
   private func refreshBrowserExtensionStatus() {
     browserExtensionInstalled = Self.browserExtensionIsInstalled()
+    let installed = browserExtensionInstalled
+    Task { [weak self] in
+      let stale = await Task.detached(priority: .utility) {
+        installed && Self.helperIsStale(
+          installed: Self.installedHelperURL("notchrouter-browser-host"),
+          bundled: Self.notchCLIURL()?.deletingLastPathComponent()
+            .appendingPathComponent("notchrouter-browser-host")
+        )
+      }.value
+      self?.browserBridgeNeedsUpdate = stale
+    }
+  }
+
+  nonisolated private static func installedHelperURL(_ name: String) -> URL {
+    AppPaths.applicationSupportDirectory
+      .appendingPathComponent("bin", isDirectory: true)
+      .appendingPathComponent(name)
+  }
+
+  /// An installed helper is stale when it differs from the copy bundled with
+  /// the running app. Without a bundled copy to compare against, assume it is
+  /// current rather than nag.
+  nonisolated static func helperIsStale(installed: URL, bundled: URL?) -> Bool {
+    guard let bundled, FileManager.default.isReadableFile(atPath: bundled.path) else {
+      return false
+    }
+    guard
+      let installedData = try? Data(contentsOf: installed, options: .mappedIfSafe),
+      let bundledData = try? Data(contentsOf: bundled, options: .mappedIfSafe)
+    else { return true }
+    return installedData != bundledData
   }
 
   nonisolated private static func notchCLIURL() -> URL? {

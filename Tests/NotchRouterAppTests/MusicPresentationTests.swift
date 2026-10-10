@@ -1,3 +1,4 @@
+import CoreGraphics
 import Foundation
 import NotchRouterCore
 import Testing
@@ -216,4 +217,87 @@ func playbackTimelineInterpolatesRateAndClampsAtDuration() {
   #expect(value.elapsed(at: Date(timeIntervalSince1970: 90)) == 12)
   let paused = snapshot(title: "Episode", isPlaying: false)
   #expect(paused.elapsed(at: Date().addingTimeInterval(50)) == 12)
+}
+
+private actor FlakyPaletteLoader {
+  private(set) var requests = 0
+  let palette: MusicArtworkPalette
+
+  init(palette: MusicArtworkPalette) { self.palette = palette }
+
+  func load() -> MusicArtworkPalette? {
+    requests += 1
+    return requests == 1 ? nil : palette
+  }
+}
+
+@MainActor
+@Test
+func failedArtworkPaletteIsRetriedAfterBackoff() async throws {
+  let identifier = UUID().uuidString
+  let defaults = try #require(UserDefaults(suiteName: identifier))
+  defer { defaults.removePersistentDomain(forName: identifier) }
+  let context = try #require(CGContext(
+    data: nil, width: 4, height: 4, bitsPerComponent: 8, bytesPerRow: 0,
+    space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+  ))
+  context.setFillColor(red: 0.9, green: 0.2, blue: 0.3, alpha: 1)
+  context.fill(CGRect(x: 0, y: 0, width: 4, height: 4))
+  let image = try #require(context.makeImage())
+  let palette = try #require(MusicArtworkPalette.extract(from: image))
+  let loader = FlakyPaletteLoader(palette: palette)
+  var now = Date(timeIntervalSince1970: 1_000)
+  let controller = MusicController(
+    defaults: defaults,
+    artworkPaletteLoader: { _ in await loader.load() },
+    dateProvider: { now }
+  )
+  let data = Data([7, 8, 9])
+  let heartbeat = BrowserMediaEvent(
+    kind: .update, sessionID: "retry", browserName: "Test", title: "Track",
+    artworkData: data, isPlaying: true
+  )
+  func settle() async { for _ in 0..<100 { await Task.yield() } }
+
+  _ = try controller.ingestBrowserMedia(heartbeat)
+  await settle()
+  #expect(await loader.requests == 1)
+  #expect(controller.artworkPalette == nil)
+
+  // Within the backoff window heartbeats do not retry.
+  now += 5
+  _ = try controller.ingestBrowserMedia(heartbeat)
+  await settle()
+  #expect(await loader.requests == 1)
+
+  // Once it elapses, the next heartbeat retries and the palette appears.
+  now += MusicController.PaletteFailure.retryDelay(afterAttempts: 1)
+  _ = try controller.ingestBrowserMedia(heartbeat)
+  await settle()
+  #expect(await loader.requests == 2)
+  #expect(controller.artworkPalette == palette)
+}
+
+@MainActor
+@Test
+func backgroundBrowserSessionsOutliveTimerThrottling() throws {
+  let identifier = UUID().uuidString
+  let defaults = try #require(UserDefaults(suiteName: identifier))
+  defer { defaults.removePersistentDomain(forName: identifier) }
+  let start = Date(timeIntervalSince1970: 5_000)
+
+  for (isBackground, survives) in [(true, true), (false, false)] {
+    let controller = MusicController(defaults: defaults)
+    _ = try controller.ingestBrowserMedia(BrowserMediaEvent(
+      kind: .update, sessionID: "tab", browserName: "Chrome", title: "Paused episode",
+      isPlaying: false, isBackground: isBackground
+    ), now: start)
+    // Another session's message prunes expired sessions a minute later, as a
+    // throttled hidden tab would still be waiting to send its next heartbeat.
+    _ = try controller.ingestBrowserMedia(BrowserMediaEvent(
+      kind: .ended, sessionID: "other", browserName: "Chrome"
+    ), now: start.addingTimeInterval(60))
+
+    #expect((controller.nowPlaying?.title == "Paused episode") == survives)
+  }
 }

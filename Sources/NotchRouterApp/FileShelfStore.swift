@@ -265,6 +265,11 @@ final class FileShelfStore: NSObject,
       items[index].bookmark = bookmark
       persist()
     }
+    // Actions stay enabled for items shown as missing; when one turns out to be
+    // available again, update the cached status too.
+    if result.url != nil, presentations[item.id]?.url == nil {
+      Task { await refreshPresentation() }
+    }
     return result.url
   }
 

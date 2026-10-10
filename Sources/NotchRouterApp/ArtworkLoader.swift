@@ -14,22 +14,42 @@ actor ArtworkLoader {
   static let maximumBrowserBytes = 32_768
   static let maximumPixels = 16_000_000
   private var cache: [ArtworkSource: CGImage] = [:]
+  /// Loads shared by every consumer of the same cover (palette sampling and
+  /// each visible artwork view). They are unstructured, so one consumer being
+  /// cancelled does not cancel a transfer another consumer still awaits.
+  private var inFlight: [ArtworkSource: Task<CGImage?, Never>] = [:]
+  private let fetch: @Sendable (ArtworkSource) async -> CGImage?
+
+  init(fetch: @escaping @Sendable (ArtworkSource) async -> CGImage? = ArtworkLoader.load) {
+    self.fetch = fetch
+  }
 
   func image(for source: ArtworkSource) async -> CGImage? {
     if let image = cache[source] { return image }
+    if let pending = inFlight[source] { return await pending.value }
+
+    let fetch = fetch
+    let load = Task { await fetch(source) }
+    inFlight[source] = load
+    let image = await load.value
+    inFlight[source] = nil
+    if let image {
+      if cache.count >= 12 { cache.removeAll() }
+      cache[source] = image
+    }
+    return image
+  }
+
+  static func load(_ source: ArtworkSource) async -> CGImage? {
     let data: Data?
     switch source {
-    case .browser(let bytes): data = bytes.count <= Self.maximumBrowserBytes ? bytes : nil
-    case .spotify(let url): data = try? await Self.download(url: url)
+    case .browser(let bytes): data = bytes.count <= maximumBrowserBytes ? bytes : nil
+    case .spotify(let url): data = try? await download(url: url)
     }
-    guard let data, !Task.isCancelled,
-      let image = Self.decode(data, browserThumbnail: {
-        if case .browser = source { return true }; return false
-      }())
-    else { return nil }
-    if cache.count >= 12 { cache.removeAll() }
-    cache[source] = image
-    return image
+    guard let data else { return nil }
+    return decode(data, browserThumbnail: {
+      if case .browser = source { return true }; return false
+    }())
   }
 
   nonisolated static func allowsRemoteURL(_ url: URL) -> Bool {

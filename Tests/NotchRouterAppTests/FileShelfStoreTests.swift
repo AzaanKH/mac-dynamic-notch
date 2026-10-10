@@ -191,3 +191,29 @@ func shelfPresentationIsCachedUntilExplicitRefreshAndActionsRevalidate() async t
   #expect(store.missingItemCount == 0)
   await store.flushPersistence()
 }
+
+@MainActor
+@Test
+func usingARestoredMissingItemRefreshesItsCachedStatus() async throws {
+  let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+  try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+  defer { try? FileManager.default.removeItem(at: directory) }
+  let file = directory.appendingPathComponent("sample.txt")
+  try Data("test".utf8).write(to: file)
+  let store = FileShelfStore(storageURL: directory.appendingPathComponent("shelf.json"))
+  await store.add([file])
+  try FileManager.default.removeItem(at: file)
+  await store.refreshPresentation()
+  let item = try #require(store.items.first)
+  #expect(store.missingItemCount == 1)
+
+  // The file returns without the shelf changing; an action (which stays
+  // enabled for missing items) finds it and the cached status catches up.
+  try Data("restored".utf8).write(to: file)
+  #expect(await store.resolvedURL(for: item) != nil)
+  for _ in 0..<200 where store.missingItemCount != 0 {
+    try await Task.sleep(for: .milliseconds(10))
+  }
+  #expect(store.missingItemCount == 0)
+  await store.flushPersistence()
+}

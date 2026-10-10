@@ -34,6 +34,9 @@ Preconditions: doctor passed; exact verification bundle bound to `notch`.
   `await notch.pressKey("Left")`, then inspect the selected section.
 - Focus traversal: `await notch.pressKey("Tab")` and
   `await notch.pressKey("shift+Tab")`; require the focused element to move.
+  Buttons join the Tab order only when the system Keyboard Navigation setting
+  (`AppleKeyboardUIMode`) is on; with it off, expect Tab to reach text fields
+  such as Search activities.
 - Collapse: click `Collapse notch`; separately test
   `await notch.pressKey("Escape")`. Each should remove expanded controls.
 - Menu entries: select the verification app's menu extra from its own tree,

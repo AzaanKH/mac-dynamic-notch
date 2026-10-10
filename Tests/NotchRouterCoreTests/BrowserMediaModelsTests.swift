@@ -173,3 +173,17 @@ func browserArtworkBytesHaveAnExplicitWireLimit() throws {
     try BrowserMediaEvent(kind: .update, sessionID: "test", browserName: "Browser", artworkData: Data(repeating: 1, count: 32769)).validated()
   }
 }
+
+@Test
+func backgroundFlagDecodesAndStaysOptionalForOlderExtensions() throws {
+  let decoder = JSONDecoder()
+  let hidden = try decoder.decode(BrowserMediaEvent.self, from: Data(#"""
+    {"kind":"update","session_id":"s","browser_name":"Chrome","title":"T","is_background":true}
+    """#.utf8))
+  #expect(hidden.isBackground == true)
+
+  let legacy = try decoder.decode(BrowserMediaEvent.self, from: Data(#"""
+    {"kind":"update","session_id":"s","browser_name":"Chrome","title":"T"}
+    """#.utf8))
+  #expect(legacy.isBackground == nil)
+}

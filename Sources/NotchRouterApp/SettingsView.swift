@@ -590,15 +590,20 @@ private struct IntegrationSettingsView: View {
       SettingsCard(title: "Codex and T3 Code", symbol: "terminal") {
         HStack(spacing: 8) {
           Image(
-            systemName: controller.codexHooksInstalled
-              ? "checkmark.circle.fill"
-              : "circle.dashed"
+            systemName: controller.codexHooksNeedUpdate
+              ? "exclamationmark.triangle.fill"
+              : controller.codexHooksInstalled ? "checkmark.circle.fill" : "circle.dashed"
           )
-          .foregroundStyle(controller.codexHooksInstalled ? .green : .secondary)
+          .foregroundStyle(
+            controller.codexHooksNeedUpdate
+              ? .orange : controller.codexHooksInstalled ? .green : .secondary
+          )
           Text(
-            controller.codexHooksInstalled
-              ? "Lifecycle hooks are installed"
-              : "Lifecycle hooks are not installed"
+            controller.codexHooksNeedUpdate
+              ? "Hooks use an outdated helper and may not reach NotchRouter"
+              : controller.codexHooksInstalled
+                ? "Lifecycle hooks are installed"
+                : "Lifecycle hooks are not installed"
           )
           Spacer()
           if controller.isRunningCodexSetup {
@@ -613,7 +618,11 @@ private struct IntegrationSettingsView: View {
         )
 
         HStack {
-          Button(controller.codexHooksInstalled ? "Reinstall Hooks" : "Install Hooks") {
+          Button(
+            controller.codexHooksNeedUpdate
+              ? "Update Hooks"
+              : controller.codexHooksInstalled ? "Reinstall Hooks" : "Install Hooks"
+          ) {
             controller.installCodexHooks()
           }
           Button("Remove Hooks") {
@@ -632,17 +641,20 @@ private struct IntegrationSettingsView: View {
       SettingsCard(title: "Browser bridge", symbol: "play.rectangle.on.rectangle") {
         HStack(spacing: 8) {
           Image(
-            systemName: controller.browserExtensionInstalled
-              ? "checkmark.circle.fill"
-              : "circle.dashed"
+            systemName: controller.browserBridgeNeedsUpdate
+              ? "exclamationmark.triangle.fill"
+              : controller.browserExtensionInstalled ? "checkmark.circle.fill" : "circle.dashed"
           )
           .foregroundStyle(
-            controller.browserExtensionInstalled ? .green : .secondary
+            controller.browserBridgeNeedsUpdate
+              ? .orange : controller.browserExtensionInstalled ? .green : .secondary
           )
           Text(
-            controller.browserExtensionInstalled
-              ? "Native browser bridge is installed"
-              : "Browser bridge is not installed"
+            controller.browserBridgeNeedsUpdate
+              ? "The bridge uses an outdated helper and may not reach NotchRouter"
+              : controller.browserExtensionInstalled
+                ? "Native browser bridge is installed"
+                : "Browser bridge is not installed"
           )
           Spacer()
           if controller.isRunningBrowserSetup {
@@ -669,7 +681,7 @@ private struct IntegrationSettingsView: View {
             Button("Open Extension Folder") {
               controller.openBrowserExtensionFolder()
             }
-            Button("Reinstall Bridge") {
+            Button(controller.browserBridgeNeedsUpdate ? "Update Bridge" : "Reinstall Bridge") {
               controller.installBrowserExtension()
             }
           }

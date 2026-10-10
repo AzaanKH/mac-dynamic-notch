@@ -45,6 +45,9 @@ final class ActivityHTTPServer {
   private var listener: NWListener?
   private var legacyListener: NWListener?
   private var connections: [UUID: HTTPConnection] = [:]
+  /// Invalidates in-flight socket preparation when the server is stopped or
+  /// restarted before it finishes.
+  private var startGeneration = 0
   private let requestTimeout: TimeInterval
   private let connectionLimit: Int
 
@@ -79,10 +82,32 @@ final class ActivityHTTPServer {
     listener?.cancel()
     listener = nil
     state = .starting
+    startGeneration &+= 1
+    let generation = startGeneration
 
+    guard let socketURL else {
+      installListener(socketURL: nil)
+      return
+    }
+    // Socket preparation touches the filesystem (create, chmod, probe, unlink),
+    // which can stall on a slow home volume, so keep it off the main actor.
+    Task { [weak self] in
+      let preparation = await Task.detached(priority: .utility) {
+        Result { try LocalAPISocket.prepareForListening(at: socketURL) }
+      }.value
+      guard let self, generation == self.startGeneration, self.state == .starting else {
+        return
+      }
+      switch preparation {
+      case .success: self.installListener(socketURL: socketURL)
+      case .failure(let error): self.state = .failed(Self.failure(for: error, port: self.port))
+      }
+    }
+  }
+
+  private func installListener(socketURL: URL?) {
     let newListener: NWListener
     do {
-      if let socketURL { try LocalAPISocket.prepareForListening(at: socketURL) }
       newListener = try makeListener(socketURL: socketURL)
     } catch {
       state = .failed(Self.failure(for: error, port: port))
@@ -180,6 +205,7 @@ final class ActivityHTTPServer {
   }
 
   func stop() {
+    startGeneration &+= 1
     listener?.cancel()
     listener = nil
     legacyListener?.cancel()

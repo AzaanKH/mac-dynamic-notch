@@ -26,13 +26,6 @@ struct NotchRootView: View {
   // the top center of the panel.
   var body: some View {
     ZStack(alignment: .top) {
-      if viewModel.mode == .expanded {
-        // Clicks in the shadow margin count as outside the notch.
-        Color.clear
-          .contentShape(Rectangle())
-          .onTapGesture { viewModel.collapse() }
-      }
-
       // Drawn from the outline alone, outside the surface's clip, so the
       // shadow does not re-render the dashboard content every frame.
       NotchSurfaceShape(metrics)
@@ -140,7 +133,15 @@ struct NotchRootView: View {
   private var content: some View {
     switch viewModel.mode {
     case .compact:
-      menuBarContent
+      // With nothing to show, a physical-notch surface is exactly as wide as
+      // the cutout, so there is no room beside it for any content.
+      if viewModel.hasPhysicalNotch, viewModel.presentation.primary == nil,
+        store.currentActivity == nil
+      {
+        Color.clear
+      } else {
+        menuBarContent
+      }
     case .peek:
       compactContent(isPeek: true)
     case .expanded:

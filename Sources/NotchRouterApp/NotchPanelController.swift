@@ -20,6 +20,7 @@ final class NotchPanelController {
   nonisolated(unsafe) private var screenObserver: NSObjectProtocol?
   nonisolated(unsafe) private var outsideClickMonitor: Any?
   nonisolated(unsafe) private var localClickMonitor: Any?
+  nonisolated(unsafe) private var pointerMonitors: [Any] = []
   nonisolated(unsafe) private var dynamicDisplayTrackingTimer: Timer?
   private var lastResolvedScreenIdentifier: CGDirectDisplayID?
   private var lastResolvedMode: SurfaceMode?
@@ -192,6 +193,22 @@ final class NotchPanelController {
       return event
     }
 
+    // The panel can extend past the visible surface (shadow margin, transition
+    // canvas). Ignore the mouse there so clicks reach the menu bar or windows
+    // below; the outside-click monitor then collapses as for any other click.
+    let pointerEvents: NSEvent.EventTypeMask = [.mouseMoved, .leftMouseDragged]
+    if let global = NSEvent.addGlobalMonitorForEvents(matching: pointerEvents, handler: { [weak self] _ in
+      MainActor.assumeIsolated { self?.updateMousePassThrough() }
+    }) {
+      pointerMonitors.append(global)
+    }
+    if let local = NSEvent.addLocalMonitorForEvents(matching: pointerEvents, handler: { [weak self] event in
+      MainActor.assumeIsolated { self?.updateMousePassThrough() }
+      return event
+    }) {
+      pointerMonitors.append(local)
+    }
+
     updateFrame(for: .compact, animated: false)
     if !isPanelSuppressed {
       panel.orderFrontRegardless()
@@ -209,6 +226,7 @@ final class NotchPanelController {
     if let localClickMonitor {
       NSEvent.removeMonitor(localClickMonitor)
     }
+    pointerMonitors.forEach(NSEvent.removeMonitor)
   }
 
   func show(_ section: NotchSection = .activity) {
@@ -351,6 +369,7 @@ final class NotchPanelController {
       if !NSEqualRects(panel.frame, restingFrame) {
         panel.setFrame(restingFrame, display: true)
       }
+      updateMousePassThrough()
       return
     }
 
@@ -374,12 +393,25 @@ final class NotchPanelController {
     let transitionID = surfaceTransitionID
     isSurfaceTransitioning = true
     panel.setFrame(panelFrame(size: canvas, on: screen), display: true)
+    updateMousePassThrough()
     withAnimation(NotchMotion.surface, completionCriteria: .removed) {
       viewModel.surfaceSize = size
     } completion: { [weak self] in
       guard let self, transitionID == self.surfaceTransitionID else { return }
       self.isSurfaceTransitioning = false
       self.panel.setFrame(restingFrame, display: true)
+      self.updateMousePassThrough()
+    }
+  }
+
+  private func updateMousePassThrough() {
+    let ignores = NotchGeometry.passesMouseThrough(
+      at: NSEvent.mouseLocation,
+      panelFrame: panel.frame,
+      surfaceFrame: surfaceFrame
+    )
+    if panel.ignoresMouseEvents != ignores {
+      panel.ignoresMouseEvents = ignores
     }
   }
 
@@ -650,6 +682,16 @@ struct NotchGeometry {
     }
     size.width += 2 * NotchSurfaceMetrics(mode: mode).earRadius
     return size
+  }
+
+  /// Whether the panel should let a pointer at `point` reach the windows below:
+  /// true only over the panel's transparent area outside the visible surface.
+  static func passesMouseThrough(
+    at point: CGPoint,
+    panelFrame: CGRect,
+    surfaceFrame: CGRect
+  ) -> Bool {
+    panelFrame.contains(point) && !surfaceFrame.contains(point)
   }
 
   /// Panel size once the surface settles. Only the expanded dashboard casts a

@@ -6,8 +6,9 @@ external displays, Spaces, and full-screen apps.
 
 The compact panel shows one live signal at a time. Hover to peek, or click to
 open the six sections. Option-N opens Activity; Escape collapses the panel.
-Left/Right Arrow cycles sections, 1–6 selects a section, and Tab/Shift-Tab moves
-between controls.
+Left/Right Arrow cycles sections and 1–6 selects a section. Tab/Shift-Tab moves
+between text fields, and between all controls when Keyboard Navigation is on in
+System Settings › Keyboard.
 
 Integrations are opt-in. Agents send activity through the local `notchctl` CLI
 or authenticated local API. Music supports Apple Music, Spotify, and an
@@ -94,10 +95,9 @@ and the speaker button toggles mute when the active device supports it.
 The resting music surface is narrower than an AI activity. It shows only the
 cover and playback state around a physical notch. Hover expands it into a
 mini-player with the track, artist, previous/play-pause/next controls, and
-shortcuts to Activity, Files, and Clipboard. A deliberate click opens the full
-Music section immediately. Starting playback or using the previous/next
-controls briefly reveals the mini-player; passive song transitions update the
-compact artwork without opening it.
+shortcuts to the other sections. A deliberate click opens the full Music section
+immediately. Playback changes update the compact artwork and playback state but
+never open the mini-player on their own.
 
 When artwork is available (Spotify or the browser bridge), NotchRouter samples
 the cover art and tints the notch with a soft ambient glow derived from the
@@ -354,10 +354,11 @@ browser-origin requests and requires the token, but another local account can
 impersonate that port while NotchRouter is stopped. The bundled CLI and browser
 bridge never fall back to TCP.
 
-After installing this update, reinstall enabled Codex hooks and the browser bridge
-from Settings so their copied helper executables are updated. Reload the browser
-extension and refresh media tabs. Old helpers use TCP and will not work with the
-new default transport.
+Installed integrations run helper executables copied at install time, and helpers
+from before this update use TCP, which no longer works with the new default
+transport. Settings → Integrations marks hooks or a bridge whose helper differs
+from the running app's copy; choose **Update Hooks** or **Update Bridge**, then
+reload the browser extension and refresh media tabs.
 
 Keep summaries free of secrets:
 send a useful description of an action, not prompts, source code, clipboard

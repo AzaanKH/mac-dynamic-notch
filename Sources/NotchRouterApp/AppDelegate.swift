@@ -31,6 +31,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
   private var showRequestObserver: NSObjectProtocol?
   private var activityExpiryTimer: Timer?
   private var isTerminating = false
+  private var hasRepliedToTermination = false
+  private static let terminationDeadline: Duration = .seconds(5)
 
   func applicationDidFinishLaunching(_ notification: Notification) {
     NSApp.setActivationPolicy(.accessory)
@@ -179,9 +181,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
       await store.flushPersistence()
       await clipboard.flushPersistence()
       await fileShelf.flushPersistence()
-      sender.reply(toApplicationShouldTerminate: true)
+      self.replyToTermination(sender)
+    }
+    // A write stalled on an unavailable volume must not leave Quit pending
+    // forever. Saved files are replaced atomically, so quitting mid-write
+    // keeps the previous copy.
+    Task { @MainActor in
+      try? await Task.sleep(for: Self.terminationDeadline)
+      guard !self.hasRepliedToTermination else { return }
+      NSLog("NotchRouter quit before saving finished; saving took longer than %@", "\(Self.terminationDeadline)")
+      self.replyToTermination(sender)
     }
     return .terminateLater
+  }
+
+  private func replyToTermination(_ sender: NSApplication) {
+    guard !hasRepliedToTermination else { return }
+    hasRepliedToTermination = true
+    sender.reply(toApplicationShouldTerminate: true)
   }
 
   func applicationWillTerminate(_ notification: Notification) {

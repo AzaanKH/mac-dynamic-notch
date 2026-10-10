@@ -128,11 +128,7 @@ test('browser artwork becomes bounded bytes and native requests never receive an
     fetch: async () => ({ ok: true, headers: { get: () => '3' }, body: { getReader: () => ({
       read: async () => remaining.length ? { value: remaining.shift() } : { done: true }, cancel: async () => {},
     }) } }),
-    createImageBitmap: async (_blob, options) => {
-      assert.equal(options.resizeWidth, 256);
-      assert.equal(options.resizeHeight, 256);
-      return { close() { closed = true; } };
-    },
+    createImageBitmap: async () => ({ width: 256, height: 256, close() { closed = true; } }),
     OffscreenCanvas: class {
       getContext() { return { drawImage() {} }; }
       async convertToBlob() { return new Blob([new Uint8Array([4, 5, 6])]); }
@@ -159,4 +155,66 @@ test('late artwork responses cannot restore an ended or replaced page image', as
   completions[1]('new');
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(vm.runInContext('artworkData', context), null);
+});
+
+test('wide artwork is center-cropped to a square instead of stretched', async () => {
+  let drawn;
+  const context = contentContext({
+    Blob, AbortController, btoa,
+    fetch: async () => ({ ok: true, headers: { get: () => '1' }, body: { getReader: () => {
+      let sent = false;
+      return { read: async () => sent ? { done: true } : (sent = true, { value: new Uint8Array([1]) }), cancel: async () => {} };
+    } } }),
+    createImageBitmap: async () => ({ width: 1600, height: 900, close() {} }),
+    OffscreenCanvas: class {
+      getContext() { return { drawImage(...args) { drawn = args.slice(1); } }; }
+      async convertToBlob() { return new Blob([new Uint8Array([1])]); }
+    },
+  });
+  await context.fetchArtworkThumbnail('https://example.com/wide', new AbortController().signal);
+  assert.deepEqual(drawn, [350, 0, 900, 900, 0, 0, 256, 256]);
+});
+
+test('failed artwork is retried after backoff and when the browser comes back online', async () => {
+  let requests = 0;
+  let succeed = false;
+  let now = 1_000_000;
+  const listeners = {};
+  const context = contentContext({
+    AbortController,
+    addEventListener(name, callback) { listeners[name] = callback; },
+  });
+  vm.runInContext('Date.now = () => globalThis.__now', context);
+  context.__now = now;
+  context.fetchArtworkThumbnail = async () => { requests++; return succeed ? 'DATA' : null; };
+  context.scheduleSnapshot = () => {};
+  const settle = () => new Promise(resolve => setImmediate(resolve));
+
+  context.updateArtwork('https://example.com/cover');
+  await settle();
+  assert.equal(requests, 1);
+
+  // Repeated snapshots inside the backoff window do not refetch.
+  context.__now = now + 5_000;
+  context.updateArtwork('https://example.com/cover');
+  await settle();
+  assert.equal(requests, 1);
+
+  // Connectivity returning retries immediately.
+  listeners.online();
+  await settle();
+  assert.equal(requests, 2);
+
+  // After the (doubled) backoff the same URL is requested again and succeeds.
+  succeed = true;
+  context.__now = now + 5_000 + 30_000;
+  context.updateArtwork('https://example.com/cover');
+  await settle();
+  assert.equal(requests, 3);
+  assert.equal(vm.runInContext('artworkData', context), 'DATA');
+
+  // Once loaded, the same URL is never fetched again.
+  context.updateArtwork('https://example.com/cover');
+  await settle();
+  assert.equal(requests, 3);
 });

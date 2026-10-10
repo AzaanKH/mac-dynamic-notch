@@ -237,8 +237,7 @@ struct ActivityStatusGlyph: View {
       .dashboardTint(state.tint)
       .symbolEffect(.pulse, isActive: state == .running && !reduceMotion)
       .symbolEffect(.bounce, options: .repeat(2), value: approvalBounces)
-      .contentTransition(.symbolEffect(.replace))
-      .animation(.snappy(duration: 0.25), value: state)
+      .symbolSwap(on: state)
       // Bounce only on the change into approval, not when a view is created
       // already in that state or when the request is resolved.
       .onChange(of: state) { _, newState in
@@ -493,9 +492,8 @@ struct PlaybackIndicator: View {
   var body: some View {
     Image(systemName: isPlaying ? "waveform" : "pause.fill")
       .symbolEffect(.variableColor.iterative, isActive: isPlaying && !reduceMotion)
-      .contentTransition(.symbolEffect(.replace))
+      .symbolSwap(on: isPlaying)
       .dashboardTint(tint)
-      .animation(.snappy(duration: 0.25), value: isPlaying)
       .accessibilityLabel(isPlaying ? "Playing" : "Paused")
   }
 }
@@ -505,8 +503,18 @@ struct PlayPauseSymbol: View {
 
   var body: some View {
     Image(systemName: isPlaying ? "pause.fill" : "play.fill")
-      .contentTransition(.symbolEffect(.replace))
-      .animation(.snappy(duration: 0.25), value: isPlaying)
+      .symbolSwap(on: isPlaying)
+  }
+}
+
+private struct SymbolSwapModifier<Value: Equatable>: ViewModifier {
+  let value: Value
+  @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+  func body(content: Content) -> some View {
+    content
+      .contentTransition(reduceMotion ? .opacity : .symbolEffect(.replace))
+      .animation(reduceMotion ? NotchMotion.reduced : .snappy(duration: 0.25), value: value)
   }
 }
 
@@ -523,6 +531,12 @@ private struct RollingNumberModifier<Value: Equatable>: ViewModifier {
 }
 
 extension View {
+  /// Animates a change of SF Symbol when `value` changes; fades instead under
+  /// Reduce Motion.
+  func symbolSwap<Value: Equatable>(on value: Value) -> some View {
+    modifier(SymbolSwapModifier(value: value))
+  }
+
   /// Rolls changed digits into place instead of replacing the whole label.
   func rollingNumber<Value: Equatable>(_ value: Value, countsDown: Bool = false) -> some View {
     modifier(RollingNumberModifier(value: value, countsDown: countsDown))

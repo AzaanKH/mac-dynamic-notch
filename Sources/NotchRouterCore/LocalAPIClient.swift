@@ -4,8 +4,33 @@ import Network
 
 /// Filesystem ownership is the server identity boundary for bundled clients.
 public enum LocalAPISocket {
+  /// `sockaddr_un.sun_path` holds 104 bytes including the terminator.
+  static let maximumPathLength = 103
+
   public static var url: URL {
-    AppPaths.applicationSupportDirectory.appendingPathComponent("api.sock")
+    url(
+      preferredDirectory: AppPaths.applicationSupportDirectory,
+      fallbackDirectory: darwinUserCacheDirectory?.appendingPathComponent("NotchRouter")
+    )
+  }
+
+  /// Uses Application Support when the socket path fits. Long or relocated home
+  /// folders fall back to the per-user Darwin cache directory, which is short,
+  /// private to the user, and the same for the app, CLI, and browser host.
+  static func url(preferredDirectory: URL, fallbackDirectory: URL?) -> URL {
+    let preferred = preferredDirectory.appendingPathComponent("api.sock")
+    guard preferred.path.utf8.count > maximumPathLength, let fallbackDirectory else {
+      return preferred
+    }
+    return fallbackDirectory.appendingPathComponent("api.sock")
+  }
+
+  private static var darwinUserCacheDirectory: URL? {
+    let length = confstr(_CS_DARWIN_USER_CACHE_DIR, nil, 0)
+    guard length > 0 else { return nil }
+    var buffer = [CChar](repeating: 0, count: length)
+    guard confstr(_CS_DARWIN_USER_CACHE_DIR, &buffer, length) > 0 else { return nil }
+    return URL(fileURLWithPath: String(cString: buffer), isDirectory: true)
   }
 
   public static func prepareForListening(at url: URL) throws {
@@ -15,7 +40,7 @@ public enum LocalAPISocket {
     )
     try checkOwner(directory, kind: S_IFDIR)
     try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
-    guard url.path.utf8.count < 104 else { throw LocalAPIError.invalidSocket }
+    guard url.path.utf8.count <= maximumPathLength else { throw LocalAPIError.invalidSocket }
     var info = stat()
     guard lstat(url.path, &info) == 0 else {
       if errno == ENOENT { return }

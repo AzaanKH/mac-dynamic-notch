@@ -23,6 +23,9 @@ public struct BrowserMediaEvent: Codable, Equatable, Sendable {
   public let supportsNext: Bool?
   public let supportsSeeking: Bool?
   public let playbackRate: Double?
+  /// The page was hidden when sampled. Browsers may throttle its timers to about
+  /// once a minute, so the app allows background sessions a longer expiry.
+  public let isBackground: Bool?
 
   public init(
     kind: BrowserMediaEventKind,
@@ -41,7 +44,8 @@ public struct BrowserMediaEvent: Codable, Equatable, Sendable {
     supportsPrevious: Bool? = nil,
     supportsNext: Bool? = nil,
     supportsSeeking: Bool? = nil,
-    playbackRate: Double? = nil
+    playbackRate: Double? = nil,
+    isBackground: Bool? = nil
   ) {
     self.kind = kind
     self.sessionID = sessionID
@@ -60,6 +64,7 @@ public struct BrowserMediaEvent: Codable, Equatable, Sendable {
     self.supportsNext = supportsNext
     self.supportsSeeking = supportsSeeking
     self.playbackRate = playbackRate
+    self.isBackground = isBackground
   }
 
   enum CodingKeys: String, CodingKey {
@@ -80,6 +85,7 @@ public struct BrowserMediaEvent: Codable, Equatable, Sendable {
     case supportsNext = "supports_next"
     case supportsSeeking = "supports_seeking"
     case playbackRate = "playback_rate"
+    case isBackground = "is_background"
   }
 
   public func validated() throws -> BrowserMediaEvent {

@@ -80,3 +80,43 @@ func browserArtworkURLsNeverReachNativeLoaderAndLegacyMediaStillWorks() async th
   let image = await ArtworkLoader.shared.image(for: .browser(data))
   #expect(image != nil)
 }
+
+private actor GatedArtworkFetch {
+  private(set) var calls = 0
+  private var waiters: [CheckedContinuation<Void, Never>] = []
+
+  func fetch() async -> CGImage? {
+    calls += 1
+    await withCheckedContinuation { waiters.append($0) }
+    let context = CGContext(
+      data: nil, width: 1, height: 1, bitsPerComponent: 8, bytesPerRow: 0,
+      space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+    )
+    return context?.makeImage()
+  }
+
+  func release() {
+    waiters.forEach { $0.resume() }
+    waiters.removeAll()
+  }
+}
+
+@Test
+func concurrentArtworkRequestsShareOneFetchAndSurviveCancellation() async throws {
+  let gate = GatedArtworkFetch()
+  let loader = ArtworkLoader(fetch: { _ in await gate.fetch() })
+  let source = ArtworkSource.spotify(URL(string: "https://i.scdn.co/shared")!)
+
+  let cancelled = Task { await loader.image(for: source) }
+  let kept = Task { await loader.image(for: source) }
+  while await gate.calls == 0 { await Task.yield() }
+  try await Task.sleep(for: .milliseconds(20))
+  cancelled.cancel()
+  await gate.release()
+
+  #expect(await kept.value != nil)
+  #expect(await gate.calls == 1)
+  // The completed cover is cached for later consumers.
+  #expect(await loader.image(for: source) != nil)
+  #expect(await gate.calls == 1)
+}

@@ -341,7 +341,7 @@ struct SystemVolumeSlider: View {
       Button(action: controller.toggleMute) {
         Image(systemName: controller.symbolName)
           .font(.callout.weight(.semibold))
-          .contentTransition(.symbolEffect(.replace))
+          .symbolSwap(on: controller.symbolName)
           .frame(width: 32, height: 32)
           .background(
             .white.opacity(contrast == .increased ? 0.14 : 0.075),

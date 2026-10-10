@@ -157,3 +157,25 @@ func privateSocketRejectsUnsafeDirectoriesAndSymlinksBeforeSendingCredentials() 
     Issue.record("A missing socket must fail without TCP fallback")
   } catch is LocalAPIError {}
 }
+
+@MainActor
+@Test
+func stoppingDuringSocketPreparationNeverInstallsAListener() async throws {
+  let directory = URL(fileURLWithPath: "/tmp/notch-prepare-\(UUID().uuidString)")
+  defer { try? FileManager.default.removeItem(at: directory) }
+  let socketURL = directory.appendingPathComponent("api.sock")
+  let server = securityServer(socketURL: socketURL)
+  defer { server.stop() }
+
+  server.start()
+  #expect(server.state == .starting)
+  server.stop()
+  try await Task.sleep(for: .milliseconds(150))
+
+  #expect(server.state == .stopped)
+  #expect(!FileManager.default.fileExists(atPath: socketURL.path))
+
+  // A later start still completes normally.
+  server.start()
+  try await eventually { server.state == .ready }
+}

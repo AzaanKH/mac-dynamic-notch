@@ -184,6 +184,8 @@ function absoluteHTTPURL(value) {
 let artworkRequestURL = null;
 let artworkData = null;
 let artworkAbort = null;
+let artworkFailures = 0;
+let artworkRetryAt = 0;
 
 // Fetch in the content script so browser CORS and local-network restrictions apply.
 // Native code receives only a bounded thumbnail, never an address to fetch.
@@ -208,12 +210,16 @@ async function fetchArtworkThumbnail(url, signal) {
     }
   } finally { await reader.cancel(); }
   if (signal.aborted) return null;
-  const bitmap = await createImageBitmap(new Blob(chunks), {
-    resizeWidth: 256, resizeHeight: 256, resizeQuality: "medium",
-  });
+  const bitmap = await createImageBitmap(new Blob(chunks));
   try {
+    if (bitmap.width * bitmap.height > 16_000_000) return null;
+    // Center-crop to a square, as the notch displays covers, so wide video
+    // thumbnails are cropped instead of stretched.
+    const side = Math.min(bitmap.width, bitmap.height);
     const canvas = new OffscreenCanvas(256, 256);
-    canvas.getContext("2d").drawImage(bitmap, 0, 0, 256, 256);
+    canvas.getContext("2d").drawImage(
+      bitmap, (bitmap.width - side) / 2, (bitmap.height - side) / 2, side, side, 0, 0, 256, 256,
+    );
     const thumbnail = await canvas.convertToBlob({ type: "image/jpeg", quality: 0.75 });
     if (thumbnail.size > 32768 || signal.aborted) return null;
     const bytes = new Uint8Array(await thumbnail.arrayBuffer());
@@ -221,22 +227,43 @@ async function fetchArtworkThumbnail(url, signal) {
   } finally { bitmap.close(); }
 }
 
-function updateArtwork(url) {
-  if (url === artworkRequestURL) return;
-  artworkAbort?.abort();
-  artworkAbort = null;
-  artworkRequestURL = url;
-  artworkData = null;
-  if (!url) return;
+function artworkRetryDelay(failures) {
+  return Math.min(15000 * 2 ** (failures - 1), 600000);
+}
+
+function updateArtwork(url, { force = false } = {}) {
+  if (url === artworkRequestURL) {
+    // Snapshots repeat the same image. Retry only a failed request, once its
+    // backoff has elapsed (or immediately when connectivity returns).
+    if (!url || artworkData || artworkAbort || (!force && Date.now() < artworkRetryAt)) return;
+  } else {
+    artworkAbort?.abort();
+    artworkAbort = null;
+    artworkRequestURL = url;
+    artworkData = null;
+    artworkFailures = 0;
+    artworkRetryAt = 0;
+    if (!url) return;
+  }
   const controller = new AbortController();
   artworkAbort = controller;
   const deadline = setTimeout(() => controller.abort(), 10000);
-  fetchArtworkThumbnail(url, controller.signal).then(data => {
-    if (controller.signal.aborted || artworkRequestURL !== url) return;
-    artworkData = data;
-    if (data) scheduleSnapshot(true);
-  }).catch(() => {}).finally(() => clearTimeout(deadline));
+  fetchArtworkThumbnail(url, controller.signal).catch(() => null).then(data => {
+    // A newer image or an ended page replaced this request.
+    if (artworkRequestURL !== url || artworkAbort !== controller) return;
+    artworkAbort = null;
+    if (data) {
+      artworkData = data;
+      artworkFailures = 0;
+      scheduleSnapshot(true);
+      return;
+    }
+    artworkFailures += 1;
+    artworkRetryAt = Date.now() + artworkRetryDelay(artworkFailures);
+  }).finally(() => clearTimeout(deadline));
 }
+
+addEventListener("online", () => updateArtwork(artworkRequestURL, { force: true }));
 
 function buildSnapshot(media) {
   const metadata = mediaSessionMetadata();
@@ -272,6 +299,7 @@ function buildSnapshot(media) {
     supports_next: Boolean(matchingButton("next")),
     supports_seeking: Number.isFinite(media.duration) && media.duration > 0 && media.seekable.length > 0,
     playback_rate: Number.isFinite(media.playbackRate) ? media.playbackRate : 1,
+    is_background: Boolean(document.hidden),
   };
 }
 

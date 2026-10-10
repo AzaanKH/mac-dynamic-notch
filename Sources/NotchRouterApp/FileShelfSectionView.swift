@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 struct FileShelfSectionView: View {
@@ -6,6 +7,8 @@ struct FileShelfSectionView: View {
   let isDropTargeted: Bool
   @Environment(\.colorSchemeContrast) private var contrast
   @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+  private let workspace = NSWorkspace.shared.notificationCenter
 
   private let columns = [
     GridItem(.adaptive(minimum: 145, maximum: 160), spacing: 8)
@@ -21,6 +24,14 @@ struct FileShelfSectionView: View {
       fileShelf
     }
     .task(id: store.items) { await store.refreshPresentation() }
+    // A reconnected volume can make missing items available again without
+    // changing the shelf itself.
+    .onReceive(workspace.publisher(for: NSWorkspace.didMountNotification)) { _ in
+      Task { await store.refreshPresentation() }
+    }
+    .onReceive(workspace.publisher(for: NSWorkspace.didUnmountNotification)) { _ in
+      Task { await store.refreshPresentation() }
+    }
   }
 
   private var fileShelf: some View {
@@ -49,7 +60,7 @@ struct FileShelfSectionView: View {
           Image(systemName: isDropTargeted ? "arrow.down.doc.fill" : "tray.and.arrow.down")
             .font(.system(size: 27, weight: .light))
             .dashboardTint(isDropTargeted ? .orange : .white.opacity(0.74))
-            .contentTransition(.symbolEffect(.replace))
+            .symbolSwap(on: isDropTargeted)
           Text(isDropTargeted ? "Release to add" : "Drop files on the notch")
             .font(.headline)
           Text("Open, reveal, AirDrop, or drag them out later.")
@@ -160,7 +171,6 @@ private struct FileShelfCard: View {
           Image(systemName: "eye")
         }
         .buttonStyle(NotchIconButtonStyle())
-        .disabled(!isAvailable)
         .accessibilityLabel("Quick Look \(item.name)")
 
         Button {
@@ -169,7 +179,6 @@ private struct FileShelfCard: View {
           Image(systemName: "magnifyingglass")
         }
         .buttonStyle(NotchIconButtonStyle())
-        .disabled(!isAvailable)
         .accessibilityLabel("Reveal \(item.name)")
 
         Button {
@@ -178,7 +187,6 @@ private struct FileShelfCard: View {
           Image(systemName: "airplayaudio")
         }
         .buttonStyle(NotchIconButtonStyle())
-        .disabled(!isAvailable)
         .accessibilityLabel("AirDrop \(item.name)")
 
         Button {

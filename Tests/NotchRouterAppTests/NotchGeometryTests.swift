@@ -119,3 +119,16 @@ func onlyTheExpandedPanelReservesRoomForItsShadow() {
   #expect(expanded.width > surface.width)
   #expect(expanded.height > surface.height)
 }
+
+@Test
+func onlyThePanelMarginOutsideTheSurfacePassesClicksThrough() {
+  let panel = CGRect(x: 0, y: 0, width: 600, height: 530)
+  let surface = CGRect(x: 20, y: 30, width: 560, height: 500)
+
+  #expect(NotchGeometry.passesMouseThrough(at: CGPoint(x: 10, y: 520), panelFrame: panel, surfaceFrame: surface))
+  #expect(NotchGeometry.passesMouseThrough(at: CGPoint(x: 300, y: 10), panelFrame: panel, surfaceFrame: surface))
+  #expect(!NotchGeometry.passesMouseThrough(at: CGPoint(x: 300, y: 300), panelFrame: panel, surfaceFrame: surface))
+  // Outside the panel the setting has no effect; leave the panel interactive
+  // so a drag arriving from elsewhere still finds the drop target.
+  #expect(!NotchGeometry.passesMouseThrough(at: CGPoint(x: 900, y: 300), panelFrame: panel, surfaceFrame: surface))
+}
