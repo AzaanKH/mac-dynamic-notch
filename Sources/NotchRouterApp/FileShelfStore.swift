@@ -56,6 +56,7 @@ final class FileShelfStore: NSObject,
   private(set) var items: [ShelfItem] = []
   private(set) var lastError: String?
   private(set) var presentations: [UUID: ShelfItemPresentation] = [:]
+  @ObservationIgnored private var presentationGeneration = 0
 
   private let storageURL: URL
   private var previewedItemID: UUID?
@@ -224,6 +225,10 @@ final class FileShelfStore: NSObject,
   /// Refresh once when the shelf appears or its contents change, never from a view getter.
   @discardableResult
   func refreshPresentation() async -> Bool {
+    // Mount events and actions can start refreshes that overlap; only the
+    // newest may publish, so an older result never restores stale status.
+    presentationGeneration &+= 1
+    let generation = presentationGeneration
     let snapshot = items
     let resolved = await Task.detached(priority: .utility) {
       snapshot.map { item in
@@ -232,7 +237,9 @@ final class FileShelfStore: NSObject,
         return result
       }
     }.value
-    guard !Task.isCancelled, snapshot == items else { return false }
+    guard !Task.isCancelled, generation == presentationGeneration, snapshot == items else {
+      return false
+    }
     var updatedItems = items
     var updatedPresentations: [UUID: ShelfItemPresentation] = [:]
     for (index, result) in resolved.enumerated() {

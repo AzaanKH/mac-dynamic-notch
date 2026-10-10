@@ -119,12 +119,7 @@ final class MusicController: NSObject {
   private var browserExpiryTimer: Timer?
   private var refreshTask: Task<Void, Never>?
   private var transportRefreshTask: Task<Void, Never>?
-  /// Native controls run one at a time, in order. Each is a separate
-  /// `osascript` process, so unordered runs could finish out of order.
-  @ObservationIgnored private var nativeControlChain: Task<Void, Never>?
-  /// Newest seek target not yet sent. Seeks queued behind a running command
-  /// collapse into one, so scrubbing does not build a backlog of scripts.
-  @ObservationIgnored private var pendingNativeSeek: Double?
+  @ObservationIgnored private let nativeControls = NativeControlQueue()
   private var refreshAfterCurrentTask = false
   private var nativeSnapshots: [NowPlayingSnapshot] = []
   private var browserSessions: [String: BrowserSession] = [:]
@@ -135,6 +130,8 @@ final class MusicController: NSObject {
   private var artworkPaletteFailures: [ArtworkSource: PaletteFailure] = [:]
   private var artworkPaletteTask: Task<Void, Never>?
   private var artworkPaletteRequestURL: ArtworkSource?
+  /// Whether a palette load is running. Lets tests wait for it to settle.
+  var isLoadingArtworkPalette: Bool { artworkPaletteTask != nil }
   private let artworkPaletteLoader: @Sendable (ArtworkSource) async -> MusicArtworkPalette?
   private let defaults: UserDefaults
   private let dateProvider: () -> Date
@@ -144,7 +141,7 @@ final class MusicController: NSObject {
     var retryAt: Date
 
     static func retryDelay(afterAttempts attempts: Int) -> TimeInterval {
-      min(15 * pow(2, Double(max(attempts, 1) - 1)), 600)
+      ArtworkLoader.retryDelay(afterAttempts: attempts)
     }
   }
 
@@ -173,6 +170,7 @@ final class MusicController: NSObject {
     if enabled {
       refresh(allowsPermissionPrompt: true)
     } else {
+      nativeControls.cancelPending()
       stopPolling()
       refreshTask?.cancel()
       refreshTask = nil
@@ -494,27 +492,14 @@ final class MusicController: NSObject {
       || control == .previous
       || (control == .playPause && nowPlaying?.isPlaying != true)
 
-    if case .seek(let position) = control {
-      let isQueued = pendingNativeSeek != nil
-      pendingNativeSeek = position
-      if isQueued { return }
-    }
-    let previous = nativeControlChain
-    nativeControlChain = Task { [weak self] in
-      await previous?.value
-      guard let self else { return }
-      var control = control
-      if case .seek = control {
-        guard let target = self.pendingNativeSeek else { return }
-        self.pendingNativeSeek = nil
-        control = .seek(target)
-      }
+    nativeControls.enqueue(control, source: source) { [weak self] control, source in
+      // The integration can be disabled while this command waits its turn.
+      guard let self, self.isEnabled else { return }
       let error = await MusicScriptRunner.control(
         control,
         source: source,
         timeout: 2
       )
-      guard !Task.isCancelled else { return }
       self.permissionMessage = error
       if error == nil, requestsPeek {
         self.onChange?(.userTransport)
@@ -657,11 +642,61 @@ final class MusicController: NSObject {
   }
 }
 
-private enum MusicControl: Equatable, Sendable {
+enum MusicControl: Equatable, Sendable {
   case playPause
   case next
   case previous
   case seek(Double)
+}
+
+/// Runs native Music/Spotify controls one at a time, in order: each is a
+/// separate `osascript` process, so unordered runs could finish out of order.
+/// A seek merges into the command queued just before it only when that is a
+/// seek for the same app, so scrubbing does not build a backlog yet never
+/// jumps ahead of another command.
+@MainActor
+final class NativeControlQueue {
+  typealias Run = @MainActor (MusicControl, MusicSource) async -> Void
+
+  private final class SeekTarget {
+    var position: Double
+    init(_ position: Double) { self.position = position }
+  }
+
+  private var chain: Task<Void, Never>?
+  private var generation = 0
+  /// The most recently queued command, when it is a seek that has not started.
+  private var openSeek: (target: SeekTarget, source: MusicSource)?
+
+  func enqueue(_ control: MusicControl, source: MusicSource, run: @escaping Run) {
+    if case .seek(let position) = control, let openSeek, openSeek.source == source {
+      openSeek.target.position = position
+      return
+    }
+    var seekTarget: SeekTarget?
+    if case .seek(let position) = control { seekTarget = SeekTarget(position) }
+    openSeek = seekTarget.map { ($0, source) }
+
+    let generation = self.generation
+    let previous = chain
+    chain = Task { [weak self] in
+      await previous?.value
+      guard let self, generation == self.generation else { return }
+      if let seekTarget, self.openSeek?.target === seekTarget { self.openSeek = nil }
+      await run(seekTarget.map { .seek($0.position) } ?? control, source)
+    }
+  }
+
+  /// Drops queued commands that have not started.
+  func cancelPending() {
+    generation &+= 1
+    openSeek = nil
+  }
+
+  /// Waits for every queued command to finish. For tests.
+  func drain() async {
+    await chain?.value
+  }
 }
 
 private struct PendingBrowserControl {

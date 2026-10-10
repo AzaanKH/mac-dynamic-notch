@@ -221,6 +221,10 @@ final class IntegrationSettingsController {
   /// TCP), so offer an explicit update instead of failing silently.
   private(set) var codexHooksNeedUpdate = false
   private(set) var browserBridgeNeedsUpdate = false
+  // Comparisons run in the background; only the newest result may publish,
+  // so a check that started before an install or removal cannot win.
+  @ObservationIgnored private var codexHelperCheck = 0
+  @ObservationIgnored private var browserHelperCheck = 0
 
   let endpoint: String
 
@@ -392,6 +396,8 @@ final class IntegrationSettingsController {
   private func refreshCodexHookStatus() {
     codexHooksInstalled = Self.codexHooksAreInstalled()
     let installed = codexHooksInstalled
+    codexHelperCheck &+= 1
+    let check = codexHelperCheck
     Task { [weak self] in
       let stale = await Task.detached(priority: .utility) {
         installed && Self.helperIsStale(
@@ -399,13 +405,16 @@ final class IntegrationSettingsController {
           bundled: Self.notchCLIURL()
         )
       }.value
-      self?.codexHooksNeedUpdate = stale
+      guard let self, check == self.codexHelperCheck else { return }
+      self.codexHooksNeedUpdate = stale
     }
   }
 
   private func refreshBrowserExtensionStatus() {
     browserExtensionInstalled = Self.browserExtensionIsInstalled()
     let installed = browserExtensionInstalled
+    browserHelperCheck &+= 1
+    let check = browserHelperCheck
     Task { [weak self] in
       let stale = await Task.detached(priority: .utility) {
         installed && Self.helperIsStale(
@@ -414,7 +423,8 @@ final class IntegrationSettingsController {
             .appendingPathComponent("notchrouter-browser-host")
         )
       }.value
-      self?.browserBridgeNeedsUpdate = stale
+      guard let self, check == self.browserHelperCheck else { return }
+      self.browserBridgeNeedsUpdate = stale
     }
   }
 

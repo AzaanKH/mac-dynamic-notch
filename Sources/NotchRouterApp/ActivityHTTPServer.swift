@@ -48,6 +48,10 @@ final class ActivityHTTPServer {
   /// Invalidates in-flight socket preparation when the server is stopped or
   /// restarted before it finishes.
   private var startGeneration = 0
+  /// The latest socket preparation. Each one waits for the previous to finish,
+  /// so a superseded preparation can never unlink a newer server's socket.
+  private var socketPreparation: Task<Result<Void, Error>, Never>?
+  private let socketPreparer: @Sendable (URL) throws -> Void
   private let requestTimeout: TimeInterval
   private let connectionLimit: Int
 
@@ -60,6 +64,7 @@ final class ActivityHTTPServer {
     socketURL: URL? = nil,
     requestTimeout: TimeInterval = 10,
     connectionLimit: Int = 64,
+    socketPreparer: @escaping @Sendable (URL) throws -> Void = LocalAPISocket.prepareForListening,
     ingestHandler: @escaping IngestHandler,
     listHandler: @escaping ListHandler,
     browserMediaHandler: @escaping BrowserMediaHandler,
@@ -69,6 +74,7 @@ final class ActivityHTTPServer {
     self.socketURL = socketURL
     self.requestTimeout = requestTimeout
     self.connectionLimit = connectionLimit
+    self.socketPreparer = socketPreparer
     self.token = token
     self.ingestHandler = ingestHandler
     self.listHandler = listHandler
@@ -91,10 +97,15 @@ final class ActivityHTTPServer {
     }
     // Socket preparation touches the filesystem (create, chmod, probe, unlink),
     // which can stall on a slow home volume, so keep it off the main actor.
+    let previous = socketPreparation
+    let preparer = socketPreparer
+    let pending = Task.detached(priority: .utility) { () -> Result<Void, Error> in
+      _ = await previous?.value
+      return Result { try preparer(socketURL) }
+    }
+    socketPreparation = pending
     Task { [weak self] in
-      let preparation = await Task.detached(priority: .utility) {
-        Result { try LocalAPISocket.prepareForListening(at: socketURL) }
-      }.value
+      let preparation = await pending.value
       guard let self, generation == self.startGeneration, self.state == .starting else {
         return
       }
@@ -231,12 +242,30 @@ final class ActivityHTTPServer {
       state = .failed(failure)
       NSLog("NotchRouter activity server is waiting: \(failure.message)")
     case .ready:
-      if let socketURL {
-        do { try LocalAPISocket.secureSocket(at: socketURL) }
-        catch { stop(); state = .failed(Self.failure(for: error, port: port)); return }
+      guard let socketURL else {
+        state = .ready
+        NSLog("NotchRouter local activity server is ready")
+        return
       }
-      state = .ready
-      NSLog("NotchRouter local activity server is ready")
+      // Securing the socket is filesystem work too; keep it off the main actor
+      // and publish the result only for the listener that is still current.
+      let generation = startGeneration
+      Task { [weak self, weak listener] in
+        let secured = await Task.detached(priority: .utility) {
+          Result { try LocalAPISocket.secureSocket(at: socketURL) }
+        }.value
+        guard let self, let listener, self.listener === listener,
+          generation == self.startGeneration
+        else { return }
+        switch secured {
+        case .success:
+          self.state = .ready
+          NSLog("NotchRouter local activity server is ready")
+        case .failure(let error):
+          self.stop()
+          self.state = .failed(Self.failure(for: error, port: self.port))
+        }
+      }
     case .failed(let error):
       let failure = Self.failure(for: error, port: port)
       state = .failed(failure)

@@ -257,24 +257,31 @@ func failedArtworkPaletteIsRetriedAfterBackoff() async throws {
     kind: .update, sessionID: "retry", browserName: "Test", title: "Track",
     artworkData: data, isPlaying: true
   )
-  func settle() async { for _ in 0..<100 { await Task.yield() } }
+  // Waits for the loader to have seen `requests` calls and for the controller
+  // to finish handling the result, instead of yielding a fixed number of times.
+  func settle(requests: Int) async throws {
+    for _ in 0..<200 {
+      if await loader.requests == requests, !controller.isLoadingArtworkPalette { return }
+      try await Task.sleep(for: .milliseconds(5))
+    }
+    Issue.record("Palette load did not settle at \(requests) requests")
+  }
 
   _ = try controller.ingestBrowserMedia(heartbeat)
-  await settle()
-  #expect(await loader.requests == 1)
+  try await settle(requests: 1)
   #expect(controller.artworkPalette == nil)
 
-  // Within the backoff window heartbeats do not retry.
+  // Within the backoff window a heartbeat does not start a load at all; the
+  // decision is synchronous, so no waiting is needed to observe it.
   now += 5
   _ = try controller.ingestBrowserMedia(heartbeat)
-  await settle()
+  #expect(!controller.isLoadingArtworkPalette)
   #expect(await loader.requests == 1)
 
   // Once it elapses, the next heartbeat retries and the palette appears.
   now += MusicController.PaletteFailure.retryDelay(afterAttempts: 1)
   _ = try controller.ingestBrowserMedia(heartbeat)
-  await settle()
-  #expect(await loader.requests == 2)
+  try await settle(requests: 2)
   #expect(controller.artworkPalette == palette)
 }
 
@@ -300,4 +307,60 @@ func backgroundBrowserSessionsOutliveTimerThrottling() throws {
 
     #expect((controller.nowPlaying?.title == "Paused episode") == survives)
   }
+}
+
+@MainActor
+@Test
+func nativeControlsRunInOrderAndOnlyMergeAdjacentSeeksForTheSameApp() async {
+  let queue = NativeControlQueue()
+  var ran: [String] = []
+  var release: CheckedContinuation<Void, Never>?
+  let run: NativeControlQueue.Run = { control, source in
+    if ran.isEmpty { await withCheckedContinuation { release = $0 } }
+    switch control {
+    case .seek(let position): ran.append("seek \(Int(position)) \(source.rawValue)")
+    default: ran.append("\(control) \(source.rawValue)")
+    }
+  }
+
+  // The first command blocks while the rest queue behind it.
+  queue.enqueue(.next, source: .spotify, run: run)
+  while release == nil { await Task.yield() }
+  queue.enqueue(.seek(10), source: .spotify, run: run)
+  queue.enqueue(.previous, source: .spotify, run: run)
+  queue.enqueue(.seek(20), source: .spotify, run: run)
+  queue.enqueue(.seek(30), source: .spotify, run: run)  // merges into seek 20
+  queue.enqueue(.seek(40), source: .appleMusic, run: run)  // different app: no merge
+  release?.resume()
+  await queue.drain()
+
+  #expect(ran == [
+    "next spotify",
+    "seek 10 spotify",
+    "previous spotify",
+    "seek 30 spotify",
+    "seek 40 appleMusic",
+  ])
+}
+
+@MainActor
+@Test
+func cancellingNativeControlsDropsQueuedCommands() async {
+  let queue = NativeControlQueue()
+  var ran: [MusicControl] = []
+  var release: CheckedContinuation<Void, Never>?
+  let run: NativeControlQueue.Run = { control, _ in
+    if ran.isEmpty, release == nil { await withCheckedContinuation { release = $0 } }
+    ran.append(control)
+  }
+
+  queue.enqueue(.playPause, source: .appleMusic, run: run)
+  while release == nil { await Task.yield() }
+  queue.enqueue(.next, source: .appleMusic, run: run)
+  queue.enqueue(.seek(5), source: .appleMusic, run: run)
+  queue.cancelPending()  // the integration was disabled
+  release?.resume()
+  await queue.drain()
+
+  #expect(ran == [.playPause])
 }

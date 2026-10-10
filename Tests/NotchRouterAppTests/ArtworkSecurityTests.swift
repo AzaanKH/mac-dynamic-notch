@@ -107,14 +107,17 @@ func concurrentArtworkRequestsShareOneFetchAndSurviveCancellation() async throws
   let loader = ArtworkLoader(fetch: { _ in await gate.fetch() })
   let source = ArtworkSource.spotify(URL(string: "https://i.scdn.co/shared")!)
 
-  let cancelled = Task { await loader.image(for: source) }
-  let kept = Task { await loader.image(for: source) }
+  // The first request starts the shared load and is then cancelled; the
+  // second joins it while the fetch is still blocked.
+  let owner = Task { await loader.image(for: source) }
   while await gate.calls == 0 { await Task.yield() }
-  try await Task.sleep(for: .milliseconds(20))
-  cancelled.cancel()
+  let joined = Task { await loader.image(for: source) }
+  while await loader.joinedRequests == 0 { await Task.yield() }
+  owner.cancel()
   await gate.release()
 
-  #expect(await kept.value != nil)
+  #expect(await joined.value != nil)
+  #expect(await owner.value != nil, "Cancelling the owner does not cancel the transfer")
   #expect(await gate.calls == 1)
   // The completed cover is cached for later consumers.
   #expect(await loader.image(for: source) != nil)

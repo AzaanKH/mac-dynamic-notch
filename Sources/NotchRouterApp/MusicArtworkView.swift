@@ -40,12 +40,22 @@ struct MusicArtworkView: View {
       }
       guard source != imageSource || image == nil else { return }
       // Keep the previous cover until the next one is ready, then crossfade.
-      let loaded = await ArtworkLoader.shared.image(for: source)
-      guard !Task.isCancelled else { return }
-      if let loaded { DisplayedArtworkCache.store(loaded, for: source) }
-      withAnimation(.easeInOut(duration: 0.25)) {
-        image = loaded
-        imageSource = source
+      // A failed cover shows the fallback and is retried with backoff for as
+      // long as this view shows the same source.
+      var attempts = 0
+      while !Task.isCancelled {
+        let loaded = await ArtworkLoader.shared.image(for: source)
+        guard !Task.isCancelled else { return }
+        if let loaded { DisplayedArtworkCache.store(loaded, for: source) }
+        if loaded != nil || imageSource != source || image != nil {
+          withAnimation(.easeInOut(duration: 0.25)) {
+            image = loaded
+            imageSource = source
+          }
+        }
+        if loaded != nil { return }
+        attempts += 1
+        try? await Task.sleep(for: .seconds(ArtworkLoader.retryDelay(afterAttempts: attempts)))
       }
     }
     .frame(width: size, height: size)

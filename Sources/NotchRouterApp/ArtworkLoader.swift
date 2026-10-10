@@ -13,12 +13,20 @@ actor ArtworkLoader {
   static let maximumDownloadBytes = 8_000_000
   static let maximumBrowserBytes = 32_768
   static let maximumPixels = 16_000_000
+
+  /// Backoff for retrying a cover that failed to load. Failures are never
+  /// permanent: the loader cannot tell a timeout from an undecodable image.
+  nonisolated static func retryDelay(afterAttempts attempts: Int) -> TimeInterval {
+    min(15 * pow(2, Double(max(attempts, 1) - 1)), 600)
+  }
   private var cache: [ArtworkSource: CGImage] = [:]
   /// Loads shared by every consumer of the same cover (palette sampling and
   /// each visible artwork view). They are unstructured, so one consumer being
   /// cancelled does not cancel a transfer another consumer still awaits.
   private var inFlight: [ArtworkSource: Task<CGImage?, Never>] = [:]
   private let fetch: @Sendable (ArtworkSource) async -> CGImage?
+  /// Requests that joined a load already in flight. Lets tests prove sharing.
+  private(set) var joinedRequests = 0
 
   init(fetch: @escaping @Sendable (ArtworkSource) async -> CGImage? = ArtworkLoader.load) {
     self.fetch = fetch
@@ -26,7 +34,10 @@ actor ArtworkLoader {
 
   func image(for source: ArtworkSource) async -> CGImage? {
     if let image = cache[source] { return image }
-    if let pending = inFlight[source] { return await pending.value }
+    if let pending = inFlight[source] {
+      joinedRequests += 1
+      return await pending.value
+    }
 
     let fetch = fetch
     let load = Task { await fetch(source) }

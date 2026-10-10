@@ -158,24 +158,55 @@ func privateSocketRejectsUnsafeDirectoriesAndSymlinksBeforeSendingCredentials() 
   } catch is LocalAPIError {}
 }
 
+/// Blocks the first socket preparation until released, so a test can stop and
+/// restart the server while that preparation is still running.
+private final class GatedSocketPreparer: @unchecked Sendable {
+  let entered = DispatchSemaphore(value: 0)
+  let release = DispatchSemaphore(value: 0)
+  private let lock = NSLock()
+  private var calls = 0
+
+  func waitUntilEntered() -> Bool {
+    entered.wait(timeout: .now() + 2) == .success
+  }
+
+  func prepare(_ url: URL) throws {
+    let isFirst = lock.withLock { calls += 1; return calls == 1 }
+    if isFirst {
+      entered.signal()
+      release.wait()
+    }
+    try LocalAPISocket.prepareForListening(at: url)
+  }
+}
+
 @MainActor
 @Test
-func stoppingDuringSocketPreparationNeverInstallsAListener() async throws {
+func restartingDuringSocketPreparationLeavesTheNewServerReachable() async throws {
   let directory = URL(fileURLWithPath: "/tmp/notch-prepare-\(UUID().uuidString)")
   defer { try? FileManager.default.removeItem(at: directory) }
   let socketURL = directory.appendingPathComponent("api.sock")
-  let server = securityServer(socketURL: socketURL)
+  let gate = GatedSocketPreparer()
+  let server = ActivityHTTPServer(
+    port: 0, token: "old-token", socketURL: socketURL, requestTimeout: 2,
+    socketPreparer: { try gate.prepare($0) },
+    ingestHandler: { AIActivity(event: try $0.validated()) }, listHandler: { [] },
+    browserMediaHandler: { _ in BrowserMediaBridgeResponse(status: "ok") },
+    browserDownloadHandler: { _ in BrowserDownloadBridgeResponse(status: "ok") })
   defer { server.stop() }
 
   server.start()
-  #expect(server.state == .starting)
+  let entered = await Task.detached { gate.waitUntilEntered() }.value
+  #expect(entered, "The first preparation is running")
+
+  // Stop and restart while the first preparation is blocked mid-flight.
   server.stop()
-  try await Task.sleep(for: .milliseconds(150))
-
-  #expect(server.state == .stopped)
-  #expect(!FileManager.default.fileExists(atPath: socketURL.path))
-
-  // A later start still completes normally.
   server.start()
+  try await Task.sleep(for: .milliseconds(50))
+  #expect(server.state == .starting, "The restart waits for the earlier preparation")
+  gate.release.signal()
+
   try await eventually { server.state == .ready }
+  let health = try await LocalAPIClient.request(path: "/v1/health", socketURL: socketURL)
+  #expect(health.status == 200)
 }

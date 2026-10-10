@@ -187,6 +187,50 @@ let artworkAbort = null;
 let artworkFailures = 0;
 let artworkRetryAt = 0;
 
+// Pixel dimensions from a PNG, GIF, WebP, or JPEG header, or null when the
+// format is not recognized.
+function imageDimensions(bytes) {
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const has = (at, text) => at + text.length <= bytes.length
+    && [...text].every((character, index) => bytes[at + index] === character.charCodeAt(0));
+  if (bytes.length >= 24 && bytes[0] === 0x89 && has(1, "PNG") && has(12, "IHDR")) {
+    return { width: view.getUint32(16), height: view.getUint32(20) };
+  }
+  if (bytes.length >= 10 && has(0, "GIF8")) {
+    return { width: view.getUint16(6, true), height: view.getUint16(8, true) };
+  }
+  if (has(0, "RIFF") && has(8, "WEBP")) {
+    if (has(12, "VP8X") && bytes.length >= 31) {
+      return {
+        width: 1 + (view.getUint32(24, true) & 0xffffff),
+        height: 1 + (view.getUint32(27, true) & 0xffffff),
+      };
+    }
+    if (has(12, "VP8 ") && bytes.length >= 30) {
+      return { width: view.getUint16(26, true) & 0x3fff, height: view.getUint16(28, true) & 0x3fff };
+    }
+    if (has(12, "VP8L") && bytes.length >= 25) {
+      const bits = view.getUint32(21, true);
+      return { width: (bits & 0x3fff) + 1, height: ((bits >>> 14) & 0x3fff) + 1 };
+    }
+    return null;
+  }
+  if (bytes.length >= 4 && bytes[0] === 0xff && bytes[1] === 0xd8) {
+    let at = 2;
+    while (at + 9 <= bytes.length) {
+      if (bytes[at] !== 0xff) return null;
+      const marker = bytes[at + 1];
+      if (marker === 0xff) { at += 1; continue; }
+      // Start-of-frame markers carry the dimensions; C4, C8, and CC do not.
+      if (marker >= 0xc0 && marker <= 0xcf && ![0xc4, 0xc8, 0xcc].includes(marker)) {
+        return { width: view.getUint16(at + 7), height: view.getUint16(at + 5) };
+      }
+      at += 2 + view.getUint16(at + 2);
+    }
+  }
+  return null;
+}
+
 // Fetch in the content script so browser CORS and local-network restrictions apply.
 // Native code receives only a bounded thumbnail, never an address to fetch.
 async function fetchArtworkThumbnail(url, signal) {
@@ -210,16 +254,34 @@ async function fetchArtworkThumbnail(url, signal) {
     }
   } finally { await reader.cancel(); }
   if (signal.aborted) return null;
-  const bitmap = await createImageBitmap(new Blob(chunks));
-  try {
-    if (bitmap.width * bitmap.height > 16_000_000) return null;
-    // Center-crop to a square, as the notch displays covers, so wide video
-    // thumbnails are cropped instead of stretched.
-    const side = Math.min(bitmap.width, bitmap.height);
-    const canvas = new OffscreenCanvas(256, 256);
-    canvas.getContext("2d").drawImage(
-      bitmap, (bitmap.width - side) / 2, (bitmap.height - side) / 2, side, side, 0, 0, 256, 256,
+  const bytes = new Uint8Array(count);
+  let offset = 0;
+  for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+  // Reject oversized images from their header, before any pixels are decoded.
+  const size = imageDimensions(bytes);
+  if (size && size.width * size.height > 16_000_000) return null;
+  const blob = new Blob([bytes]);
+  const options = { resizeWidth: 256, resizeHeight: 256, resizeQuality: "medium" };
+  // Crop to a centered square while decoding, as the notch displays covers, so
+  // wide video thumbnails are cropped instead of stretched. Formats without a
+  // recognized header fall back to a bounded square decode.
+  let bitmap;
+  if (size && size.width > 0 && size.height > 0) {
+    const side = Math.min(size.width, size.height);
+    bitmap = await createImageBitmap(
+      blob,
+      Math.floor((size.width - side) / 2),
+      Math.floor((size.height - side) / 2),
+      side,
+      side,
+      options,
     );
+  } else {
+    bitmap = await createImageBitmap(blob, options);
+  }
+  try {
+    const canvas = new OffscreenCanvas(256, 256);
+    canvas.getContext("2d").drawImage(bitmap, 0, 0, 256, 256);
     const thumbnail = await canvas.convertToBlob({ type: "image/jpeg", quality: 0.75 });
     if (thumbnail.size > 32768 || signal.aborted) return null;
     const bytes = new Uint8Array(await thumbnail.arrayBuffer());

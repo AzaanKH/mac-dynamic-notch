@@ -177,7 +177,9 @@ final class NotchPanelController {
     ) { [weak self] _ in
       Task { @MainActor in
         guard let self, self.viewModel.mode == .expanded else { return }
-        if !self.surfaceFrame.contains(NSEvent.mouseLocation) {
+        if !NotchGeometry.surface(
+          self.surfaceFrame, mode: self.viewModel.mode, contains: NSEvent.mouseLocation
+        ) {
           self.viewModel.collapse()
         }
       }
@@ -393,7 +395,6 @@ final class NotchPanelController {
     let transitionID = surfaceTransitionID
     isSurfaceTransitioning = true
     panel.setFrame(panelFrame(size: canvas, on: screen), display: true)
-    updateMousePassThrough()
     withAnimation(NotchMotion.surface, completionCriteria: .removed) {
       viewModel.surfaceSize = size
     } completion: { [weak self] in
@@ -402,13 +403,18 @@ final class NotchPanelController {
       self.panel.setFrame(restingFrame, display: true)
       self.updateMousePassThrough()
     }
+    // Hit-test against the new target right away. A shrinking surface lets
+    // clicks through as soon as it starts collapsing; a growing one captures
+    // its final area slightly before the outline arrives.
+    updateMousePassThrough()
   }
 
   private func updateMousePassThrough() {
     let ignores = NotchGeometry.passesMouseThrough(
       at: NSEvent.mouseLocation,
       panelFrame: panel.frame,
-      surfaceFrame: surfaceFrame
+      surfaceFrame: surfaceFrame,
+      mode: viewModel.mode
     )
     if panel.ignoresMouseEvents != ignores {
       panel.ignoresMouseEvents = ignores
@@ -685,13 +691,25 @@ struct NotchGeometry {
   }
 
   /// Whether the panel should let a pointer at `point` reach the windows below:
-  /// true only over the panel's transparent area outside the visible surface.
+  /// true over any transparent part of the panel, including the margins and
+  /// the areas inside the surface's bounds that its outline excludes.
   static func passesMouseThrough(
     at point: CGPoint,
     panelFrame: CGRect,
-    surfaceFrame: CGRect
+    surfaceFrame: CGRect,
+    mode: SurfaceMode
   ) -> Bool {
-    panelFrame.contains(point) && !surfaceFrame.contains(point)
+    panelFrame.contains(point) && !surface(surfaceFrame, mode: mode, contains: point)
+  }
+
+  /// Whether a screen point lies on the drawn outline, not merely its bounds.
+  static func surface(_ surfaceFrame: CGRect, mode: SurfaceMode, contains point: CGPoint) -> Bool {
+    guard surfaceFrame.contains(point) else { return false }
+    // Screen coordinates grow upward; the outline is drawn from the top edge.
+    let local = CGPoint(x: point.x - surfaceFrame.minX, y: surfaceFrame.maxY - point.y)
+    return NotchSurfaceShape(NotchSurfaceMetrics(mode: mode))
+      .path(in: CGRect(origin: .zero, size: surfaceFrame.size))
+      .contains(local)
   }
 
   /// Panel size once the surface settles. Only the expanded dashboard casts a
