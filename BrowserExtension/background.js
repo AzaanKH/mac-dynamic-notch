@@ -1,13 +1,23 @@
+const extensionAPI = typeof browser !== "undefined" ? browser : chrome;
+const downloadPermissions = {
+  permissions: ["downloads"],
+  ...(typeof extensionAPI.runtime.getBrowserInfo === "function"
+    ? { data_collection: ["websiteActivity"] } : {}),
+};
 const HOST_NAME = "com.notchrouter.browser_media";
 
 let nativePort = null;
 let downloadsEnabled = false;
 let downloadHeartbeatTimer = null;
+let downloadHeartbeatInFlight = false;
+let downloadGeneration = 0;
 const sessionTabs = new Map();
 const tabSessions = new Map();
 
 function browserName() {
   const agent = navigator.userAgent;
+  if (agent.includes("Zen/")) return "Zen";
+  if (agent.includes("Firefox/")) return "Firefox";
   if (agent.includes("Edg/")) return "Microsoft Edge";
   if (navigator.brave || agent.includes("Brave")) return "Brave";
   if (agent.includes("Chromium")) return "Chromium";
@@ -18,7 +28,7 @@ function connectNativeHost() {
   if (nativePort) return nativePort;
 
   try {
-    nativePort = chrome.runtime.connectNative(HOST_NAME);
+    nativePort = extensionAPI.runtime.connectNative(HOST_NAME);
     nativePort.onMessage.addListener(handleNativeMessage);
     nativePort.onDisconnect.addListener(() => {
       nativePort = null;
@@ -45,12 +55,14 @@ function handleNativeMessage(message) {
     return;
   }
   if (!message || !message.command || !message.session_id) return;
-  const tabId = sessionTabs.get(message.session_id);
-  if (tabId === undefined) return;
-  chrome.tabs.sendMessage(tabId, {
+  const target = sessionTabs.get(message.session_id);
+  if (!target) return;
+  extensionAPI.tabs.sendMessage(target.tabId, {
     kind: "notchrouter_command",
+    document_session_id: target.scriptDocumentID,
     command: message.command,
-  }).catch(() => {});
+    seek_position: message.seek_position,
+  }, target.documentId ? { documentId: target.documentId } : { frameId: target.frameId }).catch(() => {});
 }
 
 function endSession(sessionID) {
@@ -60,26 +72,36 @@ function endSession(sessionID) {
     session_id: sessionID,
     browser_name: browserName(),
   });
-  const tabId = sessionTabs.get(sessionID);
-  if (tabId !== undefined) tabSessions.delete(tabId);
+  const target = sessionTabs.get(sessionID);
+  if (target) {
+    const sessions = tabSessions.get(target.tabId);
+    sessions?.delete(sessionID);
+    if (!sessions?.size) tabSessions.delete(target.tabId);
+  }
   sessionTabs.delete(sessionID);
 }
 
-chrome.runtime.onMessage.addListener((message, sender) => {
+extensionAPI.runtime.onMessage.addListener((message, sender) => {
   if (!message || !sender.tab) return;
 
   const tabId = sender.tab.id;
-  const sessionID = `${browserName()}:${tabId}`;
+  const frameId = sender.frameId ?? 0;
+  const documentId = sender.documentId;
+  const scriptDocumentID = typeof message.document_session_id === "string"
+    && message.document_session_id.length <= 100 ? message.document_session_id : undefined;
+  const sessionID = `${browserName()}:${tabId}:${frameId}:${documentId ?? scriptDocumentID ?? "legacy"}`;
   if (message.kind === "notchrouter_media_ended") {
     endSession(sessionID);
     return;
   }
   if (message.kind !== "notchrouter_media") return;
-  const previousSession = tabSessions.get(tabId);
-  if (previousSession && previousSession !== sessionID) endSession(previousSession);
-
-  tabSessions.set(tabId, sessionID);
-  sessionTabs.set(sessionID, tabId);
+  for (const id of tabSessions.get(tabId) ?? []) {
+    if (id !== sessionID && sessionTabs.get(id)?.frameId === frameId) endSession(id);
+  }
+  const sessions = tabSessions.get(tabId) ?? new Set();
+  sessions.add(sessionID);
+  tabSessions.set(tabId, sessions);
+  sessionTabs.set(sessionID, { tabId, frameId, documentId, scriptDocumentID });
   postToNativeHost({
     ...message.media,
     kind: "update",
@@ -88,21 +110,31 @@ chrome.runtime.onMessage.addListener((message, sender) => {
   });
 });
 
-chrome.tabs.onRemoved.addListener((tabId) => {
-  endSession(tabSessions.get(tabId));
-});
+function endTabSessions(tabId) {
+  for (const id of [...(tabSessions.get(tabId) ?? [])]) endSession(id);
+}
 
-chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
-  if (changeInfo.status === "loading") endSession(tabSessions.get(tabId));
+extensionAPI.tabs.onRemoved.addListener(endTabSessions);
+
+extensionAPI.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  if (changeInfo.status === "loading") endTabSessions(tabId);
 });
 
 function downloadMessage(item) {
+  const filename = item.filename || "";
+  const pathComponents = filename.split(/[\\/]/);
+  const displayName = pathComponents[pathComponents.length - 1] || null;
+  let sourceHost = null;
+  try {
+    sourceHost = new URL(item.finalUrl || item.url).hostname || null;
+  } catch (_error) {}
+
   return {
     kind: "download_update",
     download_id: item.id,
     browser_name: browserName(),
-    filename: item.filename || null,
-    source_url: item.finalUrl || item.url || null,
+    display_name: displayName,
+    source_host: sourceHost,
     bytes_received: item.bytesReceived ?? 0,
     total_bytes: item.totalBytes ?? -1,
     estimated_end_time: item.estimatedEndTime || null,
@@ -115,19 +147,23 @@ function downloadMessage(item) {
 
 async function publishDownload(downloadID) {
   if (!downloadsEnabled) return;
+  const generation = downloadGeneration;
   try {
-    const matches = await chrome.downloads.search({ id: downloadID });
+    const matches = await extensionAPI.downloads.search({ id: downloadID });
+    if (!downloadsEnabled || generation !== downloadGeneration) return;
     if (matches[0]) postToNativeHost(downloadMessage(matches[0]));
   } catch (_error) {}
 }
 
 async function syncRecentDownloads() {
   if (!downloadsEnabled) return;
+  const generation = downloadGeneration;
   try {
-    const items = await chrome.downloads.search({
+    const items = await extensionAPI.downloads.search({
       limit: 20,
       orderBy: ["-startTime"],
     });
+    if (!downloadsEnabled || generation !== downloadGeneration) return;
     for (const item of items.reverse()) {
       postToNativeHost(downloadMessage(item));
     }
@@ -139,16 +175,16 @@ async function applyDownloadCommand(command) {
   try {
     switch (command.action) {
       case "pause":
-        await chrome.downloads.pause(command.download_id);
+        await extensionAPI.downloads.pause(command.download_id);
         break;
       case "resume":
-        await chrome.downloads.resume(command.download_id);
+        await extensionAPI.downloads.resume(command.download_id);
         break;
       case "cancel":
-        await chrome.downloads.cancel(command.download_id);
+        await extensionAPI.downloads.cancel(command.download_id);
         break;
       case "reveal":
-        chrome.downloads.show(command.download_id);
+        extensionAPI.downloads.show(command.download_id);
         break;
       default:
         return;
@@ -158,13 +194,19 @@ async function applyDownloadCommand(command) {
 }
 
 async function sendDownloadHeartbeat() {
-  if (!downloadsEnabled) return;
+  if (!downloadsEnabled || downloadHeartbeatInFlight) return;
+  downloadHeartbeatInFlight = true;
+  const generation = downloadGeneration;
   try {
-    const activeItems = await chrome.downloads.search({ state: "in_progress" });
-    for (const item of activeItems) {
-      postToNativeHost(downloadMessage(item));
-    }
-  } catch (_error) {}
+    const activeItems = await extensionAPI.downloads.search({ state: "in_progress" });
+    if (!downloadsEnabled || generation !== downloadGeneration) return;
+    for (const item of activeItems) postToNativeHost(downloadMessage(item));
+  } catch (_error) {
+    // The heartbeat still tells the app that the opted-in bridge is available.
+  } finally {
+    downloadHeartbeatInFlight = false;
+  }
+  if (!downloadsEnabled || generation !== downloadGeneration) return;
   postToNativeHost({
     kind: "downloads_heartbeat",
     download_id: 0,
@@ -185,9 +227,9 @@ function setDownloadHeartbeatEnabled(enabled) {
 }
 
 async function updateDownloadAction() {
-  await chrome.action.setBadgeText({ text: downloadsEnabled ? "ON" : "" });
-  await chrome.action.setBadgeBackgroundColor({ color: "#2F80ED" });
-  await chrome.action.setTitle({
+  await extensionAPI.action.setBadgeText({ text: downloadsEnabled ? "ON" : "" });
+  await extensionAPI.action.setBadgeBackgroundColor({ color: "#2F80ED" });
+  await extensionAPI.action.setTitle({
     title: downloadsEnabled
       ? "NotchRouter downloads are on — click to turn off"
       : "Enable NotchRouter download progress",
@@ -195,8 +237,10 @@ async function updateDownloadAction() {
 }
 
 async function setDownloadsEnabled(enabled) {
+  downloadGeneration++;
   downloadsEnabled = enabled;
-  await chrome.storage.local.set({ downloadsEnabled: enabled });
+  if (enabled) registerDownloadListeners();
+  await extensionAPI.storage.local.set({ downloadsEnabled: enabled });
   setDownloadHeartbeatEnabled(enabled);
   if (!enabled) {
     postToNativeHost({
@@ -210,66 +254,72 @@ async function setDownloadsEnabled(enabled) {
 }
 
 async function initializeDownloads() {
-  const stored = await chrome.storage.local.get("downloadsEnabled");
-  const hasPermission = await chrome.permissions.contains({
-    permissions: ["downloads"],
-  });
+  const stored = await extensionAPI.storage.local.get("downloadsEnabled");
+  const hasPermission = await extensionAPI.permissions.contains(downloadPermissions);
   downloadsEnabled = stored.downloadsEnabled === true && hasPermission;
   if (!downloadsEnabled && stored.downloadsEnabled) {
-    await chrome.storage.local.set({ downloadsEnabled: false });
+    await extensionAPI.storage.local.set({ downloadsEnabled: false });
     postToNativeHost({
       kind: "downloads_disabled",
       download_id: 0,
       browser_name: browserName(),
     });
   }
+  if (downloadsEnabled) registerDownloadListeners();
   setDownloadHeartbeatEnabled(downloadsEnabled);
   await updateDownloadAction();
   if (downloadsEnabled) await syncRecentDownloads();
 }
 
-chrome.action.onClicked.addListener(async () => {
-  await downloadsReady;
+extensionAPI.action.onClicked.addListener(async () => {
   if (downloadsEnabled) {
-    await chrome.permissions.remove({ permissions: ["downloads"] });
+    await extensionAPI.permissions.remove(downloadPermissions);
     await setDownloadsEnabled(false);
     return;
   }
-  const granted = await chrome.permissions.request({
-    permissions: ["downloads"],
-  });
-  if (granted) await setDownloadsEnabled(true);
+  const granted = await extensionAPI.permissions.request(downloadPermissions);
+  if (granted) {
+    await downloadsReady;
+    await setDownloadsEnabled(true);
+  }
 });
 
-chrome.permissions.onRemoved.addListener((permissions) => {
+extensionAPI.permissions.onRemoved.addListener((permissions) => {
   downloadsReady.then(() => {
-    if (permissions.permissions?.includes("downloads")) {
+    if (permissions.permissions?.includes("downloads")
+      || permissions.data_collection?.includes("websiteActivity")) {
       setDownloadsEnabled(false);
     }
   });
 });
 
-chrome.downloads.onCreated.addListener((item) => {
-  downloadsReady.then(() => {
-    if (downloadsEnabled) postToNativeHost(downloadMessage(item));
-  });
-});
-
-chrome.downloads.onChanged.addListener((delta) => {
-  downloadsReady.then(() => {
-    if (downloadsEnabled) publishDownload(delta.id);
-  });
-});
-
-chrome.downloads.onErased.addListener((downloadID) => {
-  downloadsReady.then(() => {
-    if (!downloadsEnabled) return;
-    postToNativeHost({
-      kind: "download_removed",
-      download_id: downloadID,
-      browser_name: browserName(),
+let downloadListenersRegistered = false;
+function registerDownloadListeners() {
+  if (downloadListenersRegistered || !extensionAPI.downloads) return;
+  downloadListenersRegistered = true;
+  extensionAPI.downloads.onCreated.addListener((item) => {
+    downloadsReady.then(() => {
+      if (downloadsEnabled) postToNativeHost(downloadMessage(item));
     });
   });
-});
 
+  extensionAPI.downloads.onChanged.addListener((delta) => {
+    downloadsReady.then(() => {
+      if (downloadsEnabled) publishDownload(delta.id);
+    });
+  });
+
+  extensionAPI.downloads.onErased.addListener((downloadID) => {
+    downloadsReady.then(() => {
+      if (!downloadsEnabled) return;
+      postToNativeHost({
+        kind: "download_removed",
+        download_id: downloadID,
+        browser_name: browserName(),
+      });
+    });
+  });
+}
+
+registerDownloadListeners();
 const downloadsReady = initializeDownloads();

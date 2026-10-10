@@ -1,7 +1,7 @@
 import SwiftUI
 
 struct CompactFocusTimerView: View {
-  @ObservedObject var timer: FocusTimerController
+  let timer: FocusTimerController
   let hardwareNotchWidth: CGFloat
   let hasPhysicalNotch: Bool
   let isPeek: Bool
@@ -46,6 +46,7 @@ struct CompactFocusTimerView: View {
           Text(timer.formattedRemaining)
             .font(.callout.weight(.bold).monospacedDigit())
             .dashboardTint(.indigo)
+            .rollingNumber(timer.formattedRemaining, countsDown: true)
           if isPeek {
             Text(timer.stateLabel)
               .font(.caption)
@@ -74,6 +75,7 @@ struct CompactFocusTimerView: View {
               .weight(.bold)
               .monospacedDigit()
           )
+          .rollingNumber(timer.formattedRemaining, countsDown: true)
       }
 
       Spacer(minLength: 8)
@@ -121,21 +123,18 @@ struct CompactFocusTimerView: View {
         Image(systemName: "pause.fill")
       }
       .buttonStyle(NotchCircularButtonStyle(size: 36, isPrimary: true, typography: .compact))
-      .focusable()
       .accessibilityLabel("Pause focus timer")
     case .paused:
       Button(action: timer.resume) {
         Image(systemName: "play.fill")
       }
       .buttonStyle(NotchCircularButtonStyle(size: 36, isPrimary: true, typography: .compact))
-      .focusable()
       .accessibilityLabel("Resume focus timer")
     case .completed:
       Button(action: timer.start) {
         Image(systemName: "arrow.clockwise")
       }
       .buttonStyle(NotchCircularButtonStyle(size: 36, isPrimary: true, typography: .compact))
-      .focusable()
       .accessibilityLabel("Restart focus timer")
     case .idle:
       EmptyView()

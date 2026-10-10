@@ -1,4 +1,4 @@
-import Combine
+import Observation
 import Foundation
 import NotchRouterCore
 
@@ -6,8 +6,8 @@ struct BrowserDownloadItem: Identifiable, Equatable, Sendable {
   let id: String
   let downloadID: Int
   let browserName: String
-  var filename: String
-  var sourceURL: String?
+  var displayName: String
+  var sourceHost: String?
   var bytesReceived: Int64
   var totalBytes: Int64
   var estimatedEndTime: Date?
@@ -17,11 +17,6 @@ struct BrowserDownloadItem: Identifiable, Equatable, Sendable {
   var error: String?
   var updatedAt: Date
 
-  var displayName: String {
-    let component = URL(fileURLWithPath: filename).lastPathComponent
-    return component.isEmpty ? "Download" : component
-  }
-
   var progress: Double? {
     guard totalBytes > 0 else { return nil }
     return min(max(Double(bytesReceived) / Double(totalBytes), 0), 1)
@@ -30,16 +25,12 @@ struct BrowserDownloadItem: Identifiable, Equatable, Sendable {
   var isActive: Bool {
     state == .inProgress
   }
-
-  var sourceHost: String? {
-    guard let sourceURL, let url = URL(string: sourceURL) else { return nil }
-    return url.host(percentEncoded: false)
-  }
 }
 
 @MainActor
-final class BrowserDownloadStore: ObservableObject {
-  @Published private(set) var items: [BrowserDownloadItem] = []
+@Observable
+final class BrowserDownloadStore {
+  private(set) var items: [BrowserDownloadItem] = []
 
   var onChange: (() -> Void)?
 
@@ -151,8 +142,8 @@ final class BrowserDownloadStore: ObservableObject {
       id: id,
       downloadID: event.downloadID,
       browserName: event.browserName,
-      filename: event.filename ?? "Download",
-      sourceURL: event.sourceURL,
+      displayName: event.displayName ?? "Download",
+      sourceHost: event.sourceHost,
       bytesReceived: max(event.bytesReceived ?? 0, 0),
       totalBytes: event.totalBytes ?? -1,
       estimatedEndTime: event.estimatedEndTime,
@@ -165,11 +156,11 @@ final class BrowserDownloadStore: ObservableObject {
 
     if let index = items.firstIndex(where: { $0.id == id }) {
       var updatedItem = newItem
-      if event.filename == nil {
-        updatedItem.filename = items[index].filename
+      if event.displayName == nil {
+        updatedItem.displayName = items[index].displayName
       }
-      if event.sourceURL == nil {
-        updatedItem.sourceURL = items[index].sourceURL
+      if event.sourceHost == nil {
+        updatedItem.sourceHost = items[index].sourceHost
       }
       if event.estimatedEndTime == nil {
         updatedItem.estimatedEndTime = items[index].estimatedEndTime
@@ -223,14 +214,18 @@ final class BrowserDownloadStore: ObservableObject {
         return
       }
       guard let self else { return }
-      self.expiryTasks[browserName] = nil
-      if self.markActiveDownloadsInterrupted(
-        from: browserName,
-        message: "Browser bridge disconnected."
-      ) {
-        self.sortAndTrim()
-        self.onChange?()
-      }
+      self.expireActiveDownloads(from: browserName)
+    }
+  }
+
+  func expireActiveDownloads(from browserName: String) {
+    expiryTasks.removeValue(forKey: browserName)?.cancel()
+    if markActiveDownloadsInterrupted(
+      from: browserName,
+      message: "Browser bridge disconnected."
+    ) {
+      sortAndTrim()
+      onChange?()
     }
   }
 

@@ -1,11 +1,13 @@
 import AppKit
 import Carbon.HIToolbox
-import Combine
+import Observation
+import SwiftUI
 import NotchRouterCore
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
-  @Published private(set) var settingsDependencies: SettingsDependencies?
+@Observable
+final class AppDelegate: NSObject, NSApplicationDelegate {
+  private(set) var settingsDependencies: SettingsDependencies?
 
   private var store: ActivityStore!
   private var fileShelf: FileShelfStore!
@@ -22,11 +24,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
   private var displaySelection: DisplaySelectionController!
   private var integrations: IntegrationSettingsController!
   private var globalHotKey: GlobalHotKey?
+  private var settingsWindow: NSWindow?
   private var integrationToken = ""
   private var softwareUpdater: SoftwareUpdateController!
   private var instanceGuard: SingleInstanceGuard?
   private var showRequestObserver: NSObjectProtocol?
   private var activityExpiryTimer: Timer?
+  private var isTerminating = false
 
   func applicationDidFinishLaunching(_ notification: Notification) {
     NSApp.setActivationPolicy(.accessory)
@@ -69,9 +73,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
 
     let server = ActivityHTTPServer(
       token: integrationToken,
-      ingestHandler: { [weak store] event in
+      socketURL: LocalAPISocket.url,
+      ingestHandler: { [weak self, weak store] event in
         try await MainActor.run {
-          guard let store else {
+          guard let store, self?.isTerminating != true else {
             throw AppRuntimeError.storeUnavailable
           }
           return try store.ingest(event)
@@ -110,7 +115,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
       notificationService: notificationService,
       server: server,
       systemMonitor: systemMonitor,
-      displaySelection: displaySelection
+      displaySelection: displaySelection,
+      onOpenSettings: { [weak self] in self?.showSettings() }
     )
 
     integrations = IntegrationSettingsController(
@@ -146,6 +152,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
       self?.notificationService.deliverIfImportant(activity)
     }
 
+    server.setLegacyTCPEnabled(UserDefaults.standard.bool(forKey: "legacyTCPAPIEnabled"))
     server.start()
 
     let activityExpiryTimer = Timer(
@@ -159,6 +166,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     self.activityExpiryTimer = activityExpiryTimer
 
     configureGlobalShortcut()
+  }
+
+  func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+    guard store != nil else { return .terminateNow }
+    guard !isTerminating else { return .terminateLater }
+    isTerminating = true
+    activityExpiryTimer?.invalidate()
+    server?.stop()
+    clipboard?.stopMonitoringForTermination()
+    Task { @MainActor in
+      await store.flushPersistence()
+      await clipboard.flushPersistence()
+      await fileShelf.flushPersistence()
+      sender.reply(toApplicationShouldTerminate: true)
+    }
+    return .terminateLater
   }
 
   func applicationWillTerminate(_ notification: Notification) {
@@ -176,6 +199,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
   func applicationDidBecomeActive(_ notification: Notification) {
     launchAtLogin?.refresh()
     displaySelection?.refreshDisplays()
+  }
+
+  func showSettings() {
+    // The notch uses an AppKit hosting view outside SwiftUI's scene environment.
+    // Both entry points share this window so the gear also works before the menu opens.
+    if settingsWindow == nil {
+      let window = NSWindow(contentViewController: NSHostingController(
+        rootView: SettingsRootView(appDelegate: self)
+      ))
+      window.title = "NotchRouter Settings"
+      window.styleMask = [.titled, .closable, .miniaturizable]
+      window.setContentSize(NSSize(width: 680, height: 540))
+      window.isReleasedWhenClosed = false
+      window.center()
+      settingsWindow = window
+    }
+    panelController?.viewModel.collapse()
+    NSApp.activate(ignoringOtherApps: true)
+    settingsWindow?.deminiaturize(nil)
+    settingsWindow?.makeKeyAndOrderFront(nil)
   }
 
   func showNotch() {
@@ -201,6 +244,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
 
   func showClipboard() {
     panelController.show(.clipboard)
+  }
+
+  func showSystem() {
+    panelController.show(.system)
   }
 
   func sendDemoActivity() {
@@ -234,7 +281,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
   private func configureGlobalShortcut() {
     do {
       globalHotKey = try GlobalHotKey(
-        keyCode: UInt32(kVK_Space),
+        keyCode: UInt32(kVK_ANSI_N),
         modifiers: UInt32(optionKey)
       ) { [weak self] in
         self?.panelController.show(.activity)

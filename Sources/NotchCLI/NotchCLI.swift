@@ -135,7 +135,7 @@ enum NotchCLI {
       guard let event = hook.activityEvent() else { return }
 
       let stateStore = CodexHookStateStore()
-      guard try stateStore.shouldPublish(event.state, for: event.activityID) else {
+      guard try stateStore.shouldPublish(event) else {
         return
       }
 
@@ -146,7 +146,7 @@ enum NotchCLI {
         body: body,
         timeout: 1
       )
-      try stateStore.record(event.state, for: event.activityID)
+      try stateStore.record(event)
     } catch {
       // Hooks are advisory. A closed NotchRouter app must never interrupt Codex.
     }
@@ -165,7 +165,7 @@ enum NotchCLI {
     )
 
     var root: [String: Any] = [
-      "description": "Publishes privacy-preserving Codex lifecycle state to NotchRouter."
+      "description": "Publishes Codex task titles, response excerpts, and lifecycle state to local NotchRouter."
     ]
     if FileManager.default.fileExists(atPath: hooksURL.path) {
       let data = try Data(contentsOf: hooksURL)
@@ -262,8 +262,9 @@ enum NotchCLI {
 
   private static func installBrowserExtension() throws {
     try BrowserExtensionInstaller.install()
-    print("Installed the browser bridge for Chrome, Edge, Brave, and Chromium.")
-    print("Load the unpacked extension from \(BrowserExtensionInstaller.extensionDirectory.path)")
+    print("Installed the browser bridge for Chrome, Edge, Brave, Chromium, Firefox, and Zen.")
+    print("In Zen or Firefox, use about:debugging > This Firefox > Load Temporary Add-on and select manifest.json.")
+    print("Extension folder: \(BrowserExtensionInstaller.extensionDirectory.path)")
   }
 
   private static func removeBrowserExtension() throws {
@@ -278,31 +279,15 @@ enum NotchCLI {
     authenticated: Bool = true,
     timeout: TimeInterval = 4
   ) async throws -> Data {
-    var request = URLRequest(
-      url: URL(string: "http://127.0.0.1:48271\(path)")!
+    let response = try await LocalAPIClient.request(
+      path: path, method: method, body: body,
+      token: authenticated ? IntegrationToken.loadOrCreate() : nil, timeout: timeout
     )
-    request.httpMethod = method
-    request.httpBody = body
-    request.timeoutInterval = timeout
-    if body != nil {
-      request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    guard (200..<300).contains(response.status) else {
+      let message = String(data: response.body, encoding: .utf8) ?? "Unknown server error"
+      throw CLIError.server(status: response.status, message: message)
     }
-    if authenticated {
-      request.setValue(
-        "Bearer \(try IntegrationToken.loadOrCreate())",
-        forHTTPHeaderField: "Authorization"
-      )
-    }
-
-    let (data, response) = try await URLSession.shared.data(for: request)
-    guard let response = response as? HTTPURLResponse else {
-      throw CLIError.invalidResponse
-    }
-    guard (200..<300).contains(response.statusCode) else {
-      let message = String(data: data, encoding: .utf8) ?? "Unknown server error"
-      throw CLIError.server(status: response.statusCode, message: message)
-    }
-    return data
+    return response.body
   }
 
   private static func parseOptions(_ arguments: [String]) throws -> [String: String] {
@@ -393,27 +378,32 @@ private struct CodexHookStateStore {
   private let directory = AppPaths.applicationSupportDirectory
     .appendingPathComponent("codex-adapter-state", isDirectory: true)
 
-  func recordedState(for activityID: String) throws -> ActivityState? {
-    guard
-      let rawValue = try? String(
-        contentsOf: stateURL(for: activityID),
-        encoding: .utf8
-      ).trimmingCharacters(in: .whitespacesAndNewlines)
-    else {
-      return nil
-    }
-    return ActivityState(rawValue: rawValue)
+  private struct Publication: Codable {
+    let state: ActivityState
+    let fingerprint: String
+  }
+
+  private func fingerprint(_ event: ActivityEventRequest) throws -> String {
+    let encoder = ActivityCoding.makeEncoder()
+    encoder.outputFormatting = [.sortedKeys]
+    return SHA256.hash(data: try encoder.encode(event))
+      .map { String(format: "%02x", $0) }.joined()
   }
 
   func shouldPublish(
-    _ state: ActivityState,
-    for activityID: String,
+    _ event: ActivityEventRequest,
     now: Date = Date()
   ) throws -> Bool {
-    guard try recordedState(for: activityID) == state else {
+    let activityID = event.activityID
+    // Legacy files contain only a state string. Publish once to upgrade them.
+    guard let data = try? Data(contentsOf: stateURL(for: activityID)),
+      let previous = try? JSONDecoder().decode(Publication.self, from: data),
+      previous.state == event.state,
+      previous.fingerprint == (try fingerprint(event))
+    else {
       return true
     }
-    guard !state.isTerminal else {
+    guard !event.state.isTerminal else {
       return false
     }
     guard
@@ -427,14 +417,16 @@ private struct CodexHookStateStore {
     return now.timeIntervalSince(lastPublishedAt) >= ActivityLiveness.heartbeatInterval
   }
 
-  func record(_ state: ActivityState, for activityID: String) throws {
+  func record(_ event: ActivityEventRequest) throws {
+    let activityID = event.activityID
     try FileManager.default.createDirectory(
       at: directory,
       withIntermediateDirectories: true
     )
     cleanupExpiredFiles()
     let url = stateURL(for: activityID)
-    try Data("\(state.rawValue)\n".utf8).write(to: url, options: .atomic)
+    let publication = Publication(state: event.state, fingerprint: try fingerprint(event))
+    try JSONEncoder().encode(publication).write(to: url, options: .atomic)
     try FileManager.default.setAttributes(
       [.posixPermissions: 0o600],
       ofItemAtPath: url.path

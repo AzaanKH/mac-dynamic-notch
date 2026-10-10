@@ -41,7 +41,7 @@ func initialPlayingTrackRequestsPeek() {
 
 @MainActor
 @Test
-func viewModelOnlyPeeksForRequestedMusicEvents() {
+func viewModelKeepsMusicEventsCompact() {
   let viewModel = NotchViewModel()
 
   viewModel.musicChanged(
@@ -54,7 +54,7 @@ func viewModelOnlyPeeksForRequestedMusicEvents() {
     event: .playbackStarted,
     hasActiveActivity: false
   )
-  #expect(viewModel.mode == .peek)
+  #expect(viewModel.mode == .compact)
   viewModel.collapse()
 }
 
@@ -76,20 +76,10 @@ func musicPollingAdaptsToPlaybackState() {
 
 @MainActor
 @Test
-func trackChangesUseFastFollowUpPolls() {
-  #expect(
-    MusicController.transportRefreshDelays == [
-      .milliseconds(120),
-      .milliseconds(480),
-    ]
-  )
-}
-
-@MainActor
-@Test
 func browserMediaBecomesNowPlayingAndReceivesCommands() throws {
   let defaults = UserDefaults(suiteName: #function)!
   defaults.removePersistentDomain(forName: #function)
+  defer { defaults.removePersistentDomain(forName: #function) }
   let controller = MusicController(defaults: defaults)
   let event = browserEvent(isPlaying: false)
 
@@ -118,6 +108,7 @@ func browserMediaBecomesNowPlayingAndReceivesCommands() throws {
 func browserTransportCapabilitiesArePreserved() throws {
   let defaults = UserDefaults(suiteName: #function)!
   defaults.removePersistentDomain(forName: #function)
+  defer { defaults.removePersistentDomain(forName: #function) }
   let controller = MusicController(defaults: defaults)
 
   _ = try controller.ingestBrowserMedia(browserEvent(isPlaying: true))
@@ -164,4 +155,65 @@ private func browserEvent(isPlaying: Bool) -> BrowserMediaEvent {
     supportsPrevious: true,
     supportsNext: false
   )
+}
+
+@MainActor
+@Test
+func browserSeekingClampsCoalescesAndRejectsInvalidTargets() throws {
+  let name = UUID().uuidString
+  let defaults = UserDefaults(suiteName: name)!
+  defer { defaults.removePersistentDomain(forName: name) }
+  let controller = MusicController(defaults: defaults)
+  let event = BrowserMediaEvent(
+    kind: .update, sessionID: "frame:1", browserName: "Chrome",
+    title: "Episode", isPlaying: false, duration: 120, position: 20,
+    supportsSeeking: true
+  )
+  _ = try controller.ingestBrowserMedia(event)
+  controller.seek(to: .nan)
+  #expect(try controller.ingestBrowserMedia(event).command == nil)
+  controller.seek(to: -20)
+  var response = try controller.ingestBrowserMedia(event)
+  #expect(response.command == .seek)
+  #expect(response.seekPosition == 0)
+  controller.seek(to: 30)
+  controller.seek(to: 500)
+  response = try controller.ingestBrowserMedia(event)
+  #expect(response.seekPosition == 120)
+  #expect(try controller.ingestBrowserMedia(event).command == nil)
+}
+
+@MainActor
+@Test
+func legacyBrowserCannotSeekAndFrameCommandsStayIsolated() throws {
+  let name = UUID().uuidString
+  let defaults = UserDefaults(suiteName: name)!
+  defer { defaults.removePersistentDomain(forName: name) }
+  let controller = MusicController(defaults: defaults)
+  let legacy = browserEvent(isPlaying: false)
+  _ = try controller.ingestBrowserMedia(legacy)
+  controller.seek(to: 60)
+  #expect(controller.nowPlaying?.canSeek == false)
+  #expect(try controller.ingestBrowserMedia(legacy).command == nil)
+  let embedded = BrowserMediaEvent(
+    kind: .update, sessionID: "frame:2", browserName: "Chrome",
+    title: "Embedded episode", isPlaying: true, duration: 100,
+    supportsSeeking: true
+  )
+  _ = try controller.ingestBrowserMedia(embedded)
+  controller.seek(to: 45)
+  #expect(try controller.ingestBrowserMedia(legacy).command == nil)
+  #expect(try controller.ingestBrowserMedia(embedded).seekPosition == 45)
+}
+
+@Test
+func playbackTimelineInterpolatesRateAndClampsAtDuration() {
+  var value = snapshot(title: "Episode", isPlaying: true)
+  value.sampledAt = Date(timeIntervalSince1970: 100)
+  value.playbackRate = 2
+  #expect(value.elapsed(at: Date(timeIntervalSince1970: 110)) == 32)
+  #expect(value.elapsed(at: Date(timeIntervalSince1970: 500)) == 180)
+  #expect(value.elapsed(at: Date(timeIntervalSince1970: 90)) == 12)
+  let paused = snapshot(title: "Episode", isPlaying: false)
+  #expect(paused.elapsed(at: Date().addingTimeInterval(50)) == 12)
 }

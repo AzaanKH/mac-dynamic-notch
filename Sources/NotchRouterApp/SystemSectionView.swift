@@ -1,7 +1,8 @@
 import SwiftUI
 
 struct SystemSectionView: View {
-  @ObservedObject var monitor: SystemMonitorController
+  let monitor: SystemMonitorController
+  let battery: BatteryMonitor
 
   private let columns = [
     GridItem(.flexible(), spacing: 8),
@@ -12,6 +13,11 @@ struct SystemSectionView: View {
     Group {
       if monitor.isEnabled {
         ScrollView {
+          if let charging = battery.charging {
+            batteryCard(charging)
+              .padding(.bottom, 8)
+          }
+
           LazyVGrid(columns: columns, spacing: 8) {
             metricCard(
               title: "CPU",
@@ -75,11 +81,47 @@ struct SystemSectionView: View {
             monitor.setEnabled(true)
           }
           .buttonStyle(NotchAccentButtonStyle(tint: .cyan))
-          .focusable()
         }
         .padding(24)
       }
     }
+  }
+
+  private func batteryCard(_ charging: BatteryChargingSnapshot) -> some View {
+    VStack(alignment: .leading, spacing: 8) {
+      HStack(spacing: 7) {
+        Image(systemName: "battery.100percent.bolt")
+          .font(.caption.weight(.bold))
+          .dashboardTint(.green)
+        Text("Battery")
+          .font(.caption.weight(.semibold))
+          .dashboardSecondaryText()
+        Spacer()
+        Text("Charging")
+          .font(.caption.weight(.semibold))
+          .dashboardTint(.green)
+      }
+
+      HStack(alignment: .firstTextBaseline) {
+        Text("\(charging.level)%")
+          .font(.title3.weight(.bold).monospacedDigit())
+          .rollingNumber(charging.level)
+        Spacer()
+        Text(charging.estimateLabel)
+          .font(.callout.weight(.semibold).monospacedDigit())
+          .dashboardSecondaryText()
+          .lineLimit(1)
+      }
+
+      ProgressView(value: Double(charging.level) / 100)
+        .tint(.green)
+    }
+    .padding(11)
+    .dashboardSurface(cornerRadius: 13)
+    .accessibilityElement(children: .combine)
+    .accessibilityLabel(
+      "Battery, \(charging.level) percent, charging, \(charging.estimateLabel)"
+    )
   }
 
   private func metricCard(
@@ -157,7 +199,6 @@ struct SystemSectionView: View {
           monitor.testConnection()
         }
         .buttonStyle(NotchSubtleButtonStyle())
-        .focusable()
         .disabled(!monitor.network.isOnline || monitor.connectionTest == .testing)
 
         connectionTestStatus
@@ -209,6 +250,7 @@ struct SystemSectionView: View {
     case .failed:
       Image(systemName: "exclamationmark.triangle.fill")
         .dashboardTint(.orange)
+        .accessibilityLabel(connectionFailureMessage)
         .help(connectionFailureMessage)
     }
   }

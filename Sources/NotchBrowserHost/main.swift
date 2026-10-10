@@ -67,25 +67,14 @@ enum NotchBrowserHost {
     let path = kind.hasPrefix("download") || kind == "downloads_heartbeat"
       ? "/v1/browser-downloads"
       : "/v1/browser-media"
-    var request = URLRequest(
-      url: URL(string: "http://127.0.0.1:48271\(path)")!
+    let response = try await LocalAPIClient.request(
+      path: path, method: "POST", body: body,
+      token: IntegrationToken.loadOrCreate(), timeout: 2
     )
-    request.httpMethod = "POST"
-    request.httpBody = body
-    request.timeoutInterval = 2
-    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-    request.setValue(
-      "Bearer \(try IntegrationToken.loadOrCreate())",
-      forHTTPHeaderField: "Authorization"
-    )
-
-    let (data, response) = try await URLSession.shared.data(for: request)
-    guard let response = response as? HTTPURLResponse,
-      (200..<300).contains(response.statusCode)
-    else {
+    guard (200..<300).contains(response.status) else {
       throw BrowserHostError.invalidResponse
     }
-    return data
+    return response.body
   }
 }
 

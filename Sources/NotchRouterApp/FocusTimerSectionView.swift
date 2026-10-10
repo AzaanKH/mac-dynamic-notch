@@ -1,7 +1,7 @@
 import SwiftUI
 
 struct FocusTimerSectionView: View {
-  @ObservedObject var timer: FocusTimerController
+  let timer: FocusTimerController
   @Environment(\.accessibilityDifferentiateWithoutColor) private var differentiateWithoutColor
   @Environment(\.colorSchemeContrast) private var contrast
 
@@ -47,6 +47,7 @@ struct FocusTimerSectionView: View {
           .dashboardTint(timer.phase == .completed ? .green : .indigo)
         Text(timer.formattedRemaining)
           .font(.system(size: 30, weight: .bold, design: .rounded).monospacedDigit())
+          .rollingNumber(timer.formattedRemaining, countsDown: true)
         Text(timer.stateLabel)
           .font(.caption.weight(.semibold))
           .dashboardSecondaryText()
@@ -77,7 +78,6 @@ struct FocusTimerSectionView: View {
               isSelected: timer.selectedDurationMinutes == minutes
             )
           )
-          .focusable()
           .accessibilityAddTraits(
             timer.selectedDurationMinutes == minutes ? .isSelected : []
           )
@@ -86,7 +86,6 @@ struct FocusTimerSectionView: View {
 
       Button("Start Focus", action: timer.start)
         .buttonStyle(NotchAccentButtonStyle(tint: .indigo))
-        .focusable()
         .keyboardShortcut(.return, modifiers: [])
     }
   }
@@ -96,19 +95,15 @@ struct FocusTimerSectionView: View {
       if timer.phase == .running {
         Button("Pause", action: timer.pause)
           .buttonStyle(NotchAccentButtonStyle(tint: .indigo))
-          .focusable()
       } else {
         Button("Resume", action: timer.resume)
           .buttonStyle(NotchAccentButtonStyle(tint: .indigo))
-          .focusable()
       }
 
       Button("+5 min", action: timer.addFiveMinutes)
         .buttonStyle(NotchSubtleButtonStyle())
-        .focusable()
       Button("Reset", action: timer.reset)
         .buttonStyle(NotchSubtleButtonStyle())
-        .focusable()
     }
   }
 
@@ -116,10 +111,8 @@ struct FocusTimerSectionView: View {
     HStack(spacing: 8) {
       Button("Start Again", action: timer.start)
         .buttonStyle(NotchAccentButtonStyle(tint: .green))
-        .focusable()
       Button("Done", action: timer.reset)
         .buttonStyle(NotchSubtleButtonStyle())
-        .focusable()
     }
   }
 }
@@ -155,5 +148,6 @@ private struct FocusPresetButtonStyle: ButtonStyle {
             lineWidth: contrast == .increased ? 1.5 : 1
           )
       }
+      .contentShape(.focusEffect, Capsule())
   }
 }

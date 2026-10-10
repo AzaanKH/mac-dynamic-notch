@@ -20,7 +20,6 @@ struct HoverSectionNavigation: View {
             .frame(maxWidth: .infinity)
         }
         .buttonStyle(HoverSectionButtonStyle())
-        .focusable()
         .accessibilityLabel("Open \(section.title)")
       }
 
@@ -32,7 +31,6 @@ struct HoverSectionNavigation: View {
           .frame(width: 32)
       }
       .buttonStyle(HoverSectionButtonStyle(tint: .red))
-      .focusable()
       .accessibilityLabel("Quit NotchRouter")
       .help("Quit NotchRouter")
     }
@@ -73,5 +71,6 @@ private struct HoverSectionButtonStyle: ButtonStyle {
             lineWidth: contrast == .increased ? 1.5 : 0.5
           )
       }
+      .contentShape(.focusEffect, RoundedRectangle(cornerRadius: 7, style: .continuous))
   }
 }

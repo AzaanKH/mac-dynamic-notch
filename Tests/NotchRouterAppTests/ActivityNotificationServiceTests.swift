@@ -168,3 +168,23 @@ private func waitUntil(_ predicate: () -> Bool) async throws {
 private enum NotificationTestError: Error {
   case timedOut
 }
+
+// `swift test`, like `swift run`, does not run from an app bundle.
+@MainActor
+@Test
+func notificationsFailGracefullyOutsideAnAppBundle() async {
+  let suiteName = "ActivityNotificationUnbundledTests.\(UUID().uuidString)"
+  let defaults = UserDefaults(suiteName: suiteName)!
+  defer { defaults.removePersistentDomain(forName: suiteName) }
+  #expect(!ActivityNotificationService.isNotificationCenterAvailable)
+
+  let service = ActivityNotificationService(defaults: defaults)
+  service.setEnabled(true)
+  for _ in 0..<100 where service.isRequestingAuthorization {
+    await Task.yield()
+  }
+
+  #expect(!service.isRequestingAuthorization)
+  #expect(!service.isEnabled)
+  #expect(service.permissionMessage?.contains("packaged app") == true)
+}

@@ -131,6 +131,7 @@ private struct ActiveCountBadge: View {
     if count > 0 {
       Text("\(count)")
         .font(.caption2.weight(.bold).monospacedDigit())
+        .rollingNumber(count)
         .foregroundStyle(contrast == .increased ? Color.black : Color.cyan)
         .padding(.horizontal, 6)
         .frame(minWidth: 20, minHeight: 18)

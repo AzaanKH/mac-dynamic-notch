@@ -1,19 +1,20 @@
 import AudioToolbox
-import Combine
+import Observation
 import CoreAudio
 import SwiftUI
 
 @MainActor
-final class SystemVolumeController: ObservableObject {
-  @Published private(set) var level: Double = 0
-  @Published private(set) var isMuted = false
-  @Published private(set) var isAvailable = false
+@Observable
+final class SystemVolumeController {
+  private(set) var level: Double = 0
+  private(set) var isMuted = false
+  private(set) var isAvailable = false
 
-  private var observedDevice = AudioDeviceID(kAudioObjectUnknown)
-  nonisolated(unsafe) private var defaultDeviceListener:
+  @ObservationIgnored private var observedDevice = AudioDeviceID(kAudioObjectUnknown)
+  @ObservationIgnored nonisolated(unsafe) private var defaultDeviceListener:
     AudioObjectPropertyListenerBlock?
-  nonisolated(unsafe) private var volumeListener: AudioObjectPropertyListenerBlock?
-  nonisolated(unsafe) private var muteListener: AudioObjectPropertyListenerBlock?
+  @ObservationIgnored nonisolated(unsafe) private var volumeListener: AudioObjectPropertyListenerBlock?
+  @ObservationIgnored nonisolated(unsafe) private var muteListener: AudioObjectPropertyListenerBlock?
   private var lastAudibleLevel = 0.5
 
   init() {
@@ -331,7 +332,7 @@ final class SystemVolumeController: ObservableObject {
 }
 
 struct SystemVolumeSlider: View {
-  @ObservedObject var controller: SystemVolumeController
+  let controller: SystemVolumeController
   var showsPercentage = false
   @Environment(\.colorSchemeContrast) private var contrast
 
@@ -355,7 +356,7 @@ struct SystemVolumeSlider: View {
           }
       }
       .buttonStyle(.plain)
-      .focusable()
+      .contentShape(.focusEffect, Circle())
       .dashboardTint(controller.isAvailable ? .white.opacity(0.78) : .orange)
       .accessibilityLabel(controller.isMuted ? "Unmute" : "Mute")
 

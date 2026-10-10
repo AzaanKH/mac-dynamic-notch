@@ -1,8 +1,9 @@
+import NotchRouterCore
 import AppKit
 import SwiftUI
 
 struct SettingsRootView: View {
-  @ObservedObject var appDelegate: AppDelegate
+  let appDelegate: AppDelegate
 
   var body: some View {
     Group {
@@ -63,12 +64,12 @@ private struct NotchRouterSettingsView: View {
 }
 
 private struct GeneralSettingsView: View {
-  @ObservedObject var launchAtLogin: LaunchAtLoginController
-  @ObservedObject var displaySelection: DisplaySelectionController
-  @ObservedObject var activityStore: ActivityStore
-  @ObservedObject var systemMonitor: SystemMonitorController
-  @ObservedObject var clipboard: ClipboardStore
-  @ObservedObject var integrations: IntegrationSettingsController
+  let launchAtLogin: LaunchAtLoginController
+  let displaySelection: DisplaySelectionController
+  let activityStore: ActivityStore
+  let systemMonitor: SystemMonitorController
+  let clipboard: ClipboardStore
+  let integrations: IntegrationSettingsController
 
   var body: some View {
     SettingsPage(
@@ -239,7 +240,7 @@ private struct GeneralSettingsView: View {
 }
 
 private struct NotificationSettingsView: View {
-  @ObservedObject var service: ActivityNotificationService
+  let service: ActivityNotificationService
 
   var body: some View {
     SettingsPage(
@@ -340,8 +341,8 @@ private struct NotificationSettingsView: View {
 }
 
 private struct PermissionSettingsView: View {
-  @ObservedObject var music: MusicController
-  @ObservedObject var clipboard: ClipboardStore
+  let music: MusicController
+  let clipboard: ClipboardStore
   @AppStorage(CrashReporter.consentPreferenceKey)
   private var crashReportingEnabled = false
   @State private var confirmsClipboardClear = false
@@ -490,8 +491,8 @@ private struct PermissionSettingsView: View {
 }
 
 private struct IntegrationSettingsView: View {
-  @ObservedObject var controller: IntegrationSettingsController
-  @ObservedObject var server: ActivityHTTPServer
+  let controller: IntegrationSettingsController
+  let server: ActivityHTTPServer
 
   @State private var revealsToken = false
   @State private var confirmsRotation = false
@@ -499,7 +500,7 @@ private struct IntegrationSettingsView: View {
   var body: some View {
     SettingsPage(
       title: "Integrations",
-      subtitle: "Connect local agents and the optional Chromium browser bridge."
+      subtitle: "Connect local agents and the optional browser bridge."
     ) {
       SettingsCard(title: "Local activity server", symbol: "network") {
         HStack(spacing: 8) {
@@ -515,6 +516,23 @@ private struct IntegrationSettingsView: View {
             }
             .controlSize(.small)
           }
+        }
+
+        LabeledContent("Private socket") {
+          Text(LocalAPISocket.url.path)
+            .font(.system(.caption, design: .monospaced))
+            .textSelection(.enabled)
+        }
+        Toggle("Allow legacy TCP integrations", isOn: Binding(
+          get: { server.legacyTCPEnabled },
+          set: { controller.setLegacyTCPEnabled($0) }
+        ))
+        SettingsMessage(
+          "Legacy clients use 127.0.0.1:48271. Another local account can impersonate that endpoint while NotchRouter is stopped. The bundled CLI and browser bridge always use the private socket.",
+          color: .secondary
+        )
+        if case .failed(let failure) = server.legacyTCPState {
+          SettingsMessage(failure.message, color: .orange)
         }
 
         LabeledContent("Endpoint") {
@@ -590,7 +608,7 @@ private struct IntegrationSettingsView: View {
         }
 
         SettingsMessage(
-          "The adapter publishes activity IDs, workspace names, and lifecycle states. It does not send prompts, source code, tool output, or responses.",
+          "The adapter saves task titles from prompts, workspace names, tool names, and final response excerpts locally in NotchRouter. Titles are limited to 160 characters and responses to 1,000 characters.",
           color: .secondary
         )
 
@@ -634,13 +652,13 @@ private struct IntegrationSettingsView: View {
         }
 
         SettingsMessage(
-          "Supports Chrome, Edge, Brave, and Chromium. Media metadata and opted-in download status stay on this Mac; the extension cannot read the local API token.",
+          "Supports Chrome, Edge, Brave, Chromium, and temporary loading in Zen or Firefox. Safari needs a separate extension and is not supported yet. Media and opted-in download status stay on this Mac.",
           color: .secondary
         )
 
         if controller.browserExtensionInstalled {
           Text(
-            "Turn on Developer mode, choose Load unpacked, then select the installed extension folder. Click its toolbar icon once to grant download access; click again to revoke it."
+            "Zen or Firefox: open about:debugging, choose This Firefox → Load Temporary Add-on, and select manifest.json in the extension folder. Repeat after restarting the browser. Chrome-based browsers: turn on Developer mode and choose Load unpacked. Grant download access separately by clicking the extension toolbar icon."
           )
           .font(.caption.weight(.medium))
 
@@ -697,8 +715,8 @@ private struct IntegrationSettingsView: View {
   private var serverStatusLabel: String {
     switch server.state {
     case .stopped: "Stopped"
-    case .starting: "Starting on port \(server.port)…"
-    case .ready: "Listening on 127.0.0.1:\(server.port)"
+    case .starting: "Starting private activity server…"
+    case .ready: "Private activity server ready"
     case .failed(let failure): failure.message
     }
   }

@@ -1,3 +1,5 @@
+const extensionAPI = typeof browser !== "undefined" ? browser : chrome;
+const documentSessionID = crypto.randomUUID();
 const MEDIA_EVENTS = [
   "play",
   "playing",
@@ -7,6 +9,7 @@ const MEDIA_EVENTS = [
   "loadedmetadata",
   "durationchange",
   "seeked",
+  "ratechange",
 ];
 
 let activeMedia = null;
@@ -16,6 +19,67 @@ let lastSentAt = 0;
 let reportedMedia = false;
 let sendTimer = null;
 const observedMedia = new WeakSet();
+const knownMedia = new Set();
+const rootObservers = new Map();
+const pendingSubtrees = new Set();
+let discoveryTimer = null;
+let pendingForce = false;
+let heartbeatTimer = null;
+let reconciliationTimer = null;
+let commandTimer = null;
+let isPageActive = true;
+
+function pruneDiscovery() {
+  for (const media of knownMedia) {
+    if (!media.isConnected) knownMedia.delete(media);
+  }
+  for (const [root, observer] of rootObservers) {
+    if (root !== document && !root.host?.isConnected) {
+      observer.disconnect();
+      rootObservers.delete(root);
+    }
+  }
+}
+
+function observeRoot(root) {
+  if (rootObservers.has(root)) return;
+  const observer = new MutationObserver((records) => {
+    if (!isPageActive) return;
+    for (const record of records) {
+      for (const node of record.addedNodes) {
+        if (node.nodeType === 1) pendingSubtrees.add(node);
+      }
+    }
+    if (discoveryTimer !== null) return;
+    discoveryTimer = setTimeout(() => {
+      discoveryTimer = null;
+      const subtrees = new Set(pendingSubtrees);
+      pendingSubtrees.clear();
+      for (const node of subtrees) {
+        let ancestor = node.parentNode;
+        while (ancestor && !subtrees.has(ancestor)) ancestor = ancestor.parentNode || ancestor.host;
+        if (node.isConnected && !ancestor) discoverSubtree(node);
+      }
+      pruneDiscovery();
+      if (knownMedia.size || reportedMedia) scheduleSnapshot();
+    }, 100);
+  });
+  observer.observe(root, { childList: true, subtree: true });
+  rootObservers.set(root, observer);
+}
+
+function discoverSubtree(root) {
+  if (root === document || root.host) observeRoot(root);
+  function visit(element) {
+    if (element.matches?.("audio, video")) {
+      knownMedia.add(element);
+      observeMedia(element);
+    }
+    if (element.shadowRoot) discoverSubtree(element.shadowRoot);
+  }
+  if (root.nodeType === 1) visit(root);
+  for (const element of root.querySelectorAll("*")) visit(element);
+}
 
 function metaContent(selectors) {
   for (const selector of selectors) {
@@ -40,8 +104,14 @@ function mediaSessionMetadata() {
   }
 }
 
+// Controls are queried only within roots already found by incremental discovery.
+function queryMediaRoots(selector) {
+  return [...rootObservers.keys()].flatMap(root => [...root.querySelectorAll(selector)]);
+}
+
 function mediaElements() {
-  return [...document.querySelectorAll("audio, video")].filter((media) => {
+  pruneDiscovery();
+  return [...knownMedia].filter((media) => {
     return !media.ended
       && media.readyState > 0
       && (media.duration > 0 || media.duration === Infinity);
@@ -79,7 +149,7 @@ function matchingButton(direction) {
       ".skipControl__previous",
     ];
   for (const selector of knownSelectors) {
-    const element = document.querySelector(selector);
+    const element = queryMediaRoots(selector)[0];
     if (element && !element.disabled && element.getAttribute("aria-disabled") !== "true") {
       return element;
     }
@@ -89,7 +159,7 @@ function matchingButton(direction) {
     ? /^(next|skip)\s+(track|video|episode|song)(?:\s*\(.+\))?$/i
     : /^(previous|back)\s+(track|video|episode|song)(?:\s*\(.+\))?$/i;
 
-  return [...document.querySelectorAll("button, [role='button']")].find((element) => {
+  return queryMediaRoots("button, [role='button']").find((element) => {
     if (element.disabled || element.getAttribute("aria-disabled") === "true") return false;
     const label = (
       element.getAttribute("aria-label") ||
@@ -111,6 +181,63 @@ function absoluteHTTPURL(value) {
   }
 }
 
+let artworkRequestURL = null;
+let artworkData = null;
+let artworkAbort = null;
+
+// Fetch in the content script so browser CORS and local-network restrictions apply.
+// Native code receives only a bounded thumbnail, never an address to fetch.
+async function fetchArtworkThumbnail(url, signal) {
+  const response = await fetch(url, { credentials: "omit", redirect: "error", signal });
+  const limit = 2 * 1024 * 1024;
+  if (!response.ok || !response.body) return null;
+  if (Number(response.headers.get("content-length")) > limit) {
+    await response.body.cancel();
+    return null;
+  }
+  const reader = response.body.getReader();
+  const chunks = [];
+  let count = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      count += value.byteLength;
+      if (count > limit) return null;
+      chunks.push(value);
+    }
+  } finally { await reader.cancel(); }
+  if (signal.aborted) return null;
+  const bitmap = await createImageBitmap(new Blob(chunks), {
+    resizeWidth: 256, resizeHeight: 256, resizeQuality: "medium",
+  });
+  try {
+    const canvas = new OffscreenCanvas(256, 256);
+    canvas.getContext("2d").drawImage(bitmap, 0, 0, 256, 256);
+    const thumbnail = await canvas.convertToBlob({ type: "image/jpeg", quality: 0.75 });
+    if (thumbnail.size > 32768 || signal.aborted) return null;
+    const bytes = new Uint8Array(await thumbnail.arrayBuffer());
+    return btoa(String.fromCharCode(...bytes));
+  } finally { bitmap.close(); }
+}
+
+function updateArtwork(url) {
+  if (url === artworkRequestURL) return;
+  artworkAbort?.abort();
+  artworkAbort = null;
+  artworkRequestURL = url;
+  artworkData = null;
+  if (!url) return;
+  const controller = new AbortController();
+  artworkAbort = controller;
+  const deadline = setTimeout(() => controller.abort(), 10000);
+  fetchArtworkThumbnail(url, controller.signal).then(data => {
+    if (controller.signal.aborted || artworkRequestURL !== url) return;
+    artworkData = data;
+    if (data) scheduleSnapshot(true);
+  }).catch(() => {}).finally(() => clearTimeout(deadline));
+}
+
 function buildSnapshot(media) {
   const metadata = mediaSessionMetadata();
   const artwork = metadata?.artwork?.at(-1)?.src;
@@ -127,34 +254,41 @@ function buildSnapshot(media) {
     || metaContent(["meta[property='music:album']"])
     || siteName;
 
+  updateArtwork(absoluteHTTPURL(
+    artwork || metaContent(["meta[property='og:image']", "meta[name='twitter:image']"])
+  ));
   return {
-    title,
-    artist,
-    album,
-    site_name: siteName,
-    page_url: location.href,
-    artwork_url: absoluteHTTPURL(
-      artwork || metaContent(["meta[property='og:image']", "meta[name='twitter:image']"])
-    ),
+    title: title.slice(0, 500),
+    artist: artist.slice(0, 300),
+    album: album.slice(0, 300),
+    site_name: siteName.slice(0, 120),
+    page_url: location.href.slice(0, 4096),
+    artwork_data: artworkData,
     is_playing: !media.paused && !media.ended,
     duration: Number.isFinite(media.duration) ? Math.max(0, media.duration) : 0,
     position: Number.isFinite(media.currentTime) ? Math.max(0, media.currentTime) : 0,
     supports_previous: Boolean(matchingButton("previous"))
       || (Number.isFinite(media.duration) && media.currentTime > 3),
     supports_next: Boolean(matchingButton("next")),
+    supports_seeking: Number.isFinite(media.duration) && media.duration > 0 && media.seekable.length > 0,
+    playback_rate: Number.isFinite(media.playbackRate) ? media.playbackRate : 1,
   };
 }
 
 function sendSnapshot(force = false) {
+  if (!isPageActive) return;
   activeMedia = chooseMedia();
+  scheduleHeartbeat();
   if (!activeMedia) {
+    updateArtwork(null);
     if (reportedMedia) {
-      chrome.runtime.sendMessage({ kind: "notchrouter_media_ended" }).catch(() => {});
+      extensionAPI.runtime.sendMessage({ kind: "notchrouter_media_ended", document_session_id: documentSessionID }).catch(() => {});
       reportedMedia = false;
       lastPayload = "";
     }
     return;
   }
+  observeMedia(activeMedia);
   const snapshot = buildSnapshot(activeMedia);
   const comparison = JSON.stringify({
     ...snapshot,
@@ -164,15 +298,23 @@ function sendSnapshot(force = false) {
   lastPayload = comparison;
   lastSentAt = Date.now();
   reportedMedia = true;
-  chrome.runtime.sendMessage({
+  extensionAPI.runtime.sendMessage({
     kind: "notchrouter_media",
+    document_session_id: documentSessionID,
     media: snapshot,
   }).catch(() => {});
 }
 
 function scheduleSnapshot(force = false) {
-  clearTimeout(sendTimer);
-  sendTimer = setTimeout(() => sendSnapshot(force), 100);
+  if (!isPageActive) return;
+  pendingForce ||= force;
+  if (sendTimer !== null) return;
+  sendTimer = setTimeout(() => {
+    sendTimer = null;
+    const shouldForce = pendingForce;
+    pendingForce = false;
+    sendSnapshot(shouldForce);
+  }, 100);
 }
 
 function observeMedia(media) {
@@ -184,12 +326,79 @@ function observeMedia(media) {
 }
 
 function discoverMedia() {
-  for (const media of document.querySelectorAll("audio, video")) observeMedia(media);
-  scheduleSnapshot();
+  if (!isPageActive) return;
+  discoverSubtree(document);
+  pruneDiscovery();
+  if (knownMedia.size || reportedMedia) scheduleSnapshot();
 }
 
-chrome.runtime.onMessage.addListener((message) => {
+function scheduleHeartbeat() {
+  clearTimeout(heartbeatTimer);
+  heartbeatTimer = null;
+  if (!isPageActive || !activeMedia) return;
+  // Paused and background players still heartbeat below the native session expiry.
+  // Media events and commands publish immediately through the short debounce.
+  const delay = document.hidden || activeMedia.paused ? 5000 : 1000;
+  heartbeatTimer = setTimeout(() => {
+    heartbeatTimer = null;
+    sendSnapshot();
+  }, delay);
+}
+
+function scheduleReconciliation() {
+  clearTimeout(reconciliationTimer);
+  reconciliationTimer = null;
+  if (!isPageActive) return;
+  // attachShadow() on an existing host does not emit a DOM mutation. Keep a
+  // fallback scan, but give background pages without user interaction more time.
+  reconciliationTimer = setTimeout(() => {
+    reconciliationTimer = null;
+    discoverMedia();
+    scheduleReconciliation();
+  }, document.hidden ? 60000 : 10000);
+}
+
+function suspendPage() {
+  isPageActive = false;
+  for (const timer of [heartbeatTimer, reconciliationTimer, commandTimer, sendTimer, discoveryTimer]) {
+    clearTimeout(timer);
+  }
+  heartbeatTimer = reconciliationTimer = commandTimer = sendTimer = discoveryTimer = null;
+  pendingForce = false;
+  pendingSubtrees.clear();
+  for (const observer of rootObservers.values()) observer.disconnect();
+  rootObservers.clear();
+  knownMedia.clear();
+  activeMedia = lastPlayingMedia = null;
+  updateArtwork(null);
+  if (reportedMedia) {
+    extensionAPI.runtime.sendMessage({ kind: "notchrouter_media_ended", document_session_id: documentSessionID }).catch(() => {});
+  }
+  reportedMedia = false;
+  lastPayload = "";
+}
+
+function seekMedia(media, position) {
+  if (!Number.isFinite(position) || !Number.isFinite(media.duration) || media.duration <= 0) return;
+  const ranges = media.seekable;
+  if (!ranges.length) return;
+  const requested = Math.min(media.duration, Math.max(0, position));
+  let target = ranges.start(0);
+  let distance = Infinity;
+  for (let index = 0; index < ranges.length; index++) {
+    const candidate = Math.min(ranges.end(index), Math.max(ranges.start(index), requested));
+    if (Math.abs(candidate - requested) < distance) {
+      target = candidate;
+      distance = Math.abs(candidate - requested);
+    }
+  }
+  try { media.currentTime = target; } catch (_error) {}
+}
+
+extensionAPI.runtime.onMessage.addListener((message) => {
+  if (!isPageActive) return;
   if (!message || message.kind !== "notchrouter_command") return;
+  if (message.document_session_id && message.document_session_id !== documentSessionID) return;
   const media = chooseMedia();
   if (!media) return;
 
@@ -200,16 +409,30 @@ chrome.runtime.onMessage.addListener((message) => {
     const button = matchingButton("previous");
     if (button) button.click();
     else if (Number.isFinite(media.duration) && media.currentTime > 3) media.currentTime = 0;
+  } else if (message.command === "seek") {
+    seekMedia(media, message.seek_position);
   } else if (message.command === "next") {
     matchingButton("next")?.click();
   }
-  setTimeout(() => sendSnapshot(true), 150);
-});
-
-new MutationObserver(discoverMedia).observe(document.documentElement, {
-  childList: true,
-  subtree: true,
+  clearTimeout(commandTimer);
+  commandTimer = setTimeout(() => {
+    commandTimer = null;
+    sendSnapshot(true);
+  }, 150);
 });
 
 discoverMedia();
-setInterval(() => sendSnapshot(), 1000);
+scheduleReconciliation();
+document.addEventListener("visibilitychange", () => {
+  if (!isPageActive) return;
+  if (!document.hidden) discoverMedia();
+  scheduleSnapshot(true);
+  scheduleReconciliation();
+});
+addEventListener("pagehide", suspendPage);
+addEventListener("pageshow", () => {
+  if (isPageActive) return;
+  isPageActive = true;
+  discoverMedia();
+  scheduleReconciliation();
+});

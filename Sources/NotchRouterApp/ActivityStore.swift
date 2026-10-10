@@ -1,4 +1,4 @@
-import Combine
+import Observation
 import Foundation
 import NotchRouterCore
 
@@ -24,17 +24,19 @@ extension ActivityState {
 }
 
 @MainActor
-final class ActivityStore: ObservableObject {
+@Observable
+final class ActivityStore {
   static let expiryCheckInterval: TimeInterval = 30
   static let retentionPreferenceKey = "activityRetentionLimit"
   static let defaultRetentionLimit = 30
   static let availableRetentionLimits = [10, 30, 50, 100]
 
-  @Published private(set) var activities: [AIActivity] = []
-  @Published private(set) var retentionLimit: Int
+  private(set) var activities: [AIActivity] = []
+  private(set) var retentionLimit: Int
 
   var onIngest: ((AIActivity) -> Void)?
 
+  private let historyWriter: HistoryWriter<[AIActivity]>
   private let storageURL: URL
   private let expiryWindow: TimeInterval
   private let dateProvider: () -> Date
@@ -47,6 +49,7 @@ final class ActivityStore: ObservableObject {
     defaults: UserDefaults = .standard
   ) {
     self.storageURL = storageURL
+    historyWriter = HistoryWriter(storageURL: storageURL)
     self.expiryWindow = max(0, expiryWindow)
     self.dateProvider = dateProvider
     self.defaults = defaults
@@ -96,6 +99,7 @@ final class ActivityStore: ObservableObject {
         activity.id,
         activity.source,
         activity.title,
+        activity.workspace ?? "",
         activity.message ?? "",
         activity.state.rawValue.replacingOccurrences(of: "_", with: " "),
         activity.state.activityGroup.rawValue.replacingOccurrences(of: "_", with: " "),
@@ -133,15 +137,17 @@ final class ActivityStore: ObservableObject {
   @discardableResult
   func expireStaleActivities(at expirationDate: Date? = nil) -> Bool {
     let now = expirationDate ?? dateProvider()
+    var updatedActivities = activities
     var didExpire = false
-    for index in activities.indices {
+    for index in updatedActivities.indices {
       didExpire =
-        activities[index].expireIfNeeded(
+        updatedActivities[index].expireIfNeeded(
           at: now,
           after: expiryWindow
         ) || didExpire
     }
     guard didExpire else { return false }
+    activities = updatedActivities
     sortActivities()
     persist()
     return true
@@ -205,18 +211,11 @@ final class ActivityStore: ObservableObject {
   }
 
   private func persist() {
-    do {
-      try preparePrivateStorageDirectory()
-      let data = try ActivityCoding.makeEncoder(prettyPrinted: true)
-        .encode(activities)
-      try data.write(to: storageURL, options: .atomic)
-      try FileManager.default.setAttributes(
-        [.posixPermissions: 0o600],
-        ofItemAtPath: storageURL.path
-      )
-    } catch {
-      NSLog("NotchRouter could not persist its activity history: \(error)")
-    }
+    historyWriter.submit(activities)
+  }
+
+  func flushPersistence() async {
+    await historyWriter.flush()
   }
 
   private func secureStoragePermissions() {

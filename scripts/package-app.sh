@@ -157,6 +157,13 @@ sparkle_framework_source=$(find \
 [[ -n "$sparkle_framework_source" ]] \
   || fail "Could not locate Sparkle.framework in SwiftPM artifacts"
 
+# GHSA-3x7w-j75x-ppq5 is fixed in 2.9.6. Refuse stale cached artifacts.
+sparkle_version=$(plutil -extract CFBundleShortVersionString raw -o - \
+  "${sparkle_framework_source}/Resources/Info.plist")
+autoload -Uz is-at-least
+is-at-least 2.9.6 "$sparkle_version" \
+  || fail "Sparkle ${sparkle_version} is unsafe; packaging requires 2.9.6 or later"
+
 sparkle_framework="${contents_directory}/Frameworks/Sparkle.framework"
 ditto "$sparkle_framework_source" "$sparkle_framework"
 

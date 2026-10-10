@@ -1,5 +1,5 @@
 import AppKit
-import Combine
+import Observation
 import Foundation
 import NotchRouterCore
 import UniformTypeIdentifiers
@@ -35,7 +35,7 @@ struct ClipboardExcludedApplication: Codable, Identifiable, Equatable {
   var id: String { bundleIdentifier }
 }
 
-struct ClipboardEntry: Codable, Identifiable, Equatable {
+struct ClipboardEntry: Codable, Identifiable, Equatable, Sendable {
   let id: UUID
   let text: String?
   let imageFileName: String?
@@ -157,12 +157,13 @@ struct ClipboardEntry: Codable, Identifiable, Equatable {
 }
 
 @MainActor
-final class ClipboardStore: NSObject, ObservableObject {
+@Observable
+final class ClipboardStore: NSObject {
   static let preferenceKey = "clipboardHistoryEnabled"
   static let retentionPreferenceKey = "clipboardRetentionLimit"
   static let autoExpiryPreferenceKey = "clipboardAutoExpiry"
   static let excludedApplicationsPreferenceKey = "clipboardExcludedApplications"
-  static let pollingInterval: TimeInterval = 1.5
+  private static let pollingInterval: TimeInterval = 1.5
   static let maximumEntryCount = 30
   static let availableRetentionLimits = [10, 30, 50, 100]
   static let maximumTextLength = 10_000
@@ -170,16 +171,19 @@ final class ClipboardStore: NSObject, ObservableObject {
   nonisolated static let maximumImageDimension = 4_096
   nonisolated static let fallbackImageDimension = 2_048
 
-  @Published private(set) var entries: [ClipboardEntry] = []
-  @Published private(set) var isEnabled: Bool
-  @Published private(set) var retentionLimit: Int
-  @Published private(set) var autoExpiry: ClipboardAutoExpiry
-  @Published private(set) var excludedApplications: [ClipboardExcludedApplication]
+  private(set) var entries: [ClipboardEntry] = []
+  private(set) var isEnabled: Bool
+  private(set) var retentionLimit: Int
+  private(set) var autoExpiry: ClipboardAutoExpiry
+  private(set) var excludedApplications: [ClipboardExcludedApplication]
 
   var isPolling: Bool {
     timer?.isValid == true
   }
 
+  private let historyWriter: HistoryWriter<[ClipboardEntry]>
+  private var imageCaptureTasks: [UUID: Task<Void, Never>] = [:]
+  private var isStopping = false
   private let storageURL: URL
   private let imageDirectoryURL: URL
   private let pasteboard: NSPasteboard
@@ -196,6 +200,7 @@ final class ClipboardStore: NSObject, ObservableObject {
     defaults: UserDefaults = .standard
   ) {
     self.storageURL = storageURL
+    historyWriter = HistoryWriter(storageURL: storageURL)
     imageDirectoryURL = storageURL.deletingPathExtension()
       .appendingPathComponent("images", isDirectory: true)
     self.pasteboard = pasteboard
@@ -409,6 +414,7 @@ final class ClipboardStore: NSObject, ObservableObject {
   }
 
   @objc func captureIfChanged() {
+    guard !isStopping else { return }
     if purgeExpiredEntries(now: Date()) > 0 {
       persist()
       scheduleExpiryTimer()
@@ -505,22 +511,20 @@ final class ClipboardStore: NSObject, ObservableObject {
   }
 
   private func persist() {
-    do {
-      try FileManager.default.createDirectory(
-        at: storageURL.deletingLastPathComponent(),
-        withIntermediateDirectories: true,
-        attributes: [.posixPermissions: 0o700]
-      )
-      let data = try ActivityCoding.makeEncoder(prettyPrinted: true)
-        .encode(entries)
-      try data.write(to: storageURL, options: .atomic)
-      try FileManager.default.setAttributes(
-        [.posixPermissions: 0o600],
-        ofItemAtPath: storageURL.path
-      )
-    } catch {
-      NSLog("NotchRouter could not persist clipboard history: \(error)")
-    }
+    historyWriter.submit(entries)
+  }
+
+  func stopMonitoringForTermination() {
+    isStopping = true
+    stopPolling()
+    expiryTimer?.invalidate()
+    expiryTimer = nil
+  }
+
+  func flushPersistence() async {
+    let captures = Array(imageCaptureTasks.values)
+    for task in captures { await task.value }
+    await historyWriter.flush()
   }
 
   private func sourceApplication() -> ClipboardSourceApplication? {
@@ -566,7 +570,8 @@ final class ClipboardStore: NSObject, ObservableObject {
       return ExistingClipboardImage(url: url, byteCount: byteCount)
     }
 
-    Task { @MainActor [weak self] in
+    imageCaptureTasks[id] = Task { @MainActor [weak self] in
+      defer { self?.imageCaptureTasks[id] = nil }
       do {
         let persistedImage = try await Task.detached(priority: .utility) {
           try Self.encodeAndPersistImage(
@@ -632,6 +637,10 @@ final class ClipboardStore: NSObject, ObservableObject {
       at: imageDirectoryURL,
       withIntermediateDirectories: true,
       attributes: [.posixPermissions: 0o700]
+    )
+    try FileManager.default.setAttributes(
+      [.posixPermissions: 0o700],
+      ofItemAtPath: imageDirectoryURL.path
     )
     try encoded.data.write(to: fileURL, options: .atomic)
     try FileManager.default.setAttributes(
@@ -774,6 +783,7 @@ final class ClipboardStore: NSObject, ObservableObject {
   }
 
   private func scheduleExpiryTimer() {
+    guard !isStopping else { return }
     expiryTimer?.invalidate()
     expiryTimer = nil
     guard let interval = autoExpiry.interval else { return }

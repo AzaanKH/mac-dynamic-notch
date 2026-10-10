@@ -132,6 +132,7 @@ func systemSectionDefaultsOffAndPersistsOptIn() {
 
   controller.setEnabled(false)
   #expect(!controller.isEnabled)
+  #expect(!defaults.bool(forKey: SystemMonitorController.enabledPreferenceKey))
 }
 
 @MainActor

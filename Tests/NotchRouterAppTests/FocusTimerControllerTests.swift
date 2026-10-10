@@ -126,20 +126,14 @@ func elapsedFocusTimerRestoresAsCompleted() {
 
 @MainActor
 @Test
-func completedFocusTimerPeeksUnlessAnActivityHasPriority() {
+func completedFocusTimerStaysCompact() {
   let viewModel = NotchViewModel()
 
   viewModel.focusTimerCompleted(hasActiveActivity: true)
   #expect(viewModel.mode == .compact)
 
   viewModel.focusTimerCompleted(hasActiveActivity: false)
-  #expect(viewModel.mode == .peek)
+  #expect(viewModel.mode == .compact)
   #expect(viewModel.selectedSection == .focus)
   viewModel.collapse()
-}
-
-@MainActor
-@Test
-func focusTimerUpdatesOncePerSecond() {
-  #expect(FocusTimerController.tickInterval == .seconds(1))
 }

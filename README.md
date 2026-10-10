@@ -1,57 +1,17 @@
 # NotchRouter
 
-NotchRouter is a native macOS notch hub for live AI work, files, music,
-clipboard history, and local system status. It uses a transparent AppKit panel
-at the top center of the active display and hosts a restrained SwiftUI
-interface inside it.
+NotchRouter puts AI activity, a focus timer, files, music, clipboard history,
+and system status in a macOS notch panel. It supports physical notches and
+external displays, Spaces, and full-screen apps.
 
-The compact surface prioritizes one live signal at a time. The expanded surface
-provides six focused sections instead of turning the notch into a dense
-control-center dashboard.
+The compact panel shows one live signal at a time. Hover to peek, or click to
+open the six sections. Option-N opens Activity; Escape collapses the panel.
+Left/Right Arrow cycles sections, 1–6 selects a section, and Tab/Shift-Tab moves
+between controls.
 
-## What is implemented
-
-- Physical-notch geometry from `NSScreen.safeAreaInsets` and the auxiliary top
-  regions, with a software-notch fallback on external displays.
-- A borderless `NSPanel` across Spaces and full-screen apps.
-- Keyboard-first operation: Option-Space opens Activity globally, Escape
-  collapses, Left/Right Arrow cycles sections, 1–6 jumps directly to a
-  section, and Tab/Shift-Tab traverses controls.
-- Compact, hover/peek, and expanded states with reduced-motion support.
-- Contextual hover shortcuts for jumping directly to Activity, Files, Music,
-  or Clipboard without opening the default section first.
-- A local AI activity API with token authentication.
-- Current state plus a bounded history of what each agent reported doing.
-- Review/deep-link actions for approval events.
-- A persistent 15, 25, or 50-minute focus timer with pause, resume, reset, and
-  add-time controls, plus optional completion notifications and sounds.
-- Optional macOS notifications for approval, completion, and failure. They are
-  off until enabled from Settings, where each notification type can be chosen
-  independently.
-- A small `notchctl` client intended for agent hooks and Apple Shortcuts.
-- A persistent file shelf with whole-notch drop targeting, an open-panel
-  fallback, drag-out, native Quick Look, missing-file cleanup, Finder reveal,
-  and AirDrop actions.
-- Opt-in Apple Music and Spotify metadata and controls using bounded,
-  background Apple Events. No private MediaRemote framework is loaded.
-- An opt-in Manifest V3 extension for Chrome, Edge, Brave, and Chromium that
-  relays active audio/video metadata and, with a separate optional Downloads
-  permission, download progress and controls through an authenticated
-  native-messaging host.
-- Event-driven Mac charging percentage and time-to-full status from IOKit,
-  shown contextually on the compact surface while charging.
-- An opt-in combined System section for aggregate CPU and memory usage, memory
-  pressure, free disk space, thermal state, Low Power Mode, local connection
-  state, Wi-Fi signal, VPN detection, and network throughput.
-- System output volume and mute controls in both the hover mini-player and the
-  expanded Music section, implemented with public Core Audio APIs.
-- A native Settings window for launch-at-login, pointer/active-window/pinned
-  display placement, optional external-display hiding, history retention,
-  notification types, permissions, token rotation, and integration setup.
-- Opt-in text and image clipboard history with concealed, transient,
-  auto-generated, and known password-manager pasteboards excluded, plus
-  search, pinned clips, configurable auto-expiry, and per-app exclusions.
-- JSON persistence under `~/Library/Application Support/NotchRouter`.
+Integrations are opt-in. Agents send activity through the local `notchctl` CLI
+or authenticated local API. Music supports Apple Music, Spotify, and an
+optional browser bridge.
 
 ## Build and run
 
@@ -75,12 +35,15 @@ swift run NotchRouter
 
 UserNotifications work most predictably from the packaged `.app`.
 
+Run the test suite with `swift test`, or use `swift test --filter <test-name>`
+for a focused check. See [AGENTS.md](AGENTS.md) for repository conventions.
+
 Developer ID signing, hardened runtime, notarization, the stapled DMG, Sentry
 symbol upload, and Sparkle's signed appcast are handled by the tag-driven
 release workflow. See [Releasing NotchRouter](docs/RELEASING.md) for required
 credentials and verification commands.
 
-## Focus, files, music, clipboard, and system status
+## Using the app
 
 Click the notch and choose a section from the navigation strip.
 
@@ -109,7 +72,7 @@ with a double-click, revealed in Finder, or deliberately sent through AirDrop.
 Unavailable items are marked as missing; **Clean Missing** removes only those
 stale shelf entries and never deletes files from disk.
 
-Chromium download history also appears inside Files when the browser bridge's
+Browser download history also appears inside Files when the browser bridge's
 optional Downloads permission is enabled. Active downloads take over the
 compact surface when no AI activity has priority. Pause, resume, cancel, and
 Finder reveal commands are returned to the browser through native messaging;
@@ -136,6 +99,14 @@ Music section immediately. Starting playback or using the previous/next
 controls briefly reveals the mini-player; passive song transitions update the
 compact artwork without opening it.
 
+When artwork is available (Spotify or the browser bridge), NotchRouter samples
+the cover art and tints the notch with a soft ambient glow derived from the
+dominant color. The compact playback glyph, progress bar, and play button pick
+up the same accent. Colors are normalized for legibility on black and cached per
+artwork URL. Increased Contrast suppresses the glow; Reduce Motion limits
+transitions. Apple Music's native fallback keeps the default pink
+accent because its scripting metadata exposes no artwork URL.
+
 Previous and next schedule fast follow-up polls after the player accepts the
 command, so new metadata replaces the old track without waiting for the regular
 eight-second playback poll.
@@ -150,13 +121,23 @@ second panel over the notch.
 
 #### Browser media and downloads
 
-The packaged app includes an opt-in browser extension for Google Chrome,
-Microsoft Edge, Brave, and Chromium. Open **Settings → Integrations → Browser
-bridge** and choose **Install Browser Bridge**. Then:
+The packaged app includes an opt-in browser extension for Chrome, Edge, Brave,
+Chromium, and Firefox-compatible browsers including Zen. Open
+**Settings → Integrations → Browser bridge** and choose **Install Browser Bridge**
+or **Reinstall Bridge** to update an earlier installation. Then:
 
-1. Open the browser's Extensions page and enable Developer mode.
-2. Choose **Load unpacked**.
-3. Select the extension folder opened by NotchRouter.
+- In **Zen or Firefox**, open `about:debugging#/runtime/this-firefox`, choose
+  **Load Temporary Add-on**, and select `manifest.json` from the installed
+  extension folder. Allow the media sites you want to use and reload those tabs.
+  You must repeat temporary loading after restarting the browser. A persistent,
+  Mozilla-signed add-on is not included yet.
+- In **Chrome, Edge, Brave, or Chromium**, enable Developer mode on the Extensions
+  page, choose **Load unpacked**, and select the installed extension folder.
+- **Safari is not supported yet.** It needs a bundled Safari Web Extension and
+  a different native messaging handler.
+
+See [the browser bridge guide](BrowserExtension/README.md) for version requirements
+and installation details.
 
 Media support is then active. To add downloads, pin or open the extension and
 click its toolbar icon, then approve the Downloads permission. An **ON** badge
@@ -173,8 +154,15 @@ more than three seconds in.
 The content script observes only media elements and standard media/page
 metadata. It does not send page contents, browsing history, cookies, or
 authentication data. A native-messaging helper reads the user-only integration
-token and calls the loopback API, so neither the extension nor a web page can
+token and calls the private per-user socket, so neither the extension nor a web page can
 read that token. Browser sessions expire if the extension stops heartbeating.
+
+Browser artwork is fetched by the content script without credentials or redirects,
+subject to browser access restrictions. It sends a JPEG thumbnail of at most
+256 × 256 pixels and 32 KiB to the app. Sites that prevent artwork access retain
+the fallback icon. Legacy extensions can still report playback, but their artwork
+URLs are never fetched by native code. Native Spotify artwork is restricted to
+recognized Spotify HTTPS hosts, with an 8 MB streaming limit and bounded decoding.
 
 The same setup is available from the CLI:
 
@@ -185,7 +173,7 @@ The same setup is available from the CLI:
 
 Safari requires a separately signed Safari app extension, and persistent
 Firefox installation requires a signed add-on, so neither is advertised as
-supported by this local package. No private MediaRemote framework is loaded.
+supported by this local package.
 
 ### Battery and System
 
@@ -197,8 +185,10 @@ accessories, and other Bluetooth devices.
 
 Choose **System**, or enable it under **Settings → General → System section**,
 for aggregate CPU, memory pressure and use, disk, thermal, Low Power Mode, and
-network information. Sampling runs every two seconds while compact and every
-second while expanded, and stops when the feature is disabled. The metrics use
+network information. Sampling runs every ten seconds in the background and every
+second while the expanded System section is visible, or every two seconds in
+Low Power Mode. Opening System refreshes immediately. Sampling pauses while
+displays sleep and stops when the feature is disabled. The metrics use
 local APIs and interface counters. **Test connection** is the only action that
 contacts the internet; it sends an on-demand HEAD request to Apple's small
 connectivity endpoint and reports elapsed time.
@@ -295,11 +285,16 @@ PostToolUse       → running (and periodic heartbeat)
 Stop              → succeeded (or failed when no final response exists)
 ```
 
-It publishes only the turn identifier, workspace name, and lifecycle state. It
-does not forward prompts, tool arguments or output, transcripts, source code,
-or assistant responses. Delivery is best-effort: if NotchRouter is closed, the
-hook exits successfully and never interrupts Codex. Repeated running events are
-coalesced to one heartbeat per minute. Re-running the installer is
+It publishes the turn identifier, workspace name, lifecycle state, tool name,
+and a final response excerpt of up to 1,000 characters to local NotchRouter.
+A `task_title` label or the hook's `prompt` supplies a task title of up to 160
+characters, retained across later updates. If neither is supplied, the card
+uses “AI work”. Show details expands the saved message and dated update history.
+Prompt and response excerpts may contain sensitive task content and are saved
+in local activity history. The adapter does not read transcripts or tool output.
+Delivery is best-effort: if NotchRouter is closed, the hook exits successfully
+and never interrupts Codex. Changed details publish immediately; identical
+running events are coalesced to one heartbeat per minute. Re-running the installer is
 safe and updates the existing NotchRouter commands without replacing unrelated
 hooks or the `notify` command in `~/.codex/config.toml`. The installer copies a
 standalone `notchctl` to `~/Library/Application Support/NotchRouter/bin`, so the
@@ -322,9 +317,12 @@ state. Reliable integrations therefore need an explicit adapter:
 2. A command-line agent invokes `notchctl` from its lifecycle hooks.
 3. An Apple Shortcut or automation invokes `notchctl`.
 4. A remote service sends events through a small local companion or signed
-   push-notification service. Do not expose this loopback server to the network.
+   push-notification service. Do not expose the local API to the network.
 
-The raw endpoint is `POST http://127.0.0.1:48271/v1/activities` with
+The default transport is the private Unix socket at
+`~/Library/Application Support/NotchRouter/api.sock`. Use `notchctl`, or send
+`POST http://localhost/v1/activities` through that socket with curl's
+`--unix-socket` option and
 `Authorization: Bearer <token>`. Copy or rotate the token from **Settings →
 Integrations**, or read it from:
 
@@ -346,8 +344,22 @@ Example JSON:
 }
 ```
 
-The server binds only to `127.0.0.1`, rejects browser-origin requests, caps
-request size, and requires the per-user token. Keep summaries free of secrets:
+The private socket requires the per-user token and sits in a directory accessible
+only to your macOS account. Token rotation closes accepted connections immediately.
+Requests have a 64 KiB limit, a 10-second lifetime, and a 64-connection cap.
+
+For existing third-party clients, **Settings → Integrations → Allow legacy TCP
+integrations** enables `http://127.0.0.1:48271`. TCP defaults off. It still rejects
+browser-origin requests and requires the token, but another local account can
+impersonate that port while NotchRouter is stopped. The bundled CLI and browser
+bridge never fall back to TCP.
+
+After installing this update, reinstall enabled Codex hooks and the browser bridge
+from Settings so their copied helper executables are updated. Reload the browser
+extension and refresh media tabs. Old helpers use TCP and will not work with the
+new default transport.
+
+Keep summaries free of secrets:
 send a useful description of an action, not prompts, source code, clipboard
 contents, or model transcripts.
 
@@ -362,7 +374,7 @@ clipboard history under:
 
 Clipboard and file-shelf files are written with mode `0600`. The music
 integration stores no listening history; only the latest in-memory snapshot is
-shown. System Notifications, Music, Clipboard, browser downloads, and System
+shown. Notifications, Music, Clipboard, browser downloads, and System
 metrics are disabled until the user enables the relevant capability.
 
 ## Recommended adapter contract
@@ -375,15 +387,14 @@ queued → running → needs_approval → running → succeeded
 ```
 
 Use one stable activity ID for the whole run. Set `action_url` when the user can
-review or resume the work in the source app. A future adapter can add a callback
-action for approvals, but the MVP uses deep links so NotchRouter never receives
-credentials or impersonates the source app.
+review or resume the work in the source app. Approval actions open deep links;
+NotchRouter does not approve work on the source app's behalf.
 
 ## Distribution notes
 
-Local packages are unsigned. Tagged releases use the Developer ID, hardened
-runtime, notarization, Sparkle, and Sentry pipeline described in
+Local packages are unsigned unless `CODESIGN_IDENTITY` is set. Tagged releases
+use the Developer ID, hardened runtime, notarization, Sparkle, and Sentry pipeline described in
 [Releasing NotchRouter](docs/RELEASING.md). The app is intentionally not
-sandboxed because local CLI integrations need a stable loopback endpoint and
+sandboxed; local CLI integrations use a private Unix socket and
 shared Application Support token. Publish a privacy policy covering crash
 reporting before distributing the first Sentry-enabled build.

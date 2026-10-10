@@ -1,10 +1,10 @@
 import AppKit
-import Combine
+import Observation
 import Foundation
 import NotchRouterCore
 @preconcurrency import QuickLookUI
 
-struct ShelfItem: Codable, Identifiable, Equatable {
+struct ShelfItem: Codable, Identifiable, Equatable, Sendable {
   let id: UUID
   var name: String
   var path: String
@@ -35,20 +35,41 @@ struct ShelfItem: Codable, Identifiable, Equatable {
   }
 }
 
+struct ShelfItemPresentation {
+  let url: URL?
+  let icon: NSImage
+}
+
+private struct ResolvedShelfItem: Sendable {
+  let url: URL?
+  var refreshedBookmark: Data?
+  var iconData: Data?
+}
+
 @MainActor
-final class FileShelfStore: NSObject, ObservableObject,
+@Observable
+final class FileShelfStore: NSObject,
   @preconcurrency QLPreviewPanelDataSource,
   QLPreviewPanelDelegate,
   NSSharingServiceDelegate
 {
-  @Published private(set) var items: [ShelfItem] = []
-  @Published private(set) var lastError: String?
+  private(set) var items: [ShelfItem] = []
+  private(set) var lastError: String?
+  private(set) var presentations: [UUID: ShelfItemPresentation] = [:]
 
   private let storageURL: URL
   private var previewedItemID: UUID?
   private var previewURL: URL?
   private var previewIsAccessingSecurityScope = false
-  private var resolvedURLCache: [UUID: URL] = [:]
+  private var clearGeneration: UInt = 0
+  private var pendingAddTasks: [UUID: Task<Void, Never>] = [:]
+  @ObservationIgnored private lazy var historyWriter = HistoryWriter<[ShelfItem]>(storageURL: storageURL) {
+    [weak self] error in
+    NSLog("NotchRouter could not save the file shelf: \(error)")
+    Task { @MainActor [weak self] in
+      self?.lastError = "The file shelf could not be saved."
+    }
+  }
   private var activeAirDropURLs: [ObjectIdentifier: URL] = [:]
   private var activeAirDropServices: [ObjectIdentifier: NSSharingService] = [:]
 
@@ -59,55 +80,63 @@ final class FileShelfStore: NSObject, ObservableObject,
   }
 
   var missingItemCount: Int {
-    items.count(where: { resolvedURL(for: $0) == nil })
+    presentations.values.count { $0.url == nil }
   }
 
-  func add(_ urls: [URL]) {
+  func add(_ urls: [URL]) async {
     lastError = nil
-    resolvedURLCache.removeAll()
-
-    for url in urls {
-      guard url.isFileURL else { continue }
-      let standardizedPath = url.standardizedFileURL.path
-      guard !items.contains(where: { $0.path == standardizedPath }) else {
-        continue
+    let generation = clearGeneration
+    let operationID = UUID()
+    let task = Task { [weak self] in
+      let additions = await Task.detached(priority: .userInitiated) {
+        var paths: Set<String> = []
+        return urls.filter { $0.isFileURL }.compactMap { url -> Result<ShelfItem, Error>? in
+          let url = url.standardizedFileURL
+          guard paths.insert(url.path).inserted else { return nil }
+          return Result { try ShelfItem(url: url) }
+        }
+      }.value
+      guard let self else { return }
+      defer { self.pendingAddTasks[operationID] = nil }
+      guard generation == self.clearGeneration, !Task.isCancelled else { return }
+      for addition in additions {
+        switch addition {
+        case .success(let item):
+          guard !self.items.contains(where: { $0.path == item.path }) else { continue }
+          self.items.insert(item, at: 0)
+        case .failure:
+          self.lastError = "Could not keep access to one of the selected files."
+        }
       }
-
-      do {
-        items.insert(try ShelfItem(url: url.standardizedFileURL), at: 0)
-      } catch {
-        lastError = "Could not keep access to \(url.lastPathComponent)."
-      }
+      if self.items.count > 24 { self.items.removeLast(self.items.count - 24) }
+      self.presentations = self.presentations.filter { id, _ in self.items.contains { $0.id == id } }
+      self.persist()
     }
-
-    if items.count > 24 {
-      items.removeLast(items.count - 24)
-    }
-    persist()
+    pendingAddTasks[operationID] = task
+    await task.value
   }
 
   func remove(_ id: UUID) {
     if previewedItemID == id {
       closePreview()
     }
-    resolvedURLCache[id] = nil
+    presentations[id] = nil
     items.removeAll { $0.id == id }
     persist()
   }
 
   func clear() {
     closePreview()
-    resolvedURLCache.removeAll()
+    clearGeneration &+= 1
+    presentations.removeAll()
     items.removeAll()
     persist()
   }
 
   @discardableResult
-  func removeMissingItems() -> Int {
-    resolvedURLCache.removeAll()
-    let missingIDs = Set(
-      items.filter { resolvedURL(for: $0) == nil }.map(\.id)
-    )
+  func removeMissingItems() async -> Int {
+    guard await refreshPresentation() else { return 0 }
+    let missingIDs = Set(presentations.compactMap { $0.value.url == nil ? $0.key : nil })
     guard !missingIDs.isEmpty else {
       lastError = nil
       return 0
@@ -116,6 +145,7 @@ final class FileShelfStore: NSObject, ObservableObject,
       closePreview()
     }
     items.removeAll { missingIDs.contains($0.id) }
+    presentations = presentations.filter { !missingIDs.contains($0.key) }
     lastError = nil
     persist()
     return missingIDs.count
@@ -132,25 +162,25 @@ final class FileShelfStore: NSObject, ObservableObject,
     panel.begin { [weak self] response in
       guard response == .OK else { return }
       Task { @MainActor in
-        self?.add(panel.urls)
+        await self?.add(panel.urls)
       }
     }
   }
 
-  func open(_ item: ShelfItem) {
-    withResolvedURL(for: item) { url in
+  func open(_ item: ShelfItem) async {
+    await withResolvedURL(for: item) { url in
       NSWorkspace.shared.open(url)
     }
   }
 
-  func reveal(_ item: ShelfItem) {
-    withResolvedURL(for: item) { url in
+  func reveal(_ item: ShelfItem) async {
+    await withResolvedURL(for: item) { url in
       NSWorkspace.shared.activateFileViewerSelecting([url])
     }
   }
 
-  func airDrop(_ item: ShelfItem) {
-    guard let url = resolvedURL(for: item) else {
+  func airDrop(_ item: ShelfItem) async {
+    guard let url = await resolvedURL(for: item) else {
       lastError = "\(item.name) is no longer available."
       return
     }
@@ -169,8 +199,8 @@ final class FileShelfStore: NSObject, ObservableObject,
     service.perform(withItems: [url])
   }
 
-  func quickLook(_ item: ShelfItem) {
-    guard let url = resolvedURL(for: item) else {
+  func quickLook(_ item: ShelfItem) async {
+    guard let url = await resolvedURL(for: item) else {
       lastError = "\(item.name) is no longer available."
       return
     }
@@ -191,53 +221,98 @@ final class FileShelfStore: NSObject, ObservableObject,
     lastError = nil
   }
 
-  func resolvedURL(for item: ShelfItem) -> URL? {
-    if let cachedURL = resolvedURLCache[item.id] {
-      guard FileManager.default.fileExists(atPath: cachedURL.path) else {
-        resolvedURLCache[item.id] = nil
-        return nil
+  /// Refresh once when the shelf appears or its contents change, never from a view getter.
+  @discardableResult
+  func refreshPresentation() async -> Bool {
+    let snapshot = items
+    let resolved = await Task.detached(priority: .utility) {
+      snapshot.map { item in
+        var result = Self.resolve(item)
+        result.iconData = Self.iconData(for: result.url ?? URL(fileURLWithPath: item.path))
+        return result
       }
-      return cachedURL
+    }.value
+    guard !Task.isCancelled, snapshot == items else { return false }
+    var updatedItems = items
+    var updatedPresentations: [UUID: ShelfItemPresentation] = [:]
+    for (index, result) in resolved.enumerated() {
+      let item = snapshot[index]
+      if let bookmark = result.refreshedBookmark {
+        updatedItems[index].bookmark = bookmark
+      }
+      updatedPresentations[item.id] = ShelfItemPresentation(
+        url: result.url,
+        icon: result.iconData.flatMap(NSImage.init(data:))
+          ?? NSImage(systemSymbolName: item.isDirectory ? "folder" : "doc", accessibilityDescription: nil)!
+      )
     }
+    presentations = updatedPresentations
+    if updatedItems != items {
+      items = updatedItems
+      persist()
+    }
+    return true
+  }
 
+  func resolvedURL(for item: ShelfItem) async -> URL? {
+    let result = await Task.detached(priority: .userInitiated) {
+      Self.resolve(item)
+    }.value
+    guard !Task.isCancelled, let index = items.firstIndex(where: { $0.id == item.id }) else {
+      return nil
+    }
+    if let bookmark = result.refreshedBookmark, items[index].bookmark == item.bookmark {
+      items[index].bookmark = bookmark
+      persist()
+    }
+    return result.url
+  }
+
+  nonisolated private static func iconData(for url: URL) -> Data? {
+    let didAccess = url.startAccessingSecurityScopedResource()
+    defer { if didAccess { url.stopAccessingSecurityScopedResource() } }
+    let icon = NSWorkspace.shared.icon(forFile: url.path)
+    var rect = CGRect(x: 0, y: 0, width: 64, height: 64)
+    guard let image = icon.cgImage(forProposedRect: &rect, context: nil, hints: nil),
+      let context = CGContext(
+        data: nil, width: 64, height: 64, bitsPerComponent: 8, bytesPerRow: 64 * 4,
+        space: CGColorSpaceCreateDeviceRGB(),
+        bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+      )
+    else { return nil }
+    context.draw(image, in: CGRect(x: 0, y: 0, width: 64, height: 64))
+    guard let thumbnail = context.makeImage() else { return nil }
+    return NSBitmapImageRep(cgImage: thumbnail).representation(using: .png, properties: [:])
+  }
+
+  nonisolated private static func resolve(_ item: ShelfItem) -> ResolvedShelfItem {
     var isStale = false
     do {
       let url = try URL(
         resolvingBookmarkData: item.bookmark,
-        options: [.withSecurityScope, .withoutUI],
+        options: [.withSecurityScope, .withoutUI, .withoutMounting],
         relativeTo: nil,
         bookmarkDataIsStale: &isStale
       )
-      guard FileManager.default.fileExists(atPath: url.path) else { return nil }
-
-      if isStale {
-        let didAccess = url.startAccessingSecurityScopedResource()
-        defer {
-          if didAccess {
-            url.stopAccessingSecurityScopedResource()
-          }
-        }
-        guard
-          let refreshedBookmark = try? url.bookmarkData(
-            options: [.withSecurityScope, .securityScopeAllowOnlyReadAccess],
-            includingResourceValuesForKeys: [.nameKey, .isDirectoryKey],
-            relativeTo: nil
-          ),
-          let index = items.firstIndex(where: { $0.id == item.id })
-        else { return nil }
-        items[index].bookmark = refreshedBookmark
-        persist()
+      let didAccess = url.startAccessingSecurityScopedResource()
+      defer { if didAccess { url.stopAccessingSecurityScopedResource() } }
+      guard FileManager.default.fileExists(atPath: url.path) else {
+        return ResolvedShelfItem(url: nil)
       }
-
-      resolvedURLCache[item.id] = url
-      return url
+      var result = ResolvedShelfItem(url: url)
+      if isStale {
+        result.refreshedBookmark = try url.bookmarkData(
+          options: [.withSecurityScope, .securityScopeAllowOnlyReadAccess],
+          includingResourceValuesForKeys: [.nameKey, .isDirectoryKey],
+          relativeTo: nil
+        )
+      }
+      return result
     } catch {
       let fallback = URL(fileURLWithPath: item.path)
-      guard FileManager.default.fileExists(atPath: fallback.path) else {
-        return nil
-      }
-      resolvedURLCache[item.id] = fallback
-      return fallback
+      return ResolvedShelfItem(
+        url: FileManager.default.fileExists(atPath: fallback.path) ? fallback : nil
+      )
     }
   }
 
@@ -256,9 +331,6 @@ final class FileShelfStore: NSObject, ObservableObject,
     finishAirDrop(using: sharingService)
   }
 
-  func icon(for item: ShelfItem) -> NSImage {
-    NSWorkspace.shared.icon(forFile: item.path)
-  }
 
   func numberOfPreviewItems(in panel: QLPreviewPanel!) -> Int {
     previewURL == nil ? 0 : 1
@@ -278,8 +350,8 @@ final class FileShelfStore: NSObject, ObservableObject,
   private func withResolvedURL(
     for item: ShelfItem,
     action: (URL) -> Void
-  ) {
-    guard let url = resolvedURL(for: item) else {
+  ) async {
+    guard let url = await resolvedURL(for: item) else {
       lastError = "\(item.name) is no longer available."
       return
     }
@@ -315,7 +387,6 @@ final class FileShelfStore: NSObject, ObservableObject,
   }
 
   private func load() {
-    resolvedURLCache.removeAll()
     do {
       let data = try Data(contentsOf: storageURL)
       items = try ActivityCoding.makeDecoder().decode(
@@ -331,21 +402,12 @@ final class FileShelfStore: NSObject, ObservableObject,
   }
 
   private func persist() {
-    do {
-      try FileManager.default.createDirectory(
-        at: storageURL.deletingLastPathComponent(),
-        withIntermediateDirectories: true,
-        attributes: [.posixPermissions: 0o700]
-      )
-      let data = try ActivityCoding.makeEncoder(prettyPrinted: true)
-        .encode(items)
-      try data.write(to: storageURL, options: .atomic)
-      try FileManager.default.setAttributes(
-        [.posixPermissions: 0o600],
-        ofItemAtPath: storageURL.path
-      )
-    } catch {
-      lastError = "The file shelf could not be saved."
-    }
+    historyWriter.submit(items)
+  }
+
+  func flushPersistence() async {
+    let additions = Array(pendingAddTasks.values)
+    for task in additions { await task.value }
+    await historyWriter.flush()
   }
 }

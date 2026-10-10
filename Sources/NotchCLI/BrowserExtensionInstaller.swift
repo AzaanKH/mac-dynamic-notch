@@ -2,8 +2,7 @@ import Foundation
 import NotchRouterCore
 
 enum BrowserExtensionInstaller {
-  static let hostName = "com.notchrouter.browser_media"
-  static let extensionID = "eelhjoihmcccgbleiekmpeabeijcemkb"
+  static let hostName = BrowserBridgeConfiguration.hostName
 
   static var extensionDirectory: URL {
     AppPaths.applicationSupportDirectory
@@ -19,12 +18,7 @@ enum BrowserExtensionInstaller {
   static var manifestURLs: [URL] {
     let library = FileManager.default.homeDirectoryForCurrentUser
       .appendingPathComponent("Library/Application Support", isDirectory: true)
-    return [
-      "Google/Chrome/NativeMessagingHosts",
-      "Microsoft Edge/NativeMessagingHosts",
-      "BraveSoftware/Brave-Browser/NativeMessagingHosts",
-      "Chromium/NativeMessagingHosts",
-    ].map {
+    return BrowserBridgeConfiguration.manifestDirectories.map {
       library.appendingPathComponent($0, isDirectory: true)
         .appendingPathComponent("\(hostName).json")
     }
@@ -54,20 +48,11 @@ enum BrowserExtensionInstaller {
     }
     try fileManager.copyItem(at: sourceExtension, to: extensionDirectory)
 
-    let manifest: [String: Any] = [
-      "name": hostName,
-      "description": "Passes browser media and opted-in download status to NotchRouter.",
-      "path": installedHostURL.path,
-      "type": "stdio",
-      "allowed_origins": ["chrome-extension://\(extensionID)/"],
-    ]
-    var manifestData = try JSONSerialization.data(
-      withJSONObject: manifest,
-      options: [.prettyPrinted, .sortedKeys]
-    )
-    manifestData.append(0x0A)
-
     for manifestURL in manifestURLs {
+      let manifestData = try BrowserBridgeConfiguration.nativeHostManifest(
+        hostURL: installedHostURL,
+        forFirefox: manifestURL.path.contains("/Mozilla/NativeMessagingHosts/")
+      )
       try fileManager.createDirectory(
         at: manifestURL.deletingLastPathComponent(),
         withIntermediateDirectories: true

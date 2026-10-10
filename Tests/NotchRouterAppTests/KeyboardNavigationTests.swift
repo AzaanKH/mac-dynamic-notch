@@ -106,3 +106,24 @@ func collapseAndInvalidKeyboardNavigationPreserveExpectedState() {
   viewModel.collapse()
   #expect(modeChanges == [.expanded, .compact])
 }
+
+@MainActor
+@Test
+func sectionDirectionFollowsTabOrderAndArrowKeys() {
+  let viewModel = NotchViewModel()
+  viewModel.show(.activity)
+
+  viewModel.selectedSection = .clipboard
+  #expect(viewModel.sectionDirection == 1)
+  viewModel.selectedSection = .focus
+  #expect(viewModel.sectionDirection == -1)
+
+  // Arrow keys wrap around the ends but keep the direction that was pressed.
+  viewModel.selectedSection = .system
+  #expect(viewModel.selectAdjacentSection(offset: 1))
+  #expect(viewModel.selectedSection == .activity)
+  #expect(viewModel.sectionDirection == 1)
+  #expect(viewModel.selectAdjacentSection(offset: -1))
+  #expect(viewModel.selectedSection == .system)
+  #expect(viewModel.sectionDirection == -1)
+}

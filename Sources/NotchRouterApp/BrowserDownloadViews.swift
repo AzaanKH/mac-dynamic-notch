@@ -2,7 +2,7 @@ import NotchRouterCore
 import SwiftUI
 
 struct BrowserDownloadHistoryView: View {
-  @ObservedObject var store: BrowserDownloadStore
+  let store: BrowserDownloadStore
 
   var body: some View {
     VStack(alignment: .leading, spacing: 7) {
@@ -20,7 +20,6 @@ struct BrowserDownloadHistoryView: View {
           store.clearHistory()
         }
         .buttonStyle(NotchSubtleButtonStyle())
-        .focusable()
         .disabled(!store.items.contains(where: { !$0.isActive }))
       }
 
@@ -40,7 +39,7 @@ struct BrowserDownloadHistoryView: View {
 
 private struct BrowserDownloadRow: View {
   let item: BrowserDownloadItem
-  @ObservedObject var store: BrowserDownloadStore
+  let store: BrowserDownloadStore
 
   var body: some View {
     HStack(spacing: 9) {
@@ -80,7 +79,6 @@ private struct BrowserDownloadRow: View {
           Image(systemName: item.isPaused ? "play.fill" : "pause.fill")
         }
         .buttonStyle(NotchIconButtonStyle())
-        .focusable()
         .accessibilityLabel(item.isPaused ? "Resume \(item.displayName)" : "Pause \(item.displayName)")
 
         Button {
@@ -89,7 +87,6 @@ private struct BrowserDownloadRow: View {
           Image(systemName: "xmark")
         }
         .buttonStyle(NotchIconButtonStyle())
-        .focusable()
         .accessibilityLabel("Cancel \(item.displayName)")
       } else if item.state == .interrupted, item.canResume {
         Button {
@@ -98,7 +95,6 @@ private struct BrowserDownloadRow: View {
           Image(systemName: "arrow.clockwise")
         }
         .buttonStyle(NotchIconButtonStyle())
-        .focusable()
         .accessibilityLabel("Resume \(item.displayName)")
       } else if item.state == .complete {
         Button {
@@ -107,7 +103,6 @@ private struct BrowserDownloadRow: View {
           Image(systemName: "magnifyingglass")
         }
         .buttonStyle(NotchIconButtonStyle())
-        .focusable()
         .accessibilityLabel("Reveal \(item.displayName)")
       }
     }
@@ -168,7 +163,7 @@ private struct BrowserDownloadRow: View {
 
 struct CompactDownloadView: View {
   let item: BrowserDownloadItem
-  @ObservedObject var store: BrowserDownloadStore
+  let store: BrowserDownloadStore
   let hardwareNotchWidth: CGFloat
   let hasPhysicalNotch: Bool
   let isPeek: Bool
@@ -233,8 +228,10 @@ struct CompactDownloadView: View {
 
   private var progressLabel: some View {
     VStack(alignment: .trailing, spacing: 1) {
-      Text(item.progress?.formatted(.percent.precision(.fractionLength(0))) ?? "Downloading")
+      let label = item.progress?.formatted(.percent.precision(.fractionLength(0))) ?? "Downloading"
+      Text(label)
         .font(.callout.weight(.bold).monospacedDigit())
+        .rollingNumber(label)
         .dashboardTint(item.isPaused ? .orange : .blue)
       if isPeek {
         Text(item.isPaused ? "Paused" : "\(bytes(item.bytesReceived)) received")
@@ -251,7 +248,6 @@ struct CompactDownloadView: View {
       Image(systemName: item.isPaused ? "play.fill" : "pause.fill")
     }
     .buttonStyle(NotchCircularButtonStyle(size: 34, isPrimary: true, typography: .compact))
-    .focusable()
     .accessibilityLabel(item.isPaused ? "Resume download" : "Pause download")
   }
 
@@ -310,6 +306,7 @@ struct CompactBatteryView: View {
         .font(.callout.weight(.semibold))
       Text("\(charging.level)%")
         .font(.caption.weight(.bold).monospacedDigit())
+        .rollingNumber(charging.level)
         .dashboardTint(.green)
     }
   }

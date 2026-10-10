@@ -1,4 +1,4 @@
-import Combine
+import Observation
 import Foundation
 import IOKit.ps
 
@@ -26,12 +26,13 @@ struct BatteryChargingSnapshot: Equatable, Sendable {
 }
 
 @MainActor
-final class BatteryMonitor: ObservableObject {
-  @Published private(set) var charging: BatteryChargingSnapshot?
+@Observable
+final class BatteryMonitor {
+  private(set) var charging: BatteryChargingSnapshot?
 
   var onChange: (() -> Void)?
 
-  nonisolated(unsafe) private var notificationSource: CFRunLoopSource?
+  @ObservationIgnored nonisolated(unsafe) private var notificationSource: CFRunLoopSource?
 
   init() {
     refresh()
@@ -47,6 +48,7 @@ final class BatteryMonitor: ObservableObject {
 
   deinit {
     if let notificationSource {
+      CFRunLoopSourceInvalidate(notificationSource)
       CFRunLoopRemoveSource(CFRunLoopGetMain(), notificationSource, .commonModes)
     }
   }
@@ -95,9 +97,13 @@ final class BatteryMonitor: ObservableObject {
 
 private func batteryPowerSourceDidChange(_ context: UnsafeMutableRawPointer?) {
   guard let context else { return }
-  let monitor = Unmanaged<BatteryMonitor>.fromOpaque(context)
-    .takeUnretainedValue()
-  Task { @MainActor in
+  let contextAddress = UInt(bitPattern: context)
+  MainActor.assumeIsolated {
+    guard let context = UnsafeMutableRawPointer(bitPattern: contextAddress) else {
+      return
+    }
+    let monitor = Unmanaged<BatteryMonitor>.fromOpaque(context)
+      .takeUnretainedValue()
     monitor.refresh()
   }
 }

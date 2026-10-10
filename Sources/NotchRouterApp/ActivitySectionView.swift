@@ -3,7 +3,7 @@ import NotchRouterCore
 import SwiftUI
 
 struct ActivitySectionView: View {
-  @ObservedObject var store: ActivityStore
+  let store: ActivityStore
   @State private var searchText = ""
   @State private var selectedFilter: ActivityListFilter = .all
 
@@ -30,6 +30,7 @@ struct ActivitySectionView: View {
           }
           .padding(.horizontal, 14)
           .padding(.bottom, 12)
+          .animatesListChanges(store.activities.map { "\($0.id):\($0.state.rawValue)" })
         }
       }
     }
@@ -85,7 +86,6 @@ struct ActivitySectionView: View {
           .buttonStyle(
             ActivityFilterButtonStyle(isSelected: selectedFilter == filter)
           )
-          .focusable()
           .accessibilityLabel("\(filter.title), \(count(for: filter)) activities")
           .accessibilityAddTraits(selectedFilter == filter ? .isSelected : [])
         }
@@ -142,7 +142,6 @@ struct ActivitySectionView: View {
         }
       }
       .buttonStyle(NotchSubtleButtonStyle())
-      .focusable()
     }
     .frame(maxWidth: .infinity, maxHeight: .infinity)
   }
@@ -220,6 +219,7 @@ private struct ActivityGroupSection: View {
           activity: activity,
           dismiss: { dismiss(activity.id) }
         )
+        .notchListRowTransition()
       }
     }
   }
@@ -280,6 +280,7 @@ private struct ActivityFilterButtonStyle: ButtonStyle {
           )
       }
       .scaleEffect(configuration.isPressed ? 0.98 : 1)
+      .contentShape(.focusEffect, Capsule())
   }
 }
 
@@ -287,7 +288,7 @@ private struct ActivityCard: View {
   let activity: AIActivity
   let dismiss: () -> Void
 
-  @State private var showsHistory = false
+  @State private var showsDetails = false
   @Environment(\.accessibilityDifferentiateWithoutColor) private var differentiateWithoutColor
 
   var body: some View {
@@ -304,14 +305,22 @@ private struct ActivityCard: View {
               .font(.caption.weight(.bold))
               .dashboardTint(activity.state.tint)
           }
+          if let workspace = activity.workspace {
+            Text(workspace)
+              .font(.caption)
+              .dashboardSecondaryText()
+              .lineLimit(1)
+              .help(workspace)
+          }
           Text(activity.title)
             .font(.body.weight(.semibold))
-            .lineLimit(1)
+            .lineLimit(showsDetails ? nil : 1)
           if let message = activity.message {
             Text(message)
               .font(.callout)
               .dashboardSecondaryText()
-              .lineLimit(2)
+              .lineLimit(showsDetails ? nil : 2)
+              .textSelection(.enabled)
           }
         }
 
@@ -331,13 +340,15 @@ private struct ActivityCard: View {
       }
 
       HStack(spacing: 6) {
-        if activity.history.count > 1 {
-          Button(showsHistory ? "Hide updates" : "\(activity.history.count) updates") {
-            showsHistory.toggle()
-          }
-          .buttonStyle(NotchSubtleButtonStyle())
-          .focusable()
+        Button(showsDetails ? "Hide details" : "Show details") {
+          showsDetails.toggle()
         }
+        .buttonStyle(NotchSubtleButtonStyle())
+        .accessibilityValue(showsDetails ? "Expanded" : "Collapsed")
+
+        Text(activity.history.count == 1 ? "1 update" : "\(activity.history.count) updates")
+          .font(.caption)
+          .dashboardTertiaryText()
 
         Spacer()
 
@@ -346,7 +357,6 @@ private struct ActivityCard: View {
             NSWorkspace.shared.open(actionURL)
           }
           .buttonStyle(NotchAccentButtonStyle(tint: activity.state.tint, isCompact: true))
-          .focusable()
         }
 
         Button {
@@ -355,11 +365,10 @@ private struct ActivityCard: View {
           Image(systemName: "xmark")
         }
         .buttonStyle(NotchSubtleButtonStyle())
-        .focusable()
         .accessibilityLabel("Dismiss \(activity.title)")
       }
 
-      if showsHistory {
+      if showsDetails {
         VStack(alignment: .leading, spacing: 7) {
           ForEach(activity.history.reversed()) { update in
             HStack(alignment: .top, spacing: 7) {
@@ -380,8 +389,9 @@ private struct ActivityCard: View {
               VStack(alignment: .leading, spacing: 1) {
                 Text(update.message ?? update.state.shortLabel)
                   .font(.callout.weight(.medium))
-                  .lineLimit(2)
-                Text(update.timestamp, style: .time)
+                  .fixedSize(horizontal: false, vertical: true)
+                  .textSelection(.enabled)
+                Text(update.timestamp.formatted(date: .abbreviated, time: .standard))
                   .font(.caption)
                   .dashboardTertiaryText()
               }
