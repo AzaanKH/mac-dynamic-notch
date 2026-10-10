@@ -325,7 +325,10 @@ func nativeControlsRunInOrderAndOnlyMergeAdjacentSeeksForTheSameApp() async {
 
   // The first command blocks while the rest queue behind it.
   queue.enqueue(.next, source: .spotify, run: run)
-  while release == nil { await Task.yield() }
+  guard await waitUntil({ release != nil }) else {
+    Issue.record("The first command never started")
+    return
+  }
   queue.enqueue(.seek(10), source: .spotify, run: run)
   queue.enqueue(.previous, source: .spotify, run: run)
   queue.enqueue(.seek(20), source: .spotify, run: run)
@@ -355,7 +358,10 @@ func cancellingNativeControlsDropsQueuedCommands() async {
   }
 
   queue.enqueue(.playPause, source: .appleMusic, run: run)
-  while release == nil { await Task.yield() }
+  guard await waitUntil({ release != nil }) else {
+    Issue.record("The first command never started")
+    return
+  }
   queue.enqueue(.next, source: .appleMusic, run: run)
   queue.enqueue(.seek(5), source: .appleMusic, run: run)
   queue.cancelPending()  // the integration was disabled
@@ -363,4 +369,78 @@ func cancellingNativeControlsDropsQueuedCommands() async {
   await queue.drain()
 
   #expect(ran == [.playPause])
+}
+
+@MainActor
+private func seekableBrowserSession(
+  _ controller: MusicController, position: Double, now: Date
+) throws -> BrowserMediaEvent {
+  let event = BrowserMediaEvent(
+    kind: .update, sessionID: "player", browserName: "Chrome", title: "Episode",
+    isPlaying: false, duration: 300, position: position,
+    supportsPrevious: true, supportsNext: true, supportsSeeking: true
+  )
+  _ = try controller.ingestBrowserMedia(event, now: now)
+  return event
+}
+
+/// Commands the app hands to the extension, one per heartbeat, until empty.
+@MainActor
+private func deliveredCommands(
+  _ controller: MusicController, heartbeat: BrowserMediaEvent, now: Date
+) throws -> [String] {
+  var delivered: [String] = []
+  for _ in 0..<10 {
+    let response = try controller.ingestBrowserMedia(heartbeat, now: now)
+    guard let command = response.command else { break }
+    delivered.append(response.seekPosition.map { "\(command.rawValue) \(Int($0))" } ?? command.rawValue)
+  }
+  return delivered
+}
+
+@MainActor
+@Test
+func browserSeeksMergeOnlyIntoAnAdjacentSeek() throws {
+  let identifier = UUID().uuidString
+  let defaults = try #require(UserDefaults(suiteName: identifier))
+  defer { defaults.removePersistentDomain(forName: identifier) }
+  let now = Date(timeIntervalSince1970: 9_000)
+  let controller = MusicController(defaults: defaults, dateProvider: { now })
+  let heartbeat = try seekableBrowserSession(controller, position: 100, now: now)
+
+  controller.seek(to: 30)
+  controller.previousTrack()
+  controller.seek(to: 60)
+  controller.seek(to: 70)  // merges into the seek just before it
+
+  #expect(try deliveredCommands(controller, heartbeat: heartbeat, now: now) == [
+    "seek 30", "previous", "seek 70",
+  ])
+}
+
+@MainActor
+@Test
+func repeatedSkipsBuildOnThePreviousTargetUntilThePlayerReportsBack() throws {
+  let identifier = UUID().uuidString
+  let defaults = try #require(UserDefaults(suiteName: identifier))
+  defer { defaults.removePersistentDomain(forName: identifier) }
+  let now = Date(timeIntervalSince1970: 9_000)
+  let controller = MusicController(defaults: defaults, dateProvider: { now })
+  _ = try seekableBrowserSession(controller, position: 1, now: now)
+  func heartbeat(at position: Double) -> BrowserMediaEvent {
+    BrowserMediaEvent(
+      kind: .update, sessionID: "player", browserName: "Chrome", title: "Episode",
+      isPlaying: false, duration: 300, position: position,
+      supportsPrevious: true, supportsNext: true, supportsSeeking: true
+    )
+  }
+
+  // Both clicks land before any new snapshot, so the second builds on 16.
+  controller.skip(by: 15)
+  controller.skip(by: 15)
+  #expect(try deliveredCommands(controller, heartbeat: heartbeat(at: 31), now: now) == ["seek 31"])
+
+  // Once the player reports its new position, the next skip starts from it.
+  controller.skip(by: 15)
+  #expect(try deliveredCommands(controller, heartbeat: heartbeat(at: 46), now: now) == ["seek 46"])
 }

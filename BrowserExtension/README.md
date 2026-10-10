@@ -42,7 +42,8 @@ native messaging to NotchRouter's private per-user socket. Media artwork retriev
 can add a browser request; download-status messages create no internet traffic.
 Artwork requests omit credentials, reject redirects, and follow browser access
 restrictions. Only a thumbnail up to 256 × 256 pixels and 32 KiB reaches the app.
-Artwork that cannot be retrieved uses the fallback icon. Page content, cookies,
+Artwork must be PNG, JPEG, GIF, or WebP with a readable size of at most
+16 megapixels, checked before decoding; other artwork uses the fallback icon. Page content, cookies,
 and authentication data are not sent. The
 native host reads NotchRouter's user-only integration token; the extension and
 web pages never receive it.

@@ -52,6 +52,10 @@ final class ActivityHTTPServer {
   /// so a superseded preparation can never unlink a newer server's socket.
   private var socketPreparation: Task<Result<Void, Error>, Never>?
   private let socketPreparer: @Sendable (URL) throws -> Void
+  /// Finishes once listeners cancelled by the last stop or restart have
+  /// released their endpoints. Cancellation is asynchronous, so without this
+  /// a quick restart could probe its own still-open socket as "in use".
+  private var listenerRetirement: Task<Void, Never>?
   private let requestTimeout: TimeInterval
   private let connectionLimit: Int
 
@@ -85,14 +89,20 @@ final class ActivityHTTPServer {
   func start() {
     guard state != .starting, state != .ready else { return }
 
-    listener?.cancel()
-    listener = nil
+    retireListeners(includingLegacy: false)
     state = .starting
     startGeneration &+= 1
     let generation = startGeneration
+    let retirement = listenerRetirement
 
     guard let socketURL else {
-      installListener(socketURL: nil)
+      Task { [weak self] in
+        await retirement?.value
+        guard let self, generation == self.startGeneration, self.state == .starting else {
+          return
+        }
+        self.installListener(socketURL: nil)
+      }
       return
     }
     // Socket preparation touches the filesystem (create, chmod, probe, unlink),
@@ -101,6 +111,7 @@ final class ActivityHTTPServer {
     let preparer = socketPreparer
     let pending = Task.detached(priority: .utility) { () -> Result<Void, Error> in
       _ = await previous?.value
+      await retirement?.value
       return Result { try preparer(socketURL) }
     }
     socketPreparation = pending
@@ -217,13 +228,48 @@ final class ActivityHTTPServer {
 
   func stop() {
     startGeneration &+= 1
-    listener?.cancel()
-    listener = nil
-    legacyListener?.cancel()
-    legacyListener = nil
+    retireListeners(includingLegacy: true)
     legacyTCPState = .stopped
     closeConnections()
     state = .stopped
+  }
+
+  private func retireListeners(includingLegacy: Bool) {
+    var retiring = [listener].compactMap { $0 }
+    listener = nil
+    if includingLegacy, let legacyListener {
+      retiring.append(legacyListener)
+      self.legacyListener = nil
+    }
+    guard !retiring.isEmpty else { return }
+    let earlier = listenerRetirement
+    let released = retiring.map(Self.retire)
+    listenerRetirement = Task {
+      await earlier?.value
+      for listener in released { await listener.value }
+    }
+  }
+
+  /// Cancels `listener` and returns a task that finishes when it has released
+  /// its endpoint, or after two seconds if it never reports back.
+  private static func retire(_ listener: NWListener) -> Task<Void, Never> {
+    let (released, continuation) = AsyncStream<Void>.makeStream()
+    listener.stateUpdateHandler = { state in
+      switch state {
+      case .cancelled, .failed: continuation.finish()
+      default: break
+      }
+    }
+    listener.newConnectionHandler = { $0.cancel() }
+    listener.cancel()
+    return Task {
+      await withTaskGroup(of: Void.self) { group in
+        group.addTask { for await _ in released {} }
+        group.addTask { try? await Task.sleep(for: .seconds(2)) }
+        await group.next()
+        group.cancelAll()
+      }
+    }
   }
 
   func updateToken(_ token: String) {

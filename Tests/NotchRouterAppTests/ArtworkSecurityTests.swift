@@ -110,9 +110,16 @@ func concurrentArtworkRequestsShareOneFetchAndSurviveCancellation() async throws
   // The first request starts the shared load and is then cancelled; the
   // second joins it while the fetch is still blocked.
   let owner = Task { await loader.image(for: source) }
-  while await gate.calls == 0 { await Task.yield() }
+  let ownerStarted = await waitUntil { await gate.calls == 1 }
   let joined = Task { await loader.image(for: source) }
-  while await loader.joinedRequests == 0 { await Task.yield() }
+  let didJoin = await waitUntil { await loader.joinedRequests == 1 }
+  guard ownerStarted, didJoin else {
+    Issue.record("The second request did not join the pending load")
+    await gate.release()
+    owner.cancel()
+    joined.cancel()
+    return
+  }
   owner.cancel()
   await gate.release()
 

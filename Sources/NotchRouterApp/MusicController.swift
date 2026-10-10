@@ -120,6 +120,14 @@ final class MusicController: NSObject {
   private var refreshTask: Task<Void, Never>?
   private var transportRefreshTask: Task<Void, Never>?
   @ObservationIgnored private let nativeControls = NativeControlQueue()
+  @ObservationIgnored private var pendingSkip: PendingSkip?
+
+  private struct PendingSkip {
+    let identity: String
+    let sampledAt: Date
+    let target: Double
+    let issuedAt: Date
+  }
   private var refreshAfterCurrentTask = false
   private var nativeSnapshots: [NowPlayingSnapshot] = []
   private var browserSessions: [String: BrowserSession] = [:]
@@ -235,7 +243,25 @@ final class MusicController: NSObject {
 
   func skip(by seconds: Double) {
     guard let snapshot = nowPlaying else { return }
-    seek(to: snapshot.elapsed(at: Date()) + seconds)
+    let now = dateProvider()
+    var base = snapshot.elapsed(at: now)
+    // Repeated skips before the player reports back build on the previous
+    // target rather than the stale snapshot. A new snapshot resets this.
+    if let pending = pendingSkip, pending.identity == snapshot.identity,
+      pending.sampledAt == snapshot.sampledAt
+    {
+      let played = snapshot.isPlaying
+        ? max(0, now.timeIntervalSince(pending.issuedAt)) * snapshot.playbackRate
+        : 0
+      base = pending.target + played
+    }
+    let target = snapshot.duration > 0
+      ? min(snapshot.duration, max(0, base + seconds))
+      : max(0, base + seconds)
+    pendingSkip = PendingSkip(
+      identity: snapshot.identity, sampledAt: snapshot.sampledAt, target: target, issuedAt: now
+    )
+    seek(to: target)
   }
 
   func openSource(_ source: MusicSource) {
@@ -535,13 +561,14 @@ final class MusicController: NSObject {
       position = target
     }
     var commands = pendingBrowserCommands[sessionID] ?? []
-    if command == .seek {
-      commands.removeAll { $0.command == .seek }
-    }
-    if commands.count < 8 {
+    // A seek merges only into a seek queued directly before it, so it never
+    // jumps ahead of (or drops a seek placed before) another command.
+    if command == .seek, commands.last?.command == .seek {
+      commands[commands.count - 1] = PendingBrowserControl(command: .seek, position: position)
+    } else if commands.count < 8 {
       commands.append(PendingBrowserControl(command: command, position: position))
-      pendingBrowserCommands[sessionID] = commands
     }
+    pendingBrowserCommands[sessionID] = commands
 
     let requestsPeek =
       control == .next

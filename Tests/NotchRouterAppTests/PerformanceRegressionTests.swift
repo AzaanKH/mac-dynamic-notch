@@ -73,13 +73,11 @@ func mediaHeartbeatsKeepPendingArtworkDownload() async throws {
   )
   _ = try controller.ingestBrowserMedia(event)
   // Let the request begin, but hold its response until after the heartbeats.
-  for _ in 0..<100 { await Task.yield() }
-  #expect(loader.requests == [url])
+  #expect(await waitUntil { loader.requests == [url] })
   for _ in 0..<5 {
     _ = try controller.ingestBrowserMedia(event)
-    for _ in 0..<20 { await Task.yield() }
   }
-  #expect(loader.requests == [url])
+  #expect(controller.isLoadingArtworkPalette, "The original request is still in flight")
 
   let nextData = Data([4, 5, 6])
   let nextURL = ArtworkSource.browser(nextData)
@@ -87,7 +85,9 @@ func mediaHeartbeatsKeepPendingArtworkDownload() async throws {
     kind: .update, sessionID: "test", browserName: "Test", title: "Next track",
     artworkData: nextData, isPlaying: true
   ))
-  for _ in 0..<100 { await Task.yield() }
+  // Any request a heartbeat had started would be queued ahead of the next
+  // track's, so the exact sequence shows heartbeats added none.
+  #expect(await waitUntil { loader.requests.count >= 2 })
   #expect(loader.requests == [url, nextURL])
   _ = try controller.ingestBrowserMedia(BrowserMediaEvent(
     kind: .ended, sessionID: "test", browserName: "Test"

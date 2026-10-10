@@ -121,14 +121,14 @@ test('artwork transfer omits credentials and bounds unknown-length streams befor
 });
 
 test('browser artwork becomes bounded bytes and native requests never receive an artwork URL', async () => {
-  let remaining = [new Uint8Array([1, 2, 3])];
+  let remaining = [pngHeader(256, 256)];
   let closed = false;
   const context = contentContext({
     Blob, AbortController, btoa,
-    fetch: async () => ({ ok: true, headers: { get: () => '3' }, body: { getReader: () => ({
+    fetch: async () => ({ ok: true, headers: { get: () => '24' }, body: { getReader: () => ({
       read: async () => remaining.length ? { value: remaining.shift() } : { done: true }, cancel: async () => {},
     }) } }),
-    createImageBitmap: async (_blob, options) => {
+    createImageBitmap: async (_blob, _sx, _sy, _sw, _sh, options) => {
       assert.equal(options.resizeWidth, 256);
       assert.equal(options.resizeHeight, 256);
       return { close() { closed = true; } };
@@ -202,6 +202,47 @@ test('oversized artwork is rejected from its header before decoding', async () =
   const result = await context.fetchArtworkThumbnail('https://example.com/huge', new AbortController().signal);
   assert.equal(result, null);
   assert.equal(decoded, 0);
+});
+
+test('artwork whose size cannot be read before decoding is rejected', async () => {
+  let decoded = 0;
+  // A tiny BMP header can describe an enormous compressed image.
+  const bmp = new Uint8Array([0x42, 0x4d, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+  const context = artworkFetchContext(bmp, async () => { decoded++; return { close() {} }; });
+  const result = await context.fetchArtworkThumbnail('https://example.com/cover.bmp', new AbortController().signal);
+  assert.equal(result, null);
+  assert.equal(decoded, 0);
+});
+
+function rotatedJPEG(width, height, orientation) {
+  // SOI, APP1 "Exif" with a little-endian TIFF IFD holding one Orientation
+  // entry, then SOF0 with the stored (unrotated) dimensions.
+  const app1 = [
+    0xff, 0xe1, 0x00, 0x22,
+    0x45, 0x78, 0x69, 0x66, 0x00, 0x00,
+    0x49, 0x49, 0x2a, 0x00, 0x08, 0x00, 0x00, 0x00,
+    0x01, 0x00,
+    0x12, 0x01, 0x03, 0x00, 0x01, 0x00, 0x00, 0x00, orientation, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00,
+  ];
+  const sof = [0xff, 0xc0, 0x00, 0x11, 0x08, height >> 8, height & 0xff, width >> 8, width & 0xff, 0x03];
+  return new Uint8Array([0xff, 0xd8, ...app1, ...sof, ...new Array(12).fill(0)]);
+}
+
+test('rotated JPEGs are cropped in the orientation the browser decodes them', async () => {
+  const context = contentContext();
+  const dims = bytes => JSON.parse(JSON.stringify(context.imageDimensions(bytes)));
+  assert.deepEqual(dims(rotatedJPEG(400, 200, 1)), { width: 400, height: 200 });
+  assert.deepEqual(dims(rotatedJPEG(400, 200, 6)), { width: 200, height: 400 });
+
+  let decodeArgs;
+  const fetching = artworkFetchContext(rotatedJPEG(400, 200, 6), async (...args) => {
+    decodeArgs = args.slice(1, 5);
+    return { close() {} };
+  });
+  await fetching.fetchArtworkThumbnail('https://example.com/rotated.jpg', new AbortController().signal);
+  // Decoded as 200 × 400, so the centered square starts 100 px down.
+  assert.deepEqual(decodeArgs, [0, 100, 200, 200]);
 });
 
 test('image headers report dimensions for common artwork formats', () => {

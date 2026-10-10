@@ -159,8 +159,10 @@ read that token. Browser sessions expire if the extension stops heartbeating.
 
 Browser artwork is fetched by the content script without credentials or redirects,
 subject to browser access restrictions. It sends a JPEG thumbnail of at most
-256 × 256 pixels and 32 KiB to the app. Sites that prevent artwork access retain
-the fallback icon. Legacy extensions can still report playback, but their artwork
+256 × 256 pixels and 32 KiB to the app, cropped to a centered square. Only PNG,
+JPEG, GIF, and WebP covers up to 16 megapixels are used, checked from the file
+header before decoding. Other formats, and sites that prevent artwork access,
+retain the fallback icon. Legacy extensions can still report playback, but their artwork
 URLs are never fetched by native code. Native Spotify artwork is restricted to
 recognized Spotify HTTPS hosts, with an 8 MB streaming limit and bounded decoding.
 

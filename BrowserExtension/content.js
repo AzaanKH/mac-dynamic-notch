@@ -188,7 +188,8 @@ let artworkFailures = 0;
 let artworkRetryAt = 0;
 
 // Pixel dimensions from a PNG, GIF, WebP, or JPEG header, or null when the
-// format is not recognized.
+// format is not recognized. JPEG dimensions follow the EXIF orientation that
+// createImageBitmap applies, so crops line up with the decoded image.
 function imageDimensions(bytes) {
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const has = (at, text) => at + text.length <= bytes.length
@@ -217,16 +218,42 @@ function imageDimensions(bytes) {
   }
   if (bytes.length >= 4 && bytes[0] === 0xff && bytes[1] === 0xd8) {
     let at = 2;
+    let orientation = 1;
     while (at + 9 <= bytes.length) {
       if (bytes[at] !== 0xff) return null;
       const marker = bytes[at + 1];
       if (marker === 0xff) { at += 1; continue; }
+      const length = view.getUint16(at + 2);
+      if (marker === 0xe1) orientation = exifOrientation(view, at + 4, at + 2 + length) ?? orientation;
       // Start-of-frame markers carry the dimensions; C4, C8, and CC do not.
       if (marker >= 0xc0 && marker <= 0xcf && ![0xc4, 0xc8, 0xcc].includes(marker)) {
-        return { width: view.getUint16(at + 7), height: view.getUint16(at + 5) };
+        const width = view.getUint16(at + 7);
+        const height = view.getUint16(at + 5);
+        // Orientations 5–8 rotate by 90°, swapping the decoded dimensions.
+        return orientation >= 5 && orientation <= 8 ? { width: height, height: width } : { width, height };
       }
-      at += 2 + view.getUint16(at + 2);
+      at += 2 + length;
     }
+  }
+  return null;
+}
+
+// The EXIF orientation tag from an APP1 segment spanning [start, end), or null.
+function exifOrientation(view, start, end) {
+  const limit = Math.min(end, view.byteLength);
+  const exif = [0x45, 0x78, 0x69, 0x66, 0, 0];
+  if (start + 14 > limit || exif.some((byte, index) => view.getUint8(start + index) !== byte)) return null;
+  const tiff = start + 6;
+  const order = view.getUint16(tiff);
+  if (order !== 0x4949 && order !== 0x4d4d) return null;
+  const little = order === 0x4949;
+  const ifd = tiff + view.getUint32(tiff + 4, little);
+  if (ifd + 2 > limit) return null;
+  const entries = view.getUint16(ifd, little);
+  for (let index = 0; index < entries; index++) {
+    const entry = ifd + 2 + index * 12;
+    if (entry + 12 > limit) return null;
+    if (view.getUint16(entry, little) === 0x0112) return view.getUint16(entry + 8, little);
   }
   return null;
 }
@@ -257,28 +284,24 @@ async function fetchArtworkThumbnail(url, signal) {
   const bytes = new Uint8Array(count);
   let offset = 0;
   for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
-  // Reject oversized images from their header, before any pixels are decoded.
+  // Check the size from the header, before any pixels are decoded. Formats
+  // whose size cannot be read first (BMP, AVIF, SVG, ...) are rejected, since
+  // their decoded size is unbounded; the notch shows its fallback icon.
   const size = imageDimensions(bytes);
-  if (size && size.width * size.height > 16_000_000) return null;
-  const blob = new Blob([bytes]);
-  const options = { resizeWidth: 256, resizeHeight: 256, resizeQuality: "medium" };
-  // Crop to a centered square while decoding, as the notch displays covers, so
-  // wide video thumbnails are cropped instead of stretched. Formats without a
-  // recognized header fall back to a bounded square decode.
-  let bitmap;
-  if (size && size.width > 0 && size.height > 0) {
-    const side = Math.min(size.width, size.height);
-    bitmap = await createImageBitmap(
-      blob,
-      Math.floor((size.width - side) / 2),
-      Math.floor((size.height - side) / 2),
-      side,
-      side,
-      options,
-    );
-  } else {
-    bitmap = await createImageBitmap(blob, options);
+  if (!size || size.width <= 0 || size.height <= 0 || size.width * size.height > 16_000_000) {
+    return null;
   }
+  // Crop to a centered square while decoding, as the notch displays covers, so
+  // wide video thumbnails are cropped instead of stretched.
+  const side = Math.min(size.width, size.height);
+  const bitmap = await createImageBitmap(
+    new Blob([bytes]),
+    Math.floor((size.width - side) / 2),
+    Math.floor((size.height - side) / 2),
+    side,
+    side,
+    { resizeWidth: 256, resizeHeight: 256, resizeQuality: "medium" },
+  );
   try {
     const canvas = new OffscreenCanvas(256, 256);
     canvas.getContext("2d").drawImage(bitmap, 0, 0, 256, 256);

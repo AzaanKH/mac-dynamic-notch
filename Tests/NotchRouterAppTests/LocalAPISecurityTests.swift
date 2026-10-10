@@ -210,3 +210,26 @@ func restartingDuringSocketPreparationLeavesTheNewServerReachable() async throws
   let health = try await LocalAPIClient.request(path: "/v1/health", socketURL: socketURL)
   #expect(health.status == 200)
 }
+
+@MainActor
+@Test
+func restartingAReadySocketServerRepeatedlyNeverSeesItsOwnSocketAsInUse() async throws {
+  let directory = URL(fileURLWithPath: "/tmp/notch-restart-\(UUID().uuidString)")
+  defer { try? FileManager.default.removeItem(at: directory) }
+  let socketURL = directory.appendingPathComponent("api.sock")
+  let server = securityServer(socketURL: socketURL)
+  defer { server.stop() }
+
+  for attempt in 1...40 {
+    server.start()
+    try await eventually { server.state == .ready || server.state.canRetry }
+    #expect(server.state == .ready, "Restart \(attempt) failed: \(server.state)")
+    guard server.state == .ready else { return }
+    // Stop and restart immediately, while the old listener is still closing.
+    server.stop()
+  }
+  server.start()
+  try await eventually { server.state == .ready }
+  let health = try await LocalAPIClient.request(path: "/v1/health", socketURL: socketURL)
+  #expect(health.status == 200)
+}
