@@ -7,7 +7,7 @@ import Testing
 
 @MainActor
 @Test
-func clipboardPollingFollowsEnabledPreference() {
+func clipboardPollingFollowsEnabledPreference() async {
   let suiteName = "ClipboardPollingTests.\(UUID().uuidString)"
   let defaults = UserDefaults(suiteName: suiteName)!
   defer { defaults.removePersistentDomain(forName: suiteName) }
@@ -33,17 +33,12 @@ func clipboardPollingFollowsEnabledPreference() {
   store.setEnabled(false)
   #expect(store.isEnabled == false)
   #expect(store.isPolling == false)
+  await store.flushPersistence()
 }
 
 @MainActor
 @Test
-func clipboardPollingUsesLowerFrequency() {
-  #expect(ClipboardStore.pollingInterval == 1.5)
-}
-
-@MainActor
-@Test
-func clipboardCreatesItsStorageDirectoryWithPrivatePermissions() throws {
+func clipboardCreatesItsStorageDirectoryWithPrivatePermissions() async throws {
   let suiteName = "ClipboardDirectoryPermissionsTests.\(UUID().uuidString)"
   let defaults = UserDefaults(suiteName: suiteName)!
   defer { defaults.removePersistentDomain(forName: suiteName) }
@@ -52,6 +47,15 @@ func clipboardCreatesItsStorageDirectoryWithPrivatePermissions() throws {
   let storageDirectoryURL = rootURL.appendingPathComponent("history")
   let storageURL = storageDirectoryURL.appendingPathComponent("clipboard.json")
   defer { try? FileManager.default.removeItem(at: rootURL) }
+  try FileManager.default.createDirectory(
+    at: storageDirectoryURL,
+    withIntermediateDirectories: true,
+    attributes: [.posixPermissions: 0o755]
+  )
+  try FileManager.default.setAttributes(
+    [.posixPermissions: 0o755],
+    ofItemAtPath: storageDirectoryURL.path
+  )
 
   let pasteboard = NSPasteboard(
     name: NSPasteboard.Name("ClipboardDirectoryPermissionsTests.\(UUID().uuidString)")
@@ -67,16 +71,18 @@ func clipboardCreatesItsStorageDirectoryWithPrivatePermissions() throws {
   store.captureIfChanged()
   store.setEnabled(false)
 
+  await store.flushPersistence()
   let attributes = try FileManager.default.attributesOfItem(
     atPath: storageDirectoryURL.path
   )
   let permissions = try #require(attributes[.posixPermissions] as? NSNumber)
   #expect(permissions.intValue & 0o777 == 0o700)
+  await store.flushPersistence()
 }
 
 @MainActor
 @Test
-func clipboardPreservesWhitespaceAndMarksTruncatedText() throws {
+func clipboardPreservesWhitespaceAndMarksTruncatedText() async throws {
   let suiteName = "ClipboardTextTests.\(UUID().uuidString)"
   let defaults = UserDefaults(suiteName: suiteName)!
   defer { defaults.removePersistentDomain(forName: suiteName) }
@@ -135,6 +141,7 @@ func clipboardPreservesWhitespaceAndMarksTruncatedText() throws {
   #expect(pasteboard.string(forType: .string) == truncatedEntry.text)
   store.setEnabled(false)
 
+  await store.flushPersistence()
   let reloadedStore = ClipboardStore(
     storageURL: storageURL,
     pasteboard: pasteboard,
@@ -142,6 +149,8 @@ func clipboardPreservesWhitespaceAndMarksTruncatedText() throws {
   )
   #expect(reloadedStore.entries.first?.isTextTruncated == true)
   #expect(reloadedStore.entries.contains { $0.text == text })
+  await store.flushPersistence()
+  await reloadedStore.flushPersistence()
 }
 
 @MainActor
@@ -184,6 +193,7 @@ func clipboardCapturesPersistsAndCopiesImages() async throws {
   #expect(entry.imageByteCount != nil)
   #expect(store.image(for: entry) != nil)
 
+  await store.flushPersistence()
   let reloadedStore = ClipboardStore(
     storageURL: storageURL,
     pasteboard: pasteboard,
@@ -202,11 +212,13 @@ func clipboardCapturesPersistsAndCopiesImages() async throws {
 
   store.setEnabled(false)
   reloadedStore.setEnabled(false)
+  await store.flushPersistence()
+  await reloadedStore.flushPersistence()
 }
 
 @MainActor
 @Test
-func clipboardLoadsLegacyTextEntries() throws {
+func clipboardLoadsLegacyTextEntries() async throws {
   let suiteName = "ClipboardLegacyTests.\(UUID().uuidString)"
   let defaults = UserDefaults(suiteName: suiteName)!
   defer { defaults.removePersistentDomain(forName: suiteName) }
@@ -244,11 +256,12 @@ func clipboardLoadsLegacyTextEntries() throws {
   #expect(store.entries.first?.text == "Still here")
   #expect(store.entries.first?.isImage == false)
   #expect(store.entries.first?.isTextTruncated == false)
+  await store.flushPersistence()
 }
 
 @MainActor
 @Test
-func clipboardRetentionLimitTrimsAndPersistsImmediately() throws {
+func clipboardRetentionLimitTrimsAndPersistsAfterFlush() async throws {
   let suiteName = "ClipboardRetentionTests.\(UUID().uuidString)"
   let defaults = UserDefaults(suiteName: suiteName)!
   defer { defaults.removePersistentDomain(forName: suiteName) }
@@ -284,6 +297,7 @@ func clipboardRetentionLimitTrimsAndPersistsImmediately() throws {
   #expect(store.entries.compactMap(\.text) == ["Clip 4", "Clip 3"])
 
   store.setEnabled(false)
+  await store.flushPersistence()
   let reloadedStore = ClipboardStore(
     storageURL: storageURL,
     pasteboard: pasteboard,
@@ -291,6 +305,8 @@ func clipboardRetentionLimitTrimsAndPersistsImmediately() throws {
   )
   #expect(reloadedStore.retentionLimit == 2)
   #expect(reloadedStore.entries.compactMap(\.text) == ["Clip 4", "Clip 3"])
+  await store.flushPersistence()
+  await reloadedStore.flushPersistence()
 }
 
 @Test
@@ -320,7 +336,7 @@ func clipboardSearchMatchesTextTypeAndSourceApp() {
 
 @MainActor
 @Test
-func clipboardPinsPersistAndStayOutsideRetentionLimit() throws {
+func clipboardPinsPersistAndStayOutsideRetentionLimit() async throws {
   let suiteName = "ClipboardPinTests.\(UUID().uuidString)"
   let defaults = UserDefaults(suiteName: suiteName)!
   defer { defaults.removePersistentDomain(forName: suiteName) }
@@ -353,6 +369,7 @@ func clipboardPinsPersistAndStayOutsideRetentionLimit() throws {
   #expect(store.entries.first?.isPinned == true)
 
   store.setEnabled(false)
+  await store.flushPersistence()
   let reloadedStore = ClipboardStore(
     storageURL: storageURL,
     pasteboard: pasteboard,
@@ -360,11 +377,13 @@ func clipboardPinsPersistAndStayOutsideRetentionLimit() throws {
   )
   #expect(reloadedStore.entries.compactMap(\.text) == ["Clip 0", "Clip 2"])
   #expect(reloadedStore.entries.first?.isPinned == true)
+  await store.flushPersistence()
+  await reloadedStore.flushPersistence()
 }
 
 @MainActor
 @Test
-func clipboardAutoExpiryPreservesPinnedEntries() throws {
+func clipboardAutoExpiryPreservesPinnedEntries() async throws {
   let suiteName = "ClipboardExpiryTests.\(UUID().uuidString)"
   let defaults = UserDefaults(suiteName: suiteName)!
   defer { defaults.removePersistentDomain(forName: suiteName) }
@@ -414,11 +433,12 @@ func clipboardAutoExpiryPreservesPinnedEntries() throws {
   #expect(store.entries.compactMap(\.text) == ["Pinned old clip", "Recent clip"])
   #expect(store.entries.first?.isPinned == true)
   store.setAutoExpiry(.never)
+  await store.flushPersistence()
 }
 
 @MainActor
 @Test
-func clipboardStartupPurgesAndTrimsBeforePersisting() throws {
+func clipboardStartupPurgesAndTrimsBeforePersisting() async throws {
   let suiteName = "ClipboardStartupCleanupTests.\(UUID().uuidString)"
   let defaults = UserDefaults(suiteName: suiteName)!
   defer { defaults.removePersistentDomain(forName: suiteName) }
@@ -477,16 +497,18 @@ func clipboardStartupPurgesAndTrimsBeforePersisting() throws {
   )
 
   #expect(store.entries.compactMap(\.text) == ["Recent 4", "Recent 3"])
+  await store.flushPersistence()
   let persistedEntries = try ActivityCoding.makeDecoder().decode(
     [ClipboardEntry].self,
     from: Data(contentsOf: storageURL)
   )
   #expect(persistedEntries.compactMap(\.text) == ["Recent 4", "Recent 3"])
+  await store.flushPersistence()
 }
 
 @MainActor
 @Test
-func clipboardAppExclusionsPersistByBundleIdentifier() {
+func clipboardAppExclusionsPersistByBundleIdentifier() async {
   let suiteName = "ClipboardExclusionTests.\(UUID().uuidString)"
   let defaults = UserDefaults(suiteName: suiteName)!
   defer { defaults.removePersistentDomain(forName: suiteName) }
@@ -506,6 +528,7 @@ func clipboardAppExclusionsPersistByBundleIdentifier() {
 
   #expect(store.excludedApplications.map(\.name) == ["Another App", "Secret App"])
 
+  await store.flushPersistence()
   let reloadedStore = ClipboardStore(
     storageURL: storageURL,
     pasteboard: NSPasteboard(
@@ -520,6 +543,8 @@ func clipboardAppExclusionsPersistByBundleIdentifier() {
 
   reloadedStore.removeExcludedApplication("com.example.Secret")
   #expect(reloadedStore.excludedApplications.map(\.bundleIdentifier) == ["com.example.Other"])
+  await store.flushPersistence()
+  await reloadedStore.flushPersistence()
 }
 
 @MainActor

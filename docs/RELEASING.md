@@ -2,7 +2,8 @@
 
 The release workflow builds `arm64` and `x86_64` slices independently, merges
 all three executables with `lipo`, embeds Sparkle, and creates dSYMs from the
-merged binaries. It then signs every nested executable and Sparkle helper with
+merged binaries. Packaging rejects Sparkle versions below 2.9.6, including stale
+cached artifacts affected by GHSA-3x7w-j75x-ppq5. It then signs every nested executable and Sparkle helper with
 the hardened runtime before signing the outer app bundle.
 
 The signed app is placed in a compressed DMG, the DMG is Developer ID signed,
@@ -111,7 +112,7 @@ also supports a local `notarytool` keychain profile through
 
 Sentry starts before AppKit finishes launching only when the user has enabled
 Share crash reports and the packaged plist has a `SentryDSN`. Consent defaults
-off, and local source builds do not include a DSN. Release builds set
+off, and local source builds omit a DSN by default. Release builds set
 `sendDefaultPii` to `false`, attach the exact
 `com.notchrouter.app@VERSION+BUILD` release, and upload matching universal
 dSYMs so native crashes can be symbolicated.

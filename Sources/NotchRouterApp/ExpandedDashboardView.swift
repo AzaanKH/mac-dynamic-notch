@@ -2,16 +2,20 @@ import AppKit
 import SwiftUI
 
 struct ExpandedDashboardView: View {
-  @ObservedObject var store: ActivityStore
-  @ObservedObject var fileShelf: FileShelfStore
-  @ObservedObject var downloads: BrowserDownloadStore
-  @ObservedObject var clipboard: ClipboardStore
-  @ObservedObject var music: MusicController
-  @ObservedObject var focusTimer: FocusTimerController
-  @ObservedObject var server: ActivityHTTPServer
-  @ObservedObject var systemMonitor: SystemMonitorController
-  @ObservedObject var viewModel: NotchViewModel
+  let store: ActivityStore
+  let fileShelf: FileShelfStore
+  let downloads: BrowserDownloadStore
+  let clipboard: ClipboardStore
+  let music: MusicController
+  let focusTimer: FocusTimerController
+  let server: ActivityHTTPServer
+  let systemMonitor: SystemMonitorController
+  let battery: BatteryMonitor
+  let viewModel: NotchViewModel
+  let onOpenSettings: () -> Void
   @FocusState private var focusedSection: NotchSection?
+  @Namespace private var sectionSelection
+  @Environment(\.accessibilityReduceMotion) private var reduceMotion
   @Environment(\.accessibilityDifferentiateWithoutColor) private var differentiateWithoutColor
   @Environment(\.colorSchemeContrast) private var contrast
 
@@ -45,21 +49,29 @@ struct ExpandedDashboardView: View {
         case .clipboard:
           ClipboardSectionView(store: clipboard)
         case .system:
-          SystemSectionView(monitor: systemMonitor)
+          SystemSectionView(monitor: systemMonitor, battery: battery)
         }
       }
       .id(viewModel.selectedSection)
-      .transition(.opacity.combined(with: .move(edge: .bottom)))
+      .transition(
+        reduceMotion
+          ? AnyTransition.opacity
+          : AnyTransition(SectionEntranceTransition(direction: viewModel.sectionDirection))
+      )
       .frame(maxWidth: .infinity, maxHeight: .infinity)
 
       footer
     }
     .padding(.top, 11)
-    .onAppear {
-      focusSelectedSection()
-    }
+    .animation(
+      reduceMotion ? NotchMotion.reduced : NotchMotion.section,
+      value: viewModel.selectedSection
+    )
     .onChange(of: viewModel.selectedSection) { _, section in
-      focusedSection = section
+      // Keep keyboard focus with tab navigation without focusing mouse selections.
+      if focusedSection != nil {
+        focusedSection = section
+      }
     }
     .onExitCommand {
       viewModel.collapse()
@@ -76,6 +88,7 @@ struct ExpandedDashboardView: View {
         Text(sectionSummary)
           .font(.title3.weight(.semibold))
           .lineLimit(1)
+          .sectionSwap(viewModel.selectedSection, reduceMotion: reduceMotion)
       }
 
       Spacer()
@@ -83,6 +96,16 @@ struct ExpandedDashboardView: View {
       if canClearSection, !viewModel.hasPhysicalNotch {
         clearButton
       }
+
+      Button(action: onOpenSettings) {
+        Image(systemName: "gearshape")
+          .font(.callout.weight(.bold))
+          .frame(width: 28, height: 28)
+      }
+      .buttonStyle(NotchSubtleButtonStyle())
+      .keyboardShortcut(",", modifiers: .command)
+      .accessibilityLabel("Open Settings")
+      .help("Settings (⌘,)")
 
       Button {
         viewModel.collapse()
@@ -92,7 +115,6 @@ struct ExpandedDashboardView: View {
           .frame(width: 28, height: 28)
       }
       .buttonStyle(NotchSubtleButtonStyle())
-      .focusable()
       .accessibilityLabel("Collapse notch")
       .help("Collapse notch")
 
@@ -104,7 +126,6 @@ struct ExpandedDashboardView: View {
           .frame(width: 28, height: 28)
       }
       .buttonStyle(NotchSubtleButtonStyle())
-      .focusable()
       .keyboardShortcut("q", modifiers: .command)
       .accessibilityLabel("Quit NotchRouter")
       .help("Quit NotchRouter (⌘Q)")
@@ -119,13 +140,15 @@ struct ExpandedDashboardView: View {
         .fixedSize()
     }
     .buttonStyle(NotchSubtleButtonStyle(isProminent: true))
-    .focusable()
   }
 
   private var sectionPicker: some View {
     HStack(spacing: 5) {
       ForEach(NotchSection.allCases) { section in
         Button {
+          if NSApp.currentEvent?.type == .leftMouseUp {
+            focusedSection = nil
+          }
           viewModel.selectedSection = section
         } label: {
           HStack(spacing: 5) {
@@ -142,7 +165,11 @@ struct ExpandedDashboardView: View {
           .frame(minHeight: 36)
         }
         .buttonStyle(NotchSectionButtonStyle(isSelected: viewModel.selectedSection == section))
-        .focusable()
+        .background {
+          if viewModel.selectedSection == section {
+            selectionIndicator
+          }
+        }
         .focused($focusedSection, equals: section)
         .accessibilityAddTraits(
           viewModel.selectedSection == section ? .isSelected : []
@@ -158,9 +185,14 @@ struct ExpandedDashboardView: View {
     .padding(.bottom, 10)
   }
 
-  private func focusSelectedSection() {
-    DispatchQueue.main.async {
-      focusedSection = viewModel.selectedSection
+  // One indicator glides between tabs. With Reduce Motion it only fades.
+  @ViewBuilder
+  private var selectionIndicator: some View {
+    if reduceMotion {
+      NotchSectionSelectionIndicator()
+    } else {
+      NotchSectionSelectionIndicator()
+        .matchedGeometryEffect(id: "selectedSection", in: sectionSelection)
     }
   }
 
@@ -182,16 +214,17 @@ struct ExpandedDashboardView: View {
         .font(.caption)
         .dashboardTertiaryText()
         .lineLimit(1)
+        .sectionSwap(viewModel.selectedSection, reduceMotion: reduceMotion)
       Spacer()
       if viewModel.selectedSection == .activity, server.state.canRetry {
         Button("Retry API", action: server.start)
           .buttonStyle(NotchSubtleButtonStyle())
-          .focusable()
           .accessibilityHint("Try to start the local event API again")
       } else {
         Text(footerCount)
           .font(.caption.weight(.medium))
           .dashboardTertiaryText()
+          .sectionSwap(viewModel.selectedSection, alignment: .trailing, reduceMotion: reduceMotion)
       }
     }
     .padding(.horizontal, 16)
@@ -313,11 +346,11 @@ struct ExpandedDashboardView: View {
     case .activity:
       switch server.state {
       case .stopped:
-        "Local event API stopped · 127.0.0.1:\(server.port)"
+        "Private event API stopped"
       case .starting:
-        "Starting local event API · 127.0.0.1:\(server.port)"
+        "Starting private event API"
       case .ready:
-        "Local event API · 127.0.0.1:\(server.port)"
+        "Private event API ready"
       case .failed(let failure):
         failure.isPortConflict
           ? "Local event API unavailable · port \(server.port) is already in use"
@@ -368,6 +401,21 @@ struct ExpandedDashboardView: View {
       clipboard.isEnabled ? "\(clipboard.entries.count) clips" : "off"
     case .system:
       systemMonitor.isEnabled ? systemMonitor.network.interfaceName : "off"
+    }
+  }
+}
+
+private extension View {
+  /// Swaps section-specific text with a blur, so the old and new strings are
+  /// never both sharp while they overlap.
+  func sectionSwap(
+    _ section: NotchSection,
+    alignment: Alignment = .leading,
+    reduceMotion: Bool
+  ) -> some View {
+    ZStack(alignment: alignment) {
+      id(section)
+        .transition(reduceMotion ? AnyTransition.opacity : AnyTransition(.blurReplace))
     }
   }
 }

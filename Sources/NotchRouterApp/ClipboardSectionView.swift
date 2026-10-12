@@ -1,7 +1,7 @@
 import SwiftUI
 
 struct ClipboardSectionView: View {
-  @ObservedObject var store: ClipboardStore
+  let store: ClipboardStore
   @State private var searchText = ""
 
   var body: some View {
@@ -31,10 +31,12 @@ struct ClipboardSectionView: View {
               LazyVStack(spacing: 7) {
                 ForEach(filteredEntries) { entry in
                   ClipboardRow(entry: entry, store: store)
+                    .notchListRowTransition()
                 }
               }
               .padding(.horizontal, 14)
               .padding(.bottom, 10)
+              .animatesListChanges(filteredEntries.map(\.id))
             }
           }
         }
@@ -90,7 +92,6 @@ struct ClipboardSectionView: View {
         store.setEnabled(true)
       }
       .buttonStyle(NotchAccentButtonStyle(tint: .purple))
-      .focusable()
     }
     .frame(maxWidth: .infinity, maxHeight: .infinity)
   }
@@ -109,14 +110,13 @@ struct ClipboardSectionView: View {
         store.setEnabled(false)
       }
       .buttonStyle(NotchSubtleButtonStyle())
-      .focusable()
     }
     .frame(maxWidth: .infinity, maxHeight: .infinity)
   }
 }
 private struct ClipboardRow: View {
   let entry: ClipboardEntry
-  @ObservedObject var store: ClipboardStore
+  let store: ClipboardStore
 
   var body: some View {
     HStack(alignment: entry.isImage ? .center : .top, spacing: 10) {
@@ -155,7 +155,6 @@ private struct ClipboardRow: View {
           .dashboardTint(entry.isPinned ? .orange : .white)
       }
       .buttonStyle(NotchIconButtonStyle())
-      .focusable()
       .accessibilityLabel(entry.isPinned ? "Unpin clipboard item" : "Pin clipboard item")
 
       Button {
@@ -164,7 +163,6 @@ private struct ClipboardRow: View {
         Image(systemName: "doc.on.doc")
       }
       .buttonStyle(NotchIconButtonStyle())
-      .focusable()
       .accessibilityLabel("Copy clipboard item")
 
       Button {
@@ -173,7 +171,6 @@ private struct ClipboardRow: View {
         Image(systemName: "xmark")
       }
       .buttonStyle(NotchIconButtonStyle())
-      .focusable()
       .accessibilityLabel("Remove clipboard item")
     }
     .padding(10)

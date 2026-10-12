@@ -5,7 +5,7 @@ import Testing
 
 @MainActor
 @Test
-func approvalActivitiesOutrankNewerOrdinaryWork() throws {
+func approvalActivitiesOutrankNewerOrdinaryWork() async throws {
   let directory = FileManager.default.temporaryDirectory
     .appendingPathComponent(UUID().uuidString, isDirectory: true)
   defer { try? FileManager.default.removeItem(at: directory) }
@@ -37,11 +37,12 @@ func approvalActivitiesOutrankNewerOrdinaryWork() throws {
   #expect(store.activities.map(\.id) == ["approval", "running"])
   #expect(store.activeActivity?.id == "approval")
   #expect(store.currentActivity?.id == "approval")
+  await store.flushPersistence()
 }
 
 @MainActor
 @Test
-func activityGroupsCountsAndSearchesAcrossVisibleFields() throws {
+func activityGroupsCountsAndSearchesAcrossVisibleFields() async throws {
   let directory = FileManager.default.temporaryDirectory
     .appendingPathComponent(UUID().uuidString, isDirectory: true)
   defer { try? FileManager.default.removeItem(at: directory) }
@@ -107,6 +108,7 @@ func activityGroupsCountsAndSearchesAcrossVisibleFields() throws {
     store.activities(in: .completed, matching: "docs-complete")
       .map(\.id) == ["docs-complete"]
   )
+  await store.flushPersistence()
 }
 
 @Test
@@ -122,7 +124,7 @@ func everyActivityStateBelongsToOnePresentationGroup() {
 
 @MainActor
 @Test
-func storeExpiresNonterminalActivitiesAfterHeartbeatWindow() throws {
+func storeExpiresNonterminalActivitiesAfterHeartbeatWindow() async throws {
   let directory = FileManager.default.temporaryDirectory
     .appendingPathComponent(UUID().uuidString, isDirectory: true)
   defer { try? FileManager.default.removeItem(at: directory) }
@@ -153,11 +155,12 @@ func storeExpiresNonterminalActivitiesAfterHeartbeatWindow() throws {
   #expect(store.expireStaleActivities(at: now.addingTimeInterval(61)))
   #expect(store.activeActivity == nil)
   #expect(store.currentActivity?.state == .stale)
+  await store.flushPersistence()
 }
 
 @MainActor
 @Test
-func storeRepairsPrivateStoragePermissions() throws {
+func storeRepairsPrivateStoragePermissions() async throws {
   let directory = FileManager.default.temporaryDirectory
     .appendingPathComponent(UUID().uuidString, isDirectory: true)
   let storageURL = directory.appendingPathComponent("activities.json")
@@ -176,7 +179,9 @@ func storeRepairsPrivateStoragePermissions() throws {
 
   let store = ActivityStore(storageURL: storageURL)
 
+  await store.flushPersistence()
   #expect(try permissions(of: directory) == 0o700)
+  await store.flushPersistence()
   #expect(try permissions(of: storageURL) == 0o600)
 
   try store.ingest(
@@ -189,13 +194,16 @@ func storeRepairsPrivateStoragePermissions() throws {
     )
   )
 
+  await store.flushPersistence()
   #expect(try permissions(of: directory) == 0o700)
+  await store.flushPersistence()
   #expect(try permissions(of: storageURL) == 0o600)
+  await store.flushPersistence()
 }
 
 @MainActor
 @Test
-func activityRetentionLimitTrimsAndPersistsImmediately() throws {
+func activityRetentionLimitTrimsAndPersistsAfterFlush() async throws {
   let directory = FileManager.default.temporaryDirectory
     .appendingPathComponent(UUID().uuidString, isDirectory: true)
   let suiteName = "ActivityRetentionTests.\(UUID().uuidString)"
@@ -230,17 +238,20 @@ func activityRetentionLimitTrimsAndPersistsImmediately() throws {
   #expect(store.retentionLimit == 2)
   #expect(store.activities.map(\.id) == ["activity-4", "activity-3"])
 
+  await store.flushPersistence()
   let reloadedStore = ActivityStore(
     storageURL: storageURL,
     defaults: defaults
   )
   #expect(reloadedStore.retentionLimit == 2)
   #expect(reloadedStore.activities.map(\.id) == ["activity-4", "activity-3"])
+  await store.flushPersistence()
+  await reloadedStore.flushPersistence()
 }
 
 @MainActor
 @Test
-func activityUpdatesRoundTripWithHistoryAndHeartbeat() throws {
+func activityUpdatesRoundTripWithHistoryAndHeartbeat() async throws {
   let directory = FileManager.default.temporaryDirectory
     .appendingPathComponent(UUID().uuidString, isDirectory: true)
   let storageURL = directory.appendingPathComponent("activities.json")
@@ -280,6 +291,7 @@ func activityUpdatesRoundTripWithHistoryAndHeartbeat() throws {
     )
   )
 
+  await store.flushPersistence()
   let reloadedStore = ActivityStore(
     storageURL: storageURL,
     dateProvider: { now },
@@ -296,11 +308,13 @@ func activityUpdatesRoundTripWithHistoryAndHeartbeat() throws {
   #expect(activity.updatedAt == now)
   #expect(activity.lastHeartbeatAt == now)
   #expect(activity.history.map(\.state) == [.queued, .running])
+  await store.flushPersistence()
+  await reloadedStore.flushPersistence()
 }
 
 @MainActor
 @Test
-func clearingAndDismissingActivitiesPersistImmediately() throws {
+func clearingAndDismissingActivitiesPersistAfterFlush() async throws {
   let directory = FileManager.default.temporaryDirectory
     .appendingPathComponent(UUID().uuidString, isDirectory: true)
   let storageURL = directory.appendingPathComponent("activities.json")
@@ -333,6 +347,7 @@ func clearingAndDismissingActivitiesPersistImmediately() throws {
   }
 
   store.clearFinished()
+  await store.flushPersistence()
   var reloadedStore = ActivityStore(
     storageURL: storageURL,
     dateProvider: { now },
@@ -341,12 +356,16 @@ func clearingAndDismissingActivitiesPersistImmediately() throws {
   #expect(reloadedStore.activities.map(\.id) == ["running"])
 
   reloadedStore.dismiss("running")
+  await store.flushPersistence()
+  await reloadedStore.flushPersistence()
   reloadedStore = ActivityStore(
     storageURL: storageURL,
     dateProvider: { now },
     defaults: defaults
   )
   #expect(reloadedStore.activities.isEmpty)
+  await store.flushPersistence()
+  await reloadedStore.flushPersistence()
 }
 
 private func permissions(of url: URL) throws -> Int {

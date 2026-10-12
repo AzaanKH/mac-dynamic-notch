@@ -56,6 +56,20 @@ jobs:
           print -r -- "RELEASE_NOTES_URL=${repository_url}/releases/tag/${GITHUB_REF_NAME}" >> "$GITHUB_ENV"
           print -r -- "SENTRY_RELEASE=com.notchrouter.app@${release_version}+${build_number}" >> "$GITHUB_ENV"
 
+      - name: Validate notarization inputs
+        shell: zsh {0}
+        env:
+          NOTARY_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          for variable_name in NOTARY_KEY_ID NOTARY_ISSUER_ID; do
+            if [[ -z ${(P)variable_name:-} ]]; then
+              print -u2 -r -- "${variable_name} must be set"
+              exit 1
+            fi
+          done
+
       - name: Run test suite
         run: swift test
 
@@ -189,6 +203,7 @@ jobs:
           if [[ -f "$certificate_path" ]]; then
             rm -- "$certificate_path"
           fi
-          if [[ -n ${NOTARY_KEY_PATH:-} && -f "$NOTARY_KEY_PATH" ]]; then
-            rm -- "$NOTARY_KEY_PATH"
+          notary_key_path="${RUNNER_TEMP}/app-store-connect-api-key.p8"
+          if [[ -f "$notary_key_path" ]]; then
+            rm -- "$notary_key_path"
           fi

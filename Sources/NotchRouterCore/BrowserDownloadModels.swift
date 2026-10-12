@@ -17,8 +17,8 @@ public struct BrowserDownloadEvent: Codable, Equatable, Sendable {
   public let kind: BrowserDownloadEventKind
   public let downloadID: Int
   public let browserName: String
-  public let filename: String?
-  public let sourceURL: String?
+  public let displayName: String?
+  public let sourceHost: String?
   public let bytesReceived: Int64?
   public let totalBytes: Int64?
   public let estimatedEndTime: Date?
@@ -31,8 +31,8 @@ public struct BrowserDownloadEvent: Codable, Equatable, Sendable {
     kind: BrowserDownloadEventKind,
     downloadID: Int = 0,
     browserName: String,
-    filename: String? = nil,
-    sourceURL: String? = nil,
+    displayName: String? = nil,
+    sourceHost: String? = nil,
     bytesReceived: Int64? = nil,
     totalBytes: Int64? = nil,
     estimatedEndTime: Date? = nil,
@@ -44,8 +44,8 @@ public struct BrowserDownloadEvent: Codable, Equatable, Sendable {
     self.kind = kind
     self.downloadID = downloadID
     self.browserName = browserName
-    self.filename = filename
-    self.sourceURL = sourceURL
+    self.displayName = displayName
+    self.sourceHost = sourceHost
     self.bytesReceived = bytesReceived
     self.totalBytes = totalBytes
     self.estimatedEndTime = estimatedEndTime
@@ -59,8 +59,8 @@ public struct BrowserDownloadEvent: Codable, Equatable, Sendable {
     case kind
     case downloadID = "download_id"
     case browserName = "browser_name"
-    case filename
-    case sourceURL = "source_url"
+    case displayName = "display_name"
+    case sourceHost = "source_host"
     case bytesReceived = "bytes_received"
     case totalBytes = "total_bytes"
     case estimatedEndTime = "estimated_end_time"
@@ -80,11 +80,11 @@ public struct BrowserDownloadEvent: Codable, Equatable, Sendable {
     guard kind == .heartbeat || kind == .disabled || downloadID >= 0 else {
       throw BrowserDownloadValidationError.invalidDownloadID
     }
-    guard (filename?.count ?? 0) <= 4_096 else {
-      throw BrowserDownloadValidationError.filenameTooLong
+    guard (displayName?.count ?? 0) <= 4_096 else {
+      throw BrowserDownloadValidationError.displayNameTooLong
     }
-    guard (sourceURL?.count ?? 0) <= 4_096 else {
-      throw BrowserDownloadValidationError.sourceURLTooLong
+    guard (sourceHost?.count ?? 0) <= 4_096 else {
+      throw BrowserDownloadValidationError.sourceHostTooLong
     }
     return self
   }
@@ -93,8 +93,8 @@ public struct BrowserDownloadEvent: Codable, Equatable, Sendable {
 public enum BrowserDownloadValidationError: LocalizedError, Sendable {
   case invalidBrowserName
   case invalidDownloadID
-  case filenameTooLong
-  case sourceURLTooLong
+  case displayNameTooLong
+  case sourceHostTooLong
 
   public var errorDescription: String? {
     switch self {
@@ -102,10 +102,10 @@ public enum BrowserDownloadValidationError: LocalizedError, Sendable {
       "browser_name must contain 1–80 characters"
     case .invalidDownloadID:
       "download_id must not be negative"
-    case .filenameTooLong:
-      "filename must not exceed 4,096 characters"
-    case .sourceURLTooLong:
-      "source_url must not exceed 4,096 characters"
+    case .displayNameTooLong:
+      "display_name must not exceed 4,096 characters"
+    case .sourceHostTooLong:
+      "source_host must not exceed 4,096 characters"
     }
   }
 }

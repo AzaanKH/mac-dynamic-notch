@@ -1,4 +1,4 @@
-import Combine
+import Observation
 import Foundation
 import NotchRouterCore
 
@@ -46,13 +46,49 @@ enum NotchSection: String, CaseIterable, Identifiable {
 }
 
 @MainActor
-final class NotchViewModel: ObservableObject {
-  @Published var mode: SurfaceMode = .compact
-  @Published var selectedSection: NotchSection = .activity
-  @Published var isFileDropTargeted = false
-  @Published var hardwareNotchWidth: CGFloat = 0
-  @Published var hardwareNotchHeight: CGFloat = 0
-  @Published var hasPhysicalNotch = false
+@Observable
+final class NotchViewModel {
+  var mode: SurfaceMode = .compact
+  var selectedSection: NotchSection = .activity {
+    didSet {
+      guard selectedSection != oldValue else { return }
+      sectionDirection = selectedSection.keyboardNumber > oldValue.keyboardNumber ? 1 : -1
+      onSectionChange?()
+    }
+  }
+  /// 1 when the latest section change moved right through the tabs, -1 when
+  /// it moved left. Drives the direction of the section entrance.
+  private(set) var sectionDirection: CGFloat = 1
+  var onSectionChange: (() -> Void)?
+  var isFileDropTargeted = false
+  var hardwareNotchWidth: CGFloat = 0
+  var hardwareNotchHeight: CGFloat = 0
+  var hasPhysicalNotch = false
+  /// Size of the visible surface, including its ears. The panel controller
+  /// animates this; the panel itself may be larger mid-transition.
+  var surfaceSize: CGSize = .zero
+
+  var presentation = CompactPresentation()
+  var onPresentationChange: (() -> Void)?
+  private var pinTask: Task<Void, Never>?
+
+  func pinActivity(_ kind: CompactActivityKind) {
+    guard presentation.available.contains(kind) else { return }
+    presentation.pin(kind)
+    pinTask?.cancel()
+    pinTask = Task { [weak self] in
+      try? await Task.sleep(for: .seconds(300))
+      guard !Task.isCancelled else { return }
+      self?.unpinActivity()
+    }
+    onPresentationChange?()
+  }
+
+  func unpinActivity() {
+    pinTask?.cancel()
+    presentation.unpin()
+    onPresentationChange?()
+  }
 
   var onModeChange: ((SurfaceMode) -> Void)?
 
@@ -61,30 +97,25 @@ final class NotchViewModel: ObservableObject {
   private var isPointerInside = false
 
   func activityArrived(_ activity: AIActivity) {
-    guard mode != .expanded else { return }
-    selectedSection = .activity
-    setMode(.peek)
-    scheduleCollapse(after: activity.state == .needsApproval ? 8 : 4)
+    // Background events update the compact indicator, never open a preview or
+    // replace the section the user is reading.
+    if mode == .compact, presentation.pinned == nil || presentation.pinned == .agent {
+      selectedSection = .activity
+    }
+    onPresentationChange?()
   }
 
   func musicChanged(
     event: MusicPresentationEvent,
     hasActiveActivity: Bool
   ) {
-    guard
-      event.requestsPeek,
-      !hasActiveActivity,
-      mode != .expanded
-    else { return }
-    setMode(.peek)
-    scheduleCollapse(after: 3)
+    guard !hasActiveActivity, mode == .compact else { return }
+    selectedSection = .music
   }
 
   func focusTimerCompleted(hasActiveActivity: Bool) {
-    guard !hasActiveActivity, mode != .expanded else { return }
+    guard !hasActiveActivity, mode == .compact else { return }
     selectedSection = .focus
-    setMode(.peek)
-    scheduleCollapse(after: 8)
   }
 
   func prepareForFileDrop(isTargeted: Bool) {
@@ -92,6 +123,7 @@ final class NotchViewModel: ObservableObject {
     guard isTargeted else { return }
     selectedSection = .files
     collapseTask?.cancel()
+    hoverTask?.cancel()
     setMode(.expanded)
   }
 
@@ -122,6 +154,8 @@ final class NotchViewModel: ObservableObject {
       currentIndex + (offset % sections.count) + sections.count
     ) % sections.count
     selectedSection = sections[nextIndex]
+    // Wrapping from the last tab to the first still reads as moving right.
+    sectionDirection = offset > 0 ? 1 : -1
     return true
   }
 
@@ -132,7 +166,7 @@ final class NotchViewModel: ObservableObject {
       hoverTask?.cancel()
       if mode == .compact {
         hoverTask = Task { [weak self] in
-          try? await Task.sleep(for: .milliseconds(110))
+          try? await Task.sleep(for: .milliseconds(450))
           guard !Task.isCancelled else { return }
           guard let self, self.isPointerInside, self.mode == .compact else {
             return

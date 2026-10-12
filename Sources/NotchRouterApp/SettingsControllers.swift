@@ -1,15 +1,16 @@
 import AppKit
 import ColorSync
-import Combine
+import Observation
 import Foundation
 import NotchRouterCore
 import ServiceManagement
 
 @MainActor
-final class LaunchAtLoginController: ObservableObject {
-  @Published private(set) var isEnabled = false
-  @Published private(set) var isAvailable = false
-  @Published private(set) var statusMessage: String?
+@Observable
+final class LaunchAtLoginController {
+  private(set) var isEnabled = false
+  private(set) var isAvailable = false
+  private(set) var statusMessage: String?
 
   init() {
     refresh()
@@ -87,17 +88,18 @@ enum DisplayBehavior: String, CaseIterable, Identifiable {
 }
 
 @MainActor
-final class DisplaySelectionController: ObservableObject {
+@Observable
+final class DisplaySelectionController {
   static let automaticIdentifier = "automatic"
   static let preferenceKey = "preferredDisplayIdentifier"
   static let behaviorPreferenceKey = "displayBehavior"
   static let hideOnExternalDisplaysPreferenceKey =
     "hideSoftwareNotchOnExternalDisplays"
 
-  @Published private(set) var displays: [DisplayOption] = []
-  @Published private(set) var behavior: DisplayBehavior
-  @Published private(set) var pinnedDisplayIdentifier: String?
-  @Published private(set) var hidesOnExternalDisplays: Bool
+  private(set) var displays: [DisplayOption] = []
+  private(set) var behavior: DisplayBehavior
+  private(set) var pinnedDisplayIdentifier: String?
+  private(set) var hidesOnExternalDisplays: Bool
 
   var onSelectionChange: (() -> Void)?
 
@@ -205,14 +207,24 @@ final class DisplaySelectionController: ObservableObject {
 }
 
 @MainActor
-final class IntegrationSettingsController: ObservableObject {
-  @Published private(set) var token: String
-  @Published private(set) var operationMessage: String?
-  @Published private(set) var isRunningCodexSetup = false
-  @Published private(set) var codexHooksInstalled = false
-  @Published private(set) var browserOperationMessage: String?
-  @Published private(set) var isRunningBrowserSetup = false
-  @Published private(set) var browserExtensionInstalled = false
+@Observable
+final class IntegrationSettingsController {
+  private(set) var token: String
+  private(set) var operationMessage: String?
+  private(set) var isRunningCodexSetup = false
+  private(set) var codexHooksInstalled = false
+  private(set) var browserOperationMessage: String?
+  private(set) var isRunningBrowserSetup = false
+  private(set) var browserExtensionInstalled = false
+  /// Installed integrations keep running the helper copied at install time.
+  /// After an app update that copy can be outdated (for example still using
+  /// TCP), so offer an explicit update instead of failing silently.
+  private(set) var codexHooksNeedUpdate = false
+  private(set) var browserBridgeNeedsUpdate = false
+  // Comparisons run in the background; only the newest result may publish,
+  // so a check that started before an install or removal cannot win.
+  @ObservationIgnored private var codexHelperCheck = 0
+  @ObservationIgnored private var browserHelperCheck = 0
 
   let endpoint: String
 
@@ -227,7 +239,7 @@ final class IntegrationSettingsController: ObservableObject {
     self.token = token
     self.server = server
     self.clipboard = clipboard
-    endpoint = "http://127.0.0.1:\(server.port)/v1/activities"
+    endpoint = "http://localhost/v1/activities"
     refreshCodexHookStatus()
     refreshBrowserExtensionStatus()
   }
@@ -242,9 +254,13 @@ final class IntegrationSettingsController: ObservableObject {
     operationMessage = "Local endpoint copied."
   }
 
+  private static func shellQuote(_ value: String) -> String {
+    "'\(value.replacingOccurrences(of: "'", with: "'\\''"))'"
+  }
+
   func copyExampleRequest() {
     let request = """
-      curl -X POST \(endpoint) \\
+      curl --unix-socket \(Self.shellQuote(LocalAPISocket.url.path)) -X POST \(endpoint) \\
         -H 'Authorization: Bearer \(token)' \\
         -H 'Content-Type: application/json' \\
         -d '{"activity_id":"example","source":"My Agent","title":"Working","state":"running"}'
@@ -264,6 +280,11 @@ final class IntegrationSettingsController: ObservableObject {
     } catch {
       operationMessage = "Could not rotate the token: \(error.localizedDescription)"
     }
+  }
+
+  func setLegacyTCPEnabled(_ enabled: Bool) {
+    UserDefaults.standard.set(enabled, forKey: "legacyTCPAPIEnabled")
+    server.setLegacyTCPEnabled(enabled)
   }
 
   func retryServer() {
@@ -298,6 +319,8 @@ final class IntegrationSettingsController: ObservableObject {
 
   func openBrowserExtensionManager() {
     let browsers = [
+      ("app.zen-browser.zen", "about:debugging#/runtime/this-firefox"),
+      ("org.mozilla.firefox", "about:debugging#/runtime/this-firefox"),
       ("com.google.Chrome", "chrome://extensions"),
       ("com.microsoft.edgemac", "edge://extensions"),
       ("com.brave.Browser", "brave://extensions"),
@@ -309,7 +332,7 @@ final class IntegrationSettingsController: ObservableObject {
       })
     else {
       browserOperationMessage =
-        "Install Chrome, Edge, Brave, or Chromium to load the extension."
+        "Use Zen, Firefox, Chrome, Edge, Brave, or Chromium to load the extension. Safari is not supported yet."
       return
     }
 
@@ -372,10 +395,57 @@ final class IntegrationSettingsController: ObservableObject {
 
   private func refreshCodexHookStatus() {
     codexHooksInstalled = Self.codexHooksAreInstalled()
+    let installed = codexHooksInstalled
+    codexHelperCheck &+= 1
+    let check = codexHelperCheck
+    Task { [weak self] in
+      let stale = await Task.detached(priority: .utility) {
+        installed && Self.helperIsStale(
+          installed: Self.installedHelperURL("notchctl"),
+          bundled: Self.notchCLIURL()
+        )
+      }.value
+      guard let self, check == self.codexHelperCheck else { return }
+      self.codexHooksNeedUpdate = stale
+    }
   }
 
   private func refreshBrowserExtensionStatus() {
     browserExtensionInstalled = Self.browserExtensionIsInstalled()
+    let installed = browserExtensionInstalled
+    browserHelperCheck &+= 1
+    let check = browserHelperCheck
+    Task { [weak self] in
+      let stale = await Task.detached(priority: .utility) {
+        installed && Self.helperIsStale(
+          installed: Self.installedHelperURL("notchrouter-browser-host"),
+          bundled: Self.notchCLIURL()?.deletingLastPathComponent()
+            .appendingPathComponent("notchrouter-browser-host")
+        )
+      }.value
+      guard let self, check == self.browserHelperCheck else { return }
+      self.browserBridgeNeedsUpdate = stale
+    }
+  }
+
+  nonisolated private static func installedHelperURL(_ name: String) -> URL {
+    AppPaths.applicationSupportDirectory
+      .appendingPathComponent("bin", isDirectory: true)
+      .appendingPathComponent(name)
+  }
+
+  /// An installed helper is stale when it differs from the copy bundled with
+  /// the running app. Without a bundled copy to compare against, assume it is
+  /// current rather than nag.
+  nonisolated static func helperIsStale(installed: URL, bundled: URL?) -> Bool {
+    guard let bundled, FileManager.default.isReadableFile(atPath: bundled.path) else {
+      return false
+    }
+    guard
+      let installedData = try? Data(contentsOf: installed, options: .mappedIfSafe),
+      let bundledData = try? Data(contentsOf: bundled, options: .mappedIfSafe)
+    else { return true }
+    return installedData != bundledData
   }
 
   nonisolated private static func notchCLIURL() -> URL? {
@@ -480,12 +550,7 @@ final class IntegrationSettingsController: ObservableObject {
       .appendingPathComponent("browser-extension/manifest.json")
     let library = FileManager.default.homeDirectoryForCurrentUser
       .appendingPathComponent("Library/Application Support", isDirectory: true)
-    let manifestDirectories = [
-      "Google/Chrome/NativeMessagingHosts",
-      "Microsoft Edge/NativeMessagingHosts",
-      "BraveSoftware/Brave-Browser/NativeMessagingHosts",
-      "Chromium/NativeMessagingHosts",
-    ]
+    let manifestDirectories = BrowserBridgeConfiguration.manifestDirectories
     return FileManager.default.isExecutableFile(atPath: hostURL.path)
       && FileManager.default.fileExists(atPath: extensionManifestURL.path)
       && manifestDirectories.allSatisfy {

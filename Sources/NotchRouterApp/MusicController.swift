@@ -1,5 +1,5 @@
 import AppKit
-import Combine
+import Observation
 import Foundation
 import NotchRouterCore
 
@@ -49,6 +49,30 @@ struct NowPlayingSnapshot: Equatable, Sendable {
   let browserSessionID: String?
   let supportsPrevious: Bool
   let supportsNext: Bool
+  var supportsSeeking: Bool = true
+  var playbackRate: Double = 1
+  var sampledAt: Date = Date()
+  var artworkData: Data?
+
+  var artworkSource: ArtworkSource? {
+    if source == .browser { return artworkData.map(ArtworkSource.browser) }
+    return artworkURL.map(ArtworkSource.spotify)
+  }
+
+  var canSeek: Bool {
+    supportsSeeking && duration.isFinite && duration > 0
+  }
+
+  var identity: String {
+    "\(browserSessionID ?? source.rawValue)|\(title)|\(artist)|\(album)"
+  }
+
+  func elapsed(at date: Date) -> Double {
+    let base = position.isFinite ? max(0, position) : 0
+    let delta = isPlaying ? max(0, date.timeIntervalSince(sampledAt)) * playbackRate : 0
+    let value = base + (delta.isFinite ? delta : 0)
+    return duration.isFinite && duration > 0 ? min(duration, value) : value
+  }
 }
 
 enum MusicPresentationEvent: Equatable, Sendable {
@@ -67,19 +91,25 @@ enum MusicPresentationEvent: Equatable, Sendable {
 }
 
 @MainActor
-final class MusicController: NSObject, ObservableObject {
+@Observable
+final class MusicController: NSObject {
   static let preferenceKey = "musicIntegrationEnabled"
   static let playingPollInterval: TimeInterval = 8
   static let inactivePollInterval: TimeInterval = 30
-  static let transportRefreshDelays: [Duration] = [
+  private static let transportRefreshDelays: [Duration] = [
     .milliseconds(120),
     .milliseconds(480),
   ]
   static let browserSessionTimeout: TimeInterval = 12
+  /// Hidden, silent tabs can have timers throttled to once a minute. Closed
+  /// tabs and unloaded pages still end their sessions explicitly.
+  static let backgroundBrowserSessionTimeout: TimeInterval = 90
+  static let artworkPaletteCacheLimit = 12
 
-  @Published private(set) var isEnabled: Bool
-  @Published private(set) var nowPlaying: NowPlayingSnapshot?
-  @Published private(set) var permissionMessage: String?
+  private(set) var isEnabled: Bool
+  private(set) var nowPlaying: NowPlayingSnapshot?
+  private(set) var permissionMessage: String?
+  private(set) var artworkPalette: MusicArtworkPalette?
 
   let systemVolume = SystemVolumeController()
 
@@ -89,13 +119,50 @@ final class MusicController: NSObject, ObservableObject {
   private var browserExpiryTimer: Timer?
   private var refreshTask: Task<Void, Never>?
   private var transportRefreshTask: Task<Void, Never>?
+  @ObservationIgnored private let nativeControls = NativeControlQueue()
+  @ObservationIgnored private var pendingPosition: PendingPosition?
+
+  /// The last seek target sent before the player reported a new snapshot.
+  private struct PendingPosition {
+    let identity: String
+    let sampledAt: Date
+    let target: Double
+    let issuedAt: Date
+  }
   private var refreshAfterCurrentTask = false
   private var nativeSnapshots: [NowPlayingSnapshot] = []
   private var browserSessions: [String: BrowserSession] = [:]
-  private var pendingBrowserCommands: [String: [BrowserMediaCommand]] = [:]
+  private var pendingBrowserCommands: [String: [PendingBrowserControl]] = [:]
+  private var artworkPaletteCache: [ArtworkSource: MusicArtworkPalette] = [:]
+  /// Failed covers are retried with bounded backoff. The loader cannot tell a
+  /// network timeout from an undecodable image, so neither is permanent.
+  private var artworkPaletteFailures: [ArtworkSource: PaletteFailure] = [:]
+  private var artworkPaletteTask: Task<Void, Never>?
+  private var artworkPaletteRequestURL: ArtworkSource?
+  /// Whether a palette load is running. Lets tests wait for it to settle.
+  var isLoadingArtworkPalette: Bool { artworkPaletteTask != nil }
+  private let artworkPaletteLoader: @Sendable (ArtworkSource) async -> MusicArtworkPalette?
   private let defaults: UserDefaults
+  private let dateProvider: () -> Date
 
-  init(defaults: UserDefaults = .standard) {
+  struct PaletteFailure {
+    var attempts: Int
+    var retryAt: Date
+
+    static func retryDelay(afterAttempts attempts: Int) -> TimeInterval {
+      ArtworkLoader.retryDelay(afterAttempts: attempts)
+    }
+  }
+
+  init(
+    defaults: UserDefaults = .standard,
+    artworkPaletteLoader: @escaping @Sendable (ArtworkSource) async -> MusicArtworkPalette? = {
+      await MusicArtworkPalette.load(source: $0)
+    },
+    dateProvider: @escaping () -> Date = Date.init
+  ) {
+    self.artworkPaletteLoader = artworkPaletteLoader
+    self.dateProvider = dateProvider
     self.defaults = defaults
     isEnabled = defaults.bool(forKey: Self.preferenceKey)
     super.init()
@@ -112,6 +179,7 @@ final class MusicController: NSObject, ObservableObject {
     if enabled {
       refresh(allowsPermissionPrompt: true)
     } else {
+      nativeControls.cancelPending()
       stopPolling()
       refreshTask?.cancel()
       refreshTask = nil
@@ -158,15 +226,45 @@ final class MusicController: NSObject, ObservableObject {
   }
 
   func togglePlayback() {
+    pendingPosition = nil
     executeControl(.playPause)
   }
 
   func nextTrack() {
+    pendingPosition = nil
     executeControl(.next)
   }
 
   func previousTrack() {
+    pendingPosition = nil
     executeControl(.previous)
+  }
+
+  func seek(to position: Double) {
+    guard let snapshot = nowPlaying, snapshot.canSeek, position.isFinite else { return }
+    let target = min(snapshot.duration, max(0, position))
+    pendingPosition = PendingPosition(
+      identity: snapshot.identity, sampledAt: snapshot.sampledAt,
+      target: target, issuedAt: dateProvider()
+    )
+    executeControl(.seek(target))
+  }
+
+  func skip(by seconds: Double) {
+    guard let snapshot = nowPlaying else { return }
+    let now = dateProvider()
+    var base = snapshot.elapsed(at: now)
+    // Skips before the player reports back build on the last seek target
+    // rather than the stale snapshot. A new snapshot resets this.
+    if let pending = pendingPosition, pending.identity == snapshot.identity,
+      pending.sampledAt == snapshot.sampledAt
+    {
+      let played = snapshot.isPlaying
+        ? max(0, now.timeIntervalSince(pending.issuedAt)) * snapshot.playbackRate
+        : 0
+      base = pending.target + played
+    }
+    seek(to: base + seconds)
   }
 
   func openSource(_ source: MusicSource) {
@@ -187,6 +285,7 @@ final class MusicController: NSObject, ObservableObject {
     _ event: BrowserMediaEvent,
     now: Date = Date()
   ) throws -> BrowserMediaBridgeResponse {
+    let event = try event.validated()
     let sessionID = event.sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
     guard
       sessionID == event.sessionID,
@@ -202,10 +301,14 @@ final class MusicController: NSObject, ObservableObject {
       browserSessions.removeValue(forKey: event.sessionID)
       pendingBrowserCommands.removeValue(forKey: event.sessionID)
     case .update:
-      let snapshot = try Self.browserSnapshot(from: event)
+      var snapshot = try Self.browserSnapshot(from: event)
+      snapshot.sampledAt = now
       browserSessions[event.sessionID] = BrowserSession(
         snapshot: snapshot,
-        lastSeenAt: now
+        lastSeenAt: now,
+        timeout: event.isBackground == true
+          ? Self.backgroundBrowserSessionTimeout
+          : Self.browserSessionTimeout
       )
     }
 
@@ -221,7 +324,8 @@ final class MusicController: NSObject, ObservableObject {
     return BrowserMediaBridgeResponse(
       status: "ok",
       sessionID: event.sessionID,
-      command: command
+      command: command?.command,
+      seekPosition: command?.position
     )
   }
 
@@ -271,7 +375,7 @@ final class MusicController: NSObject, ObservableObject {
     browserExpiryTimer = nil
     guard
       let nextExpiry = browserSessions.values
-        .map({ $0.lastSeenAt.addingTimeInterval(Self.browserSessionTimeout) })
+        .map({ $0.lastSeenAt.addingTimeInterval($0.timeout) })
         .min()
     else { return }
 
@@ -310,12 +414,69 @@ final class MusicController: NSObject, ObservableObject {
       ?? nativeSnapshots.first(where: \.isPlaying)
       ?? browserSnapshots.first
       ?? nativeSnapshots.first
+    updateArtworkPalette()
 
     if let event = Self.presentationEvent(
       from: oldSnapshot,
       to: nowPlaying
     ) {
       onChange?(event)
+    }
+  }
+
+  private func updateArtworkPalette() {
+    let url = nowPlaying?.artworkSource
+    let now = dateProvider()
+    if url == artworkPaletteRequestURL {
+      // Heartbeats keep the same request. Only a failed cover whose backoff has
+      // elapsed is requested again.
+      guard let url, artworkPaletteTask == nil, artworkPalette == nil,
+        let failure = artworkPaletteFailures[url], now >= failure.retryAt
+      else { return }
+    } else {
+      artworkPaletteTask?.cancel()
+      artworkPaletteTask = nil
+      artworkPaletteRequestURL = url
+      guard let url else {
+        if artworkPalette != nil { artworkPalette = nil }
+        return
+      }
+      if let cached = artworkPaletteCache[url] {
+        if artworkPalette != cached { artworkPalette = cached }
+        return
+      }
+      if artworkPalette != nil { artworkPalette = nil }
+      if let failure = artworkPaletteFailures[url], now < failure.retryAt { return }
+    }
+    guard let url else { return }
+
+    let loader = artworkPaletteLoader
+    artworkPaletteTask = Task { [weak self] in
+      let palette = await loader(url)
+      guard let self, !Task.isCancelled else { return }
+      self.artworkPaletteTask = nil
+      guard self.artworkPaletteRequestURL == url else { return }
+      guard let palette else {
+        let attempts = (self.artworkPaletteFailures[url]?.attempts ?? 0) + 1
+        if self.artworkPaletteFailures[url] == nil,
+          self.artworkPaletteFailures.count >= Self.artworkPaletteCacheLimit
+        {
+          self.artworkPaletteFailures.removeAll(keepingCapacity: true)
+        }
+        self.artworkPaletteFailures[url] = PaletteFailure(
+          attempts: attempts,
+          retryAt: self.dateProvider().addingTimeInterval(
+            PaletteFailure.retryDelay(afterAttempts: attempts)
+          )
+        )
+        return
+      }
+      self.artworkPaletteFailures[url] = nil
+      if self.artworkPaletteCache.count >= Self.artworkPaletteCacheLimit {
+        self.artworkPaletteCache.removeAll(keepingCapacity: true)
+      }
+      self.artworkPaletteCache[url] = palette
+      self.artworkPalette = palette
     }
   }
 
@@ -340,6 +501,7 @@ final class MusicController: NSObject, ObservableObject {
       || oldSnapshot.album != newSnapshot.album
       || oldSnapshot.isPlaying != newSnapshot.isPlaying
       || oldSnapshot.artworkURL != newSnapshot.artworkURL
+      || oldSnapshot.artworkData != newSnapshot.artworkData
       || oldSnapshot.sourceURL != newSnapshot.sourceURL
     return contentChanged ? .contentChanged : nil
   }
@@ -349,6 +511,7 @@ final class MusicController: NSObject, ObservableObject {
       executeBrowserControl(control)
       return
     }
+    guard isEnabled else { return }
     let source =
       nowPlaying?.source
       ?? MusicSource.nativeCases.first(where: isRunning)
@@ -358,13 +521,14 @@ final class MusicController: NSObject, ObservableObject {
       || control == .previous
       || (control == .playPause && nowPlaying?.isPlaying != true)
 
-    Task { [weak self] in
+    nativeControls.enqueue(control, source: source) { [weak self] control, source in
+      // The integration can be disabled while this command waits its turn.
+      guard let self, self.isEnabled else { return }
       let error = await MusicScriptRunner.control(
         control,
         source: source,
         timeout: 2
       )
-      guard let self, !Task.isCancelled else { return }
       self.permissionMessage = error
       if error == nil, requestsPeek {
         self.onChange?(.userTransport)
@@ -384,6 +548,7 @@ final class MusicController: NSObject, ObservableObject {
     else { return }
 
     let command: BrowserMediaCommand
+    var position: Double?
     switch control {
     case .playPause:
       command = .playPause
@@ -393,12 +558,20 @@ final class MusicController: NSObject, ObservableObject {
     case .next:
       guard snapshot.supportsNext else { return }
       command = .next
+    case .seek(let target):
+      guard snapshot.canSeek else { return }
+      command = .seek
+      position = target
     }
     var commands = pendingBrowserCommands[sessionID] ?? []
-    if commands.count < 8 {
-      commands.append(command)
-      pendingBrowserCommands[sessionID] = commands
+    // A seek merges only into a seek queued directly before it, so it never
+    // jumps ahead of (or drops a seek placed before) another command.
+    if command == .seek, commands.last?.command == .seek {
+      commands[commands.count - 1] = PendingBrowserControl(command: .seek, position: position)
+    } else if commands.count < 8 {
+      commands.append(PendingBrowserControl(command: command, position: position))
     }
+    pendingBrowserCommands[sessionID] = commands
 
     let requestsPeek =
       control == .next
@@ -411,7 +584,7 @@ final class MusicController: NSObject, ObservableObject {
 
   private func pruneBrowserSessions(now: Date) {
     let expiredIDs = browserSessions.compactMap { id, session in
-      now.timeIntervalSince(session.lastSeenAt) > Self.browserSessionTimeout
+      now.timeIntervalSince(session.lastSeenAt) > session.timeout
         ? id
         : nil
     }
@@ -448,12 +621,15 @@ final class MusicController: NSObject, ObservableObject {
       isPlaying: event.isPlaying ?? false,
       duration: finiteNonnegative(event.duration),
       position: finiteNonnegative(event.position),
-      artworkURL: event.artworkURL,
+      artworkURL: nil,
       sourceName: siteName,
       sourceURL: event.pageURL,
       browserSessionID: sessionID,
       supportsPrevious: event.supportsPrevious ?? false,
-      supportsNext: event.supportsNext ?? false
+      supportsNext: event.supportsNext ?? false,
+      supportsSeeking: event.supportsSeeking ?? false,
+      playbackRate: event.playbackRate.map { $0.isFinite && $0 >= 0 ? $0 : 1 } ?? 1,
+      artworkData: event.artworkData
     )
   }
 
@@ -496,15 +672,72 @@ final class MusicController: NSObject, ObservableObject {
   }
 }
 
-private enum MusicControl: Equatable, Sendable {
+enum MusicControl: Equatable, Sendable {
   case playPause
   case next
   case previous
+  case seek(Double)
+}
+
+/// Runs native Music/Spotify controls one at a time, in order: each is a
+/// separate `osascript` process, so unordered runs could finish out of order.
+/// A seek merges into the command queued just before it only when that is a
+/// seek for the same app, so scrubbing does not build a backlog yet never
+/// jumps ahead of another command.
+@MainActor
+final class NativeControlQueue {
+  typealias Run = @MainActor (MusicControl, MusicSource) async -> Void
+
+  private final class SeekTarget {
+    var position: Double
+    init(_ position: Double) { self.position = position }
+  }
+
+  private var chain: Task<Void, Never>?
+  private var generation = 0
+  /// The most recently queued command, when it is a seek that has not started.
+  private var openSeek: (target: SeekTarget, source: MusicSource)?
+
+  func enqueue(_ control: MusicControl, source: MusicSource, run: @escaping Run) {
+    if case .seek(let position) = control, let openSeek, openSeek.source == source {
+      openSeek.target.position = position
+      return
+    }
+    var seekTarget: SeekTarget?
+    if case .seek(let position) = control { seekTarget = SeekTarget(position) }
+    openSeek = seekTarget.map { ($0, source) }
+
+    let generation = self.generation
+    let previous = chain
+    chain = Task { [weak self] in
+      await previous?.value
+      guard let self, generation == self.generation else { return }
+      if let seekTarget, self.openSeek?.target === seekTarget { self.openSeek = nil }
+      await run(seekTarget.map { .seek($0.position) } ?? control, source)
+    }
+  }
+
+  /// Drops queued commands that have not started.
+  func cancelPending() {
+    generation &+= 1
+    openSeek = nil
+  }
+
+  /// Waits for every queued command to finish. For tests.
+  func drain() async {
+    await chain?.value
+  }
+}
+
+private struct PendingBrowserControl {
+  let command: BrowserMediaCommand
+  let position: Double?
 }
 
 private struct BrowserSession: Sendable {
   let snapshot: NowPlayingSnapshot
   let lastSeenAt: Date
+  let timeout: TimeInterval
 }
 
 private enum BrowserMediaValidationError: LocalizedError {
@@ -559,6 +792,7 @@ private enum MusicScriptRunner {
     case .playPause: command = "playpause"
     case .next: command = "next track"
     case .previous: command = "previous track"
+    case .seek(let position): command = "set player position to \(position)"
     }
 
     let result = run(

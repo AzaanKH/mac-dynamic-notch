@@ -2,7 +2,7 @@ import Foundation
 import SwiftUI
 
 struct MusicSectionView: View {
-  @ObservedObject var controller: MusicController
+  let controller: MusicController
 
   var body: some View {
     Group {
@@ -36,9 +36,12 @@ struct MusicSectionView: View {
         controller.setEnabled(true)
       }
       .buttonStyle(NotchAccentButtonStyle(tint: .pink))
-      .focusable()
     }
     .frame(maxWidth: .infinity, maxHeight: .infinity)
+  }
+
+  private var accent: Color {
+    controller.artworkPalette?.accent ?? .pink
   }
 
   private func nowPlaying(_ snapshot: NowPlayingSnapshot) -> some View {
@@ -58,52 +61,68 @@ struct MusicSectionView: View {
             .font(.body.weight(.medium))
             .dashboardSecondaryText()
             .lineLimit(1)
-          Text(snapshot.album)
-            .font(.caption)
-            .dashboardTertiaryText()
-            .lineLimit(1)
+          if !snapshot.album.isEmpty && snapshot.album != snapshot.artist {
+            Text(snapshot.album)
+              .font(.caption)
+              .dashboardTertiaryText()
+              .lineLimit(1)
+          }
         }
         Spacer()
       }
 
       if snapshot.duration > 0 {
-        VStack(spacing: 5) {
-          ProgressView(
-            value: min(snapshot.position, snapshot.duration),
-            total: snapshot.duration
-          )
-          .progressViewStyle(.linear)
-          .tint(.pink)
-          HStack {
-            Text(formatTime(snapshot.position))
-            Spacer()
-            Text(formatTime(snapshot.duration))
-          }
-          .font(.caption.monospacedDigit())
-          .dashboardTertiaryText()
-        }
+        MusicTimelineView(snapshot: snapshot, tint: accent, onSeek: controller.seek)
+          .id(snapshot.identity)
+      } else {
+        Label(snapshot.isPlaying ? "Live playback" : "Paused", systemImage: "dot.radiowaves.left.and.right")
+          .font(.caption)
+          .dashboardSecondaryText()
       }
 
       HStack(spacing: 14) {
+        Button { controller.skip(by: -15) } label: {
+          Image(systemName: "gobackward.15")
+        }
+        .buttonStyle(NotchCircularButtonStyle(size: 30))
+        .disabled(!snapshot.canSeek)
+        .accessibilityLabel("Skip back 15 seconds")
+        .help("Skip back 15 seconds")
+
         Button(action: controller.previousTrack) {
           Image(systemName: "backward.fill")
         }
         .buttonStyle(NotchCircularButtonStyle(size: 34))
-        .focusable()
         .disabled(!snapshot.supportsPrevious)
+        .accessibilityLabel("Previous track")
+        .help("Previous track")
 
         Button(action: controller.togglePlayback) {
-          Image(systemName: snapshot.isPlaying ? "pause.fill" : "play.fill")
+          PlayPauseSymbol(isPlaying: snapshot.isPlaying)
         }
+        .accessibilityLabel(snapshot.isPlaying ? "Pause" : "Play")
+        .help(snapshot.isPlaying ? "Pause" : "Play")
         .buttonStyle(NotchCircularButtonStyle(size: 46, isPrimary: true))
-        .focusable()
+        .shadow(
+          color: accent.opacity(snapshot.isPlaying ? 0.55 : 0.15),
+          radius: snapshot.isPlaying ? 12 : 5
+        )
 
         Button(action: controller.nextTrack) {
           Image(systemName: "forward.fill")
         }
         .buttonStyle(NotchCircularButtonStyle(size: 34))
-        .focusable()
         .disabled(!snapshot.supportsNext)
+        .accessibilityLabel("Next track")
+        .help("Next track")
+
+        Button { controller.skip(by: 15) } label: {
+          Image(systemName: "goforward.15")
+        }
+        .buttonStyle(NotchCircularButtonStyle(size: 30))
+        .disabled(!snapshot.canSeek)
+        .accessibilityLabel("Skip forward 15 seconds")
+        .help("Skip forward 15 seconds")
       }
 
       SystemVolumeSlider(
@@ -112,20 +131,37 @@ struct MusicSectionView: View {
       )
       .frame(maxWidth: 280)
 
+      if let message = controller.permissionMessage {
+        Text(message)
+          .font(.caption)
+          .dashboardTint(.orange)
+          .fixedSize(horizontal: false, vertical: true)
+      }
+
       HStack {
-        Button("Open \(snapshot.sourceName)") {
+        Button {
           controller.openSource(snapshot.source)
+        } label: {
+          Label(snapshot.sourceName, systemImage: "arrow.up.forward.app")
         }
         .buttonStyle(NotchSubtleButtonStyle())
-        .focusable()
+        .help("Open \(snapshot.sourceName)")
         Spacer()
-        if controller.isEnabled {
-          Button("Disable Apple Music & Spotify") {
-            controller.setEnabled(false)
+        Menu {
+          Button("Open \(snapshot.sourceName)") {
+            controller.openSource(snapshot.source)
           }
-          .buttonStyle(NotchSubtleButtonStyle())
-          .focusable()
+          if controller.isEnabled {
+            Button("Disable Apple Music & Spotify") {
+              controller.setEnabled(false)
+            }
+          }
+        } label: {
+          Image(systemName: "ellipsis")
         }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+        .accessibilityLabel("Playback options")
       }
     }
     .padding(14)
@@ -158,27 +194,19 @@ struct MusicSectionView: View {
             controller.openSource(source)
           }
           .buttonStyle(NotchSubtleButtonStyle())
-          .focusable()
         }
         Button("Retry") {
           controller.refresh()
         }
         .buttonStyle(NotchSubtleButtonStyle())
-        .focusable()
       }
 
       Button("Disable Music Controls") {
         controller.setEnabled(false)
       }
       .buttonStyle(NotchSubtleButtonStyle())
-      .focusable()
     }
     .frame(maxWidth: .infinity, maxHeight: .infinity)
   }
 
-  private func formatTime(_ seconds: Double) -> String {
-    guard seconds.isFinite, seconds >= 0 else { return "0:00" }
-    let value = Int(seconds)
-    return "\(value / 60):\(String(format: "%02d", value % 60))"
-  }
 }

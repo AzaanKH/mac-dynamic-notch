@@ -20,11 +20,14 @@ final class NotchPanelController {
   nonisolated(unsafe) private var screenObserver: NSObjectProtocol?
   nonisolated(unsafe) private var outsideClickMonitor: Any?
   nonisolated(unsafe) private var localClickMonitor: Any?
+  nonisolated(unsafe) private var pointerMonitors: [Any] = []
   nonisolated(unsafe) private var dynamicDisplayTrackingTimer: Timer?
   private var lastResolvedScreenIdentifier: CGDirectDisplayID?
   private var lastResolvedMode: SurfaceMode?
   private var previouslyActiveApplication: NSRunningApplication?
   private var isPanelSuppressed = false
+  private var surfaceTransitionID = 0
+  private var isSurfaceTransitioning = false
 
   init(
     store: ActivityStore,
@@ -37,7 +40,8 @@ final class NotchPanelController {
     notificationService: ActivityNotificationService,
     server: ActivityHTTPServer,
     systemMonitor: SystemMonitorController,
-    displaySelection: DisplaySelectionController
+    displaySelection: DisplaySelectionController,
+    onOpenSettings: @escaping () -> Void
   ) {
     self.store = store
     self.fileShelf = fileShelf
@@ -68,7 +72,8 @@ final class NotchPanelController {
       focusTimer: focusTimer,
       server: server,
       systemMonitor: systemMonitor,
-      viewModel: viewModel
+      viewModel: viewModel,
+      onOpenSettings: onOpenSettings
     )
     panel.contentView = NSHostingView(rootView: rootView)
     panel.initialFirstResponder = panel.contentView
@@ -78,7 +83,6 @@ final class NotchPanelController {
 
     viewModel.onModeChange = { [weak self] mode in
       guard let self else { return }
-      self.systemMonitor.setSurfaceMode(mode)
       self.updateFrame(for: mode, animated: true)
       if mode == .compact {
         if self.panel.isKeyWindow {
@@ -93,6 +97,13 @@ final class NotchPanelController {
         }
         self.previouslyActiveApplication = nil
       }
+    }
+    viewModel.onSectionChange = { [weak self] in
+      self?.updateSystemMonitoring()
+    }
+    viewModel.onPresentationChange = { [weak self] in
+      guard let self else { return }
+      self.updateFrame(for: self.viewModel.mode, animated: true)
     }
     store.onIngest = { [weak self] activity in
       self?.viewModel.activityArrived(activity)
@@ -166,7 +177,9 @@ final class NotchPanelController {
     ) { [weak self] _ in
       Task { @MainActor in
         guard let self, self.viewModel.mode == .expanded else { return }
-        if !self.panel.frame.contains(NSEvent.mouseLocation) {
+        if !NotchGeometry.surface(
+          self.surfaceFrame, mode: self.viewModel.mode, contains: NSEvent.mouseLocation
+        ) {
           self.viewModel.collapse()
         }
       }
@@ -177,12 +190,25 @@ final class NotchPanelController {
     ) { [weak self] event in
       MainActor.assumeIsolated {
         guard let self, event.window === self.panel else { return }
-        if self.viewModel.mode == .compact {
-          self.viewModel.expandImmediately()
-        }
         self.focusPanel()
       }
       return event
+    }
+
+    // The panel can extend past the visible surface (shadow margin, transition
+    // canvas). Ignore the mouse there so clicks reach the menu bar or windows
+    // below; the outside-click monitor then collapses as for any other click.
+    let pointerEvents: NSEvent.EventTypeMask = [.mouseMoved, .leftMouseDragged]
+    if let global = NSEvent.addGlobalMonitorForEvents(matching: pointerEvents, handler: { [weak self] _ in
+      MainActor.assumeIsolated { self?.updateMousePassThrough() }
+    }) {
+      pointerMonitors.append(global)
+    }
+    if let local = NSEvent.addLocalMonitorForEvents(matching: pointerEvents, handler: { [weak self] event in
+      MainActor.assumeIsolated { self?.updateMousePassThrough() }
+      return event
+    }) {
+      pointerMonitors.append(local)
     }
 
     updateFrame(for: .compact, animated: false)
@@ -202,6 +228,7 @@ final class NotchPanelController {
     if let localClickMonitor {
       NSEvent.removeMonitor(localClickMonitor)
     }
+    pointerMonitors.forEach(NSEvent.removeMonitor)
   }
 
   func show(_ section: NotchSection = .activity) {
@@ -263,12 +290,9 @@ final class NotchPanelController {
     else { return false }
 
     switch action {
-    case .selectNextKeyView:
-      panel.selectNextKeyView(nil)
-      return true
-    case .selectPreviousKeyView:
-      panel.selectPreviousKeyView(nil)
-      return true
+    case .selectNextKeyView, .selectPreviousKeyView:
+      // Let SwiftUI move focus, including out of a text field's field editor.
+      return false
     case .collapse:
       viewModel.collapse()
       return true
@@ -281,8 +305,17 @@ final class NotchPanelController {
     }
   }
 
+  private func updateSystemMonitoring() {
+    systemMonitor.setPresentation(
+      mode: viewModel.mode, section: viewModel.selectedSection,
+      isVisible: !isPanelSuppressed
+    )
+  }
+
   private func updateFrame(for mode: SurfaceMode, animated: Bool) {
+    defer { updateSystemMonitoring() }
     guard let screen = targetScreen() else { return }
+    let screenChanged = displayID(for: screen) != lastResolvedScreenIdentifier
     lastResolvedScreenIdentifier = displayID(for: screen)
     lastResolvedMode = mode
     let geometry = NotchGeometry(screen: screen)
@@ -302,111 +335,111 @@ final class NotchPanelController {
     let wasPanelSuppressed = isPanelSuppressed
     isPanelSuppressed = false
 
-    let size: CGSize
-    let isFocusPresentation =
-      store.activeActivity == nil
-      && downloads.activeDownload == nil
-      && focusTimer.isPresented
-    let isDownloadPresentation =
-      store.activeActivity == nil
-      && downloads.activeDownload != nil
-    let isMusicPresentation =
-      store.activeActivity == nil
-      && !isDownloadPresentation
-      && !isFocusPresentation
-      && music.nowPlaying != nil
-    let isBatteryPresentation =
-      store.activeActivity == nil
-      && !isDownloadPresentation
-      && !isFocusPresentation
-      && !isMusicPresentation
-      && battery.charging != nil
-    switch mode {
-    case .compact:
-      if store.currentActivity == nil,
-        !isDownloadPresentation,
-        !isFocusPresentation,
-        !isMusicPresentation,
-        !isBatteryPresentation
-      {
-        size = CGSize(
-          width: geometry.restingWidth,
-          height: geometry.restingHeight
-        )
-      } else if isMusicPresentation {
-        size = CGSize(
-          width: geometry.hasPhysicalNotch
-            ? max(geometry.restingWidth + 80, 278)
-            : 238,
-          height: max(geometry.restingHeight, 34)
-        )
-      } else if isDownloadPresentation || isBatteryPresentation {
-        size = CGSize(
-          width: geometry.hasPhysicalNotch
-            ? max(geometry.restingWidth + 150, 350)
-            : 330,
-          height: max(geometry.restingHeight, 42)
-        )
-      } else {
-        size = CGSize(
-          width: max(geometry.restingWidth + 168, 368),
-          height: max(geometry.restingHeight, 44)
-        )
+    var presentation = viewModel.presentation
+    presentation.update(
+      available: [
+        store.activeActivity != nil ? .agent : nil,
+        downloads.activeDownload != nil ? .download : nil,
+        focusTimer.isPresented ? .focus : nil,
+        music.nowPlaying != nil ? .music : nil,
+        battery.charging != nil ? .battery : nil,
+      ].compactMap { $0 },
+      needsApproval: store.activeActivity?.state == .needsApproval
+    )
+    if presentation != viewModel.presentation {
+      viewModel.presentation = presentation
+    }
+    let size = geometry.surfaceSize(
+      for: mode,
+      presentation: presentation,
+      hasRecentActivity: store.currentActivity != nil
+    )
+    let restingSize = NotchGeometry.restingPanelSize(surface: size, mode: mode)
+    let restingFrame = panelFrame(size: restingSize, on: screen)
+    let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+
+    defer {
+      if wasPanelSuppressed {
+        panel.orderFrontRegardless()
       }
-    case .peek:
-      if isMusicPresentation {
-        size = CGSize(
-          width: geometry.hasPhysicalNotch
-            ? max(geometry.restingWidth + 238, 438)
-            : 400,
-          height: geometry.hasPhysicalNotch
-            ? max(geometry.restingHeight + 126, 158)
-            : 136
-        )
-      } else {
-        size = CGSize(
-          width: max(geometry.restingWidth + 208, 408),
-          height: max(geometry.restingHeight + 52, 90)
-        )
-      }
-    case .expanded:
-      size = CGSize(width: 560, height: 500)
     }
 
-    let targetFrame = NSRect(
+    guard animated, !reduceMotion, !screenChanged, viewModel.surfaceSize != .zero else {
+      surfaceTransitionID &+= 1
+      isSurfaceTransitioning = false
+      viewModel.surfaceSize = size
+      if !NSEqualRects(panel.frame, restingFrame) {
+        panel.setFrame(restingFrame, display: true)
+      }
+      updateMousePassThrough()
+      return
+    }
+
+    // Activity, download, and battery updates call this often; leave an
+    // in-flight or settled transition to the same size alone.
+    if size == viewModel.surfaceSize,
+      isSurfaceTransitioning || NSEqualRects(panel.frame, restingFrame)
+    {
+      return
+    }
+
+    // Grow the panel first so it holds the old outline, the new one, and the
+    // spring's overshoot. SwiftUI then animates the outline inside it, and the
+    // panel shrinks to the resting frame once the spring settles so the
+    // transparent margin never covers menu bar items.
+    let canvas = NotchGeometry.transitionCanvasSize(
+      displayed: panel.frame.size,
+      target: restingSize
+    )
+    surfaceTransitionID &+= 1
+    let transitionID = surfaceTransitionID
+    isSurfaceTransitioning = true
+    panel.setFrame(panelFrame(size: canvas, on: screen), display: true)
+    withAnimation(NotchMotion.surface, completionCriteria: .removed) {
+      viewModel.surfaceSize = size
+    } completion: { [weak self] in
+      guard let self, transitionID == self.surfaceTransitionID else { return }
+      self.isSurfaceTransitioning = false
+      self.panel.setFrame(restingFrame, display: true)
+      self.updateMousePassThrough()
+    }
+    // Hit-test against the new target right away. A shrinking surface lets
+    // clicks through as soon as it starts collapsing; a growing one captures
+    // its final area slightly before the outline arrives.
+    updateMousePassThrough()
+  }
+
+  private func updateMousePassThrough() {
+    let ignores = NotchGeometry.passesMouseThrough(
+      at: NSEvent.mouseLocation,
+      panelFrame: panel.frame,
+      surfaceFrame: surfaceFrame,
+      mode: viewModel.mode
+    )
+    if panel.ignoresMouseEvents != ignores {
+      panel.ignoresMouseEvents = ignores
+    }
+  }
+
+  /// The visible surface in screen coordinates. The panel can be larger, for
+  /// the dashboard's shadow or while a transition is running.
+  private var surfaceFrame: NSRect {
+    let size = viewModel.surfaceSize
+    return NSRect(
+      x: panel.frame.midX - size.width / 2,
+      y: panel.frame.maxY - size.height,
+      width: size.width,
+      height: size.height
+    )
+  }
+
+  private func panelFrame(size: CGSize, on screen: NSScreen) -> NSRect {
+    NSRect(
       x: screen.frame.midX - size.width / 2,
       y: screen.frame.maxY - size.height,
       width: size.width,
       height: size.height
     )
-
-    let frameChanged = !NSEqualRects(panel.frame, targetFrame)
-    let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
-    if frameChanged, animated, !reduceMotion {
-      NSAnimationContext.runAnimationGroup { context in
-        switch mode {
-        case .compact:
-          context.duration = 0.2
-        case .peek:
-          context.duration = 0.24
-        case .expanded:
-          context.duration = 0.22
-        }
-        context.timingFunction = CAMediaTimingFunction(
-          controlPoints: 0.22,
-          0.88,
-          0.26,
-          1
-        )
-        panel.animator().setFrame(targetFrame, display: true)
-      }
-    } else if frameChanged {
-      panel.setFrame(targetFrame, display: true)
-    }
-
-    if wasPanelSuppressed {
-      panel.orderFrontRegardless()
-    }
   }
 
   private func screenContainingPointer() -> NSScreen? {
@@ -568,11 +601,13 @@ struct NotchGeometry {
   let hasPhysicalNotch: Bool
   let hardwareWidth: CGFloat
   let hardwareHeight: CGFloat
+  let menuBarHeight: CGFloat
 
   init(screen: NSScreen) {
     self.init(
       screenWidth: screen.frame.width,
       safeAreaTop: screen.safeAreaInsets.top,
+      menuBarHeight: max(screen.safeAreaInsets.top, NSStatusBar.system.thickness),
       auxiliaryTopLeftWidth: screen.auxiliaryTopLeftArea?.width,
       auxiliaryTopRightWidth: screen.auxiliaryTopRightArea?.width
     )
@@ -581,9 +616,11 @@ struct NotchGeometry {
   init(
     screenWidth: CGFloat,
     safeAreaTop: CGFloat,
+    menuBarHeight: CGFloat = 24,
     auxiliaryTopLeftWidth: CGFloat?,
     auxiliaryTopRightWidth: CGFloat?
   ) {
+    self.menuBarHeight = max(safeAreaTop, menuBarHeight)
     guard
       let auxiliaryTopLeftWidth,
       let auxiliaryTopRightWidth,
@@ -608,11 +645,96 @@ struct NotchGeometry {
     hardwareHeight = safeAreaTop
   }
 
+  func compactSize(
+    primary: CompactActivityKind?,
+    hasRecentActivity: Bool,
+    showsIndicator: Bool
+  ) -> CGSize {
+    let active = primary != nil || hasRecentActivity
+    let wings: CGFloat = !active ? 0 : (primary == .music && !showsIndicator ? 80 : 220)
+    return CGSize(width: restingWidth + wings, height: menuBarHeight)
+  }
+
+  /// Full surface size for a mode, including the ears on both sides.
+  func surfaceSize(
+    for mode: SurfaceMode,
+    presentation: CompactPresentation,
+    hasRecentActivity: Bool
+  ) -> CGSize {
+    var size: CGSize
+    switch mode {
+    case .compact:
+      size = compactSize(
+        primary: presentation.primary,
+        hasRecentActivity: hasRecentActivity,
+        showsIndicator: presentation.showsIndicator
+      )
+    case .peek where presentation.primary == .music:
+      size = CGSize(
+        width: hasPhysicalNotch ? max(restingWidth + 238, 438) : 400,
+        height: hasPhysicalNotch ? max(restingHeight + 126, 158) : 136
+      )
+    case .peek:
+      size = CGSize(
+        width: max(restingWidth + 208, 408),
+        height: max(restingHeight + 52, 90)
+      )
+    case .expanded:
+      size = CGSize(width: 560, height: 500)
+    }
+
+    if mode == .peek, presentation.showsIndicator {
+      size.height += 28
+    }
+    size.width += 2 * NotchSurfaceMetrics(mode: mode).earRadius
+    return size
+  }
+
+  /// Whether the panel should let a pointer at `point` reach the windows below:
+  /// true over any transparent part of the panel, including the margins and
+  /// the areas inside the surface's bounds that its outline excludes.
+  static func passesMouseThrough(
+    at point: CGPoint,
+    panelFrame: CGRect,
+    surfaceFrame: CGRect,
+    mode: SurfaceMode
+  ) -> Bool {
+    panelFrame.contains(point) && !surface(surfaceFrame, mode: mode, contains: point)
+  }
+
+  /// Whether a screen point lies on the drawn outline, not merely its bounds.
+  static func surface(_ surfaceFrame: CGRect, mode: SurfaceMode, contains point: CGPoint) -> Bool {
+    guard surfaceFrame.contains(point) else { return false }
+    // Screen coordinates grow upward; the outline is drawn from the top edge.
+    let local = CGPoint(x: point.x - surfaceFrame.minX, y: surfaceFrame.maxY - point.y)
+    return NotchSurfaceShape(NotchSurfaceMetrics(mode: mode))
+      .path(in: CGRect(origin: .zero, size: surfaceFrame.size))
+      .contains(local)
+  }
+
+  /// Panel size once the surface settles. Only the expanded dashboard casts a
+  /// shadow, so compact and peek panels stay flush with the surface and never
+  /// cover menu bar items beside it.
+  static func restingPanelSize(surface: CGSize, mode: SurfaceMode) -> CGSize {
+    guard mode == .expanded else { return surface }
+    return CGSize(width: surface.width + 2 * 20, height: surface.height + 30)
+  }
+
+  /// Panel size while the surface animates from `displayed` to `target`.
+  /// The extra room keeps the spring's overshoot from being clipped.
+  static func transitionCanvasSize(displayed: CGSize, target: CGSize) -> CGSize {
+    let overshootMargin: CGFloat = 16
+    return CGSize(
+      width: max(displayed.width, target.width + 2 * overshootMargin),
+      height: max(displayed.height, target.height + overshootMargin)
+    )
+  }
+
   var restingWidth: CGFloat {
     hasPhysicalNotch ? max(hardwareWidth, 176) : 176
   }
 
   var restingHeight: CGFloat {
-    hasPhysicalNotch ? max(hardwareHeight, 32) : 34
+    menuBarHeight
   }
 }

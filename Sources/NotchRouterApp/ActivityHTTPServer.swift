@@ -1,10 +1,11 @@
-import Combine
+import Observation
 import Foundation
 import Network
 import NotchRouterCore
 
 @MainActor
-final class ActivityHTTPServer: ObservableObject, @unchecked Sendable {
+@Observable
+final class ActivityHTTPServer {
   typealias IngestHandler = @Sendable (ActivityEventRequest) async throws -> AIActivity
   typealias ListHandler = @Sendable () async -> [AIActivity]
   typealias BrowserMediaHandler =
@@ -30,7 +31,10 @@ final class ActivityHTTPServer: ObservableObject, @unchecked Sendable {
   }
 
   let port: UInt16
-  @Published private(set) var state: State = .stopped
+  let socketURL: URL?
+  private(set) var legacyTCPEnabled = false
+  private(set) var legacyTCPState: State = .stopped
+  private(set) var state: State = .stopped
 
   private var token: String
   private let queue = DispatchQueue(label: "com.notchrouter.activity-server")
@@ -39,16 +43,44 @@ final class ActivityHTTPServer: ObservableObject, @unchecked Sendable {
   private let browserMediaHandler: BrowserMediaHandler
   private let browserDownloadHandler: BrowserDownloadHandler
   private var listener: NWListener?
+  private var legacyListener: NWListener?
+  /// Bumped on every legacy toggle so a superseded delayed start is dropped.
+  private var legacyGeneration = 0
+  private var connections: [UUID: HTTPConnection] = [:]
+  /// Invalidates in-flight socket preparation when the server is stopped or
+  /// restarted before it finishes.
+  private var startGeneration = 0
+  /// The latest socket preparation. Each one waits for the previous to finish,
+  /// so a superseded preparation can never unlink a newer server's socket.
+  private var socketPreparation: Task<Result<Void, Error>, Never>?
+  private let socketPreparer: @Sendable (URL) throws -> Void
+  /// Finishes once listeners cancelled by the last stop or restart have
+  /// released their endpoints. Cancellation is asynchronous, so without this
+  /// a quick restart could probe its own still-open socket as "in use".
+  private var listenerRetirement: Task<Void, Never>?
+  private let requestTimeout: TimeInterval
+  private let connectionLimit: Int
+
+  var listeningPort: UInt16? { listener?.port?.rawValue }
+  var connectionCount: Int { connections.count }
 
   init(
     port: UInt16 = 48_271,
     token: String,
+    socketURL: URL? = nil,
+    requestTimeout: TimeInterval = 10,
+    connectionLimit: Int = 64,
+    socketPreparer: @escaping @Sendable (URL) throws -> Void = LocalAPISocket.prepareForListening,
     ingestHandler: @escaping IngestHandler,
     listHandler: @escaping ListHandler,
     browserMediaHandler: @escaping BrowserMediaHandler,
     browserDownloadHandler: @escaping BrowserDownloadHandler
   ) {
     self.port = port
+    self.socketURL = socketURL
+    self.requestTimeout = requestTimeout
+    self.connectionLimit = connectionLimit
+    self.socketPreparer = socketPreparer
     self.token = token
     self.ingestHandler = ingestHandler
     self.listHandler = listHandler
@@ -59,30 +91,52 @@ final class ActivityHTTPServer: ObservableObject, @unchecked Sendable {
   func start() {
     guard state != .starting, state != .ready else { return }
 
-    listener?.cancel()
-    listener = nil
+    retireListeners(includingLegacy: false)
     state = .starting
+    startGeneration &+= 1
+    let generation = startGeneration
+    let retirement = listenerRetirement
 
-    let parameters = NWParameters.tcp
-    parameters.requiredLocalEndpoint = .hostPort(
-      host: "127.0.0.1",
-      port: NWEndpoint.Port(rawValue: port)!
-    )
+    guard let socketURL else {
+      Task { [weak self] in
+        await retirement?.value
+        guard let self, generation == self.startGeneration, self.state == .starting else {
+          return
+        }
+        self.installListener(socketURL: nil)
+      }
+      return
+    }
+    // Socket preparation touches the filesystem (create, chmod, probe, unlink),
+    // which can stall on a slow home volume, so keep it off the main actor.
+    let previous = socketPreparation
+    let preparer = socketPreparer
+    let pending = Task.detached(priority: .utility) { () -> Result<Void, Error> in
+      _ = await previous?.value
+      await retirement?.value
+      return Result { try preparer(socketURL) }
+    }
+    socketPreparation = pending
+    Task { [weak self] in
+      let preparation = await pending.value
+      guard let self, generation == self.startGeneration, self.state == .starting else {
+        return
+      }
+      switch preparation {
+      case .success: self.installListener(socketURL: socketURL)
+      case .failure(let error): self.state = .failed(Self.failure(for: error, port: self.port))
+      }
+    }
+  }
 
+  private func installListener(socketURL: URL?) {
     let newListener: NWListener
     do {
-      newListener = try NWListener(using: parameters)
+      newListener = try makeListener(socketURL: socketURL)
     } catch {
       state = .failed(Self.failure(for: error, port: port))
       return
     }
-
-    let token = token
-    let ingestHandler = ingestHandler
-    let listHandler = listHandler
-    let browserMediaHandler = browserMediaHandler
-    let browserDownloadHandler = browserDownloadHandler
-    let queue = queue
 
     newListener.stateUpdateHandler = { [weak self, weak newListener] newState in
       Task { @MainActor in
@@ -92,34 +146,164 @@ final class ActivityHTTPServer: ObservableObject, @unchecked Sendable {
         self.handle(newState, from: newListener)
       }
     }
-    newListener.newConnectionHandler = { connection in
-      HTTPConnection(
-        connection: connection,
-        token: token,
-        ingestHandler: ingestHandler,
-        listHandler: listHandler,
-        browserMediaHandler: browserMediaHandler,
-        browserDownloadHandler: browserDownloadHandler
-      ).start(on: queue)
+    newListener.newConnectionHandler = { [weak self, weak newListener] connection in
+      Task { @MainActor in
+        guard let self, let newListener, self.listener === newListener else {
+          connection.cancel()
+          return
+        }
+        self.accept(connection)
+      }
     }
     listener = newListener
     newListener.start(queue: queue)
+    if legacyTCPEnabled { scheduleLegacyListener() }
+  }
+
+  private func makeListener(socketURL: URL?) throws -> NWListener {
+    let parameters = NWParameters.tcp
+    parameters.requiredLocalEndpoint = socketURL.map { .unix(path: $0.path) }
+      ?? .hostPort(host: "127.0.0.1", port: NWEndpoint.Port(rawValue: port)!)
+    return try NWListener(using: parameters)
+  }
+
+  private func accept(_ connection: NWConnection) {
+    guard connections.count < connectionLimit else { connection.cancel(); return }
+    let id = UUID()
+    let client = HTTPConnection(
+      connection: connection, token: token, requestTimeout: requestTimeout,
+      ingestHandler: ingestHandler, listHandler: listHandler,
+      browserMediaHandler: browserMediaHandler, browserDownloadHandler: browserDownloadHandler,
+      onClose: { [weak self] in self?.connections.removeValue(forKey: id) }
+    )
+    connections[id] = client
+    client.start(on: queue)
+  }
+
+  func setLegacyTCPEnabled(_ enabled: Bool) {
+    guard socketURL != nil else { return }
+    legacyTCPEnabled = enabled
+    legacyGeneration &+= 1
+    if let legacyListener {
+      self.legacyListener = nil
+      retire([legacyListener])
+    }
+    legacyTCPState = .stopped
+    // Drop accepted requests as well when withdrawing legacy access.
+    closeConnections()
+    if enabled, listener != nil { scheduleLegacyListener() }
+  }
+
+  /// Starts the TCP listener once any retiring listener has released the port,
+  /// unless a later toggle or shutdown has superseded this request.
+  private func scheduleLegacyListener() {
+    legacyTCPState = .starting
+    let generation = legacyGeneration
+    let retirement = listenerRetirement
+    Task { [weak self] in
+      await retirement?.value
+      guard let self, generation == self.legacyGeneration else { return }
+      guard self.legacyTCPEnabled, self.listener != nil else {
+        self.legacyTCPState = .stopped
+        return
+      }
+      self.startLegacyListener()
+    }
+  }
+
+  private func startLegacyListener() {
+    guard legacyListener == nil else { return }
+    do {
+      let listener = try makeListener(socketURL: nil)
+      legacyListener = listener
+      legacyTCPState = .starting
+      listener.stateUpdateHandler = { [weak self, weak listener] state in
+        Task { @MainActor in
+          guard let self, let listener, self.legacyListener === listener else { return }
+          switch state {
+          case .ready: self.legacyTCPState = .ready
+          case .failed(let error), .waiting(let error):
+            self.legacyTCPState = .failed(Self.failure(for: error, port: self.port))
+          case .cancelled: self.legacyTCPState = .stopped
+          default: break
+          }
+        }
+      }
+      listener.newConnectionHandler = { [weak self, weak listener] connection in
+        Task { @MainActor in
+          guard let self, let listener, self.legacyListener === listener else {
+            connection.cancel(); return
+          }
+          self.accept(connection)
+        }
+      }
+      listener.start(queue: queue)
+    } catch {
+      legacyTCPState = .failed(Self.failure(for: error, port: port))
+    }
+  }
+
+  private func closeConnections() {
+    let clients = Array(connections.values)
+    for client in clients { client.close() }
   }
 
   func stop() {
-    listener?.cancel()
-    listener = nil
+    startGeneration &+= 1
+    legacyGeneration &+= 1
+    retireListeners(includingLegacy: true)
+    legacyTCPState = .stopped
+    closeConnections()
     state = .stopped
+  }
+
+  private func retireListeners(includingLegacy: Bool) {
+    var retiring = [listener].compactMap { $0 }
+    listener = nil
+    if includingLegacy, let legacyListener {
+      retiring.append(legacyListener)
+      self.legacyListener = nil
+    }
+    retire(retiring)
+  }
+
+  private func retire(_ retiring: [NWListener]) {
+    guard !retiring.isEmpty else { return }
+    let earlier = listenerRetirement
+    let released = retiring.map(Self.retire)
+    listenerRetirement = Task {
+      await earlier?.value
+      for listener in released { await listener.value }
+    }
+  }
+
+  /// Cancels `listener` and returns a task that finishes when it has released
+  /// its endpoint, or after two seconds if it never reports back.
+  private static func retire(_ listener: NWListener) -> Task<Void, Never> {
+    let (released, continuation) = AsyncStream<Void>.makeStream()
+    listener.stateUpdateHandler = { state in
+      switch state {
+      case .cancelled, .failed: continuation.finish()
+      default: break
+      }
+    }
+    listener.newConnectionHandler = { $0.cancel() }
+    listener.cancel()
+    return Task {
+      await withTaskGroup(of: Void.self) { group in
+        group.addTask { for await _ in released {} }
+        group.addTask { try? await Task.sleep(for: .seconds(2)) }
+        await group.next()
+        group.cancelAll()
+      }
+    }
   }
 
   func updateToken(_ token: String) {
     guard token != self.token else { return }
-    let shouldRestart = state != .stopped
-    stop()
     self.token = token
-    if shouldRestart {
-      start()
-    }
+    // Keep listeners bound. Every accepted connection with the old secret is revoked.
+    closeConnections()
   }
 
   private func handle(_ newState: NWListener.State, from listener: NWListener) {
@@ -131,8 +315,30 @@ final class ActivityHTTPServer: ObservableObject, @unchecked Sendable {
       state = .failed(failure)
       NSLog("NotchRouter activity server is waiting: \(failure.message)")
     case .ready:
-      state = .ready
-      NSLog("NotchRouter is listening on 127.0.0.1:\(port)")
+      guard let socketURL else {
+        state = .ready
+        NSLog("NotchRouter local activity server is ready")
+        return
+      }
+      // Securing the socket is filesystem work too; keep it off the main actor
+      // and publish the result only for the listener that is still current.
+      let generation = startGeneration
+      Task { [weak self, weak listener] in
+        let secured = await Task.detached(priority: .utility) {
+          Result { try LocalAPISocket.secureSocket(at: socketURL) }
+        }.value
+        guard let self, let listener, self.listener === listener,
+          generation == self.startGeneration
+        else { return }
+        switch secured {
+        case .success:
+          self.state = .ready
+          NSLog("NotchRouter local activity server is ready")
+        case .failure(let error):
+          self.stop()
+          self.state = .failed(Self.failure(for: error, port: self.port))
+        }
+      }
     case .failed(let error):
       let failure = Self.failure(for: error, port: port)
       state = .failed(failure)
@@ -171,7 +377,8 @@ final class ActivityHTTPServer: ObservableObject, @unchecked Sendable {
   }
 }
 
-private final class HTTPConnection: @unchecked Sendable {
+@MainActor
+private final class HTTPConnection {
   private static let maximumRequestSize = 64 * 1_024
 
   private let connection: NWConnection
@@ -181,17 +388,25 @@ private final class HTTPConnection: @unchecked Sendable {
   private let browserMediaHandler: ActivityHTTPServer.BrowserMediaHandler
   private let browserDownloadHandler: ActivityHTTPServer.BrowserDownloadHandler
   private var buffer = Data()
-  private var queue: DispatchQueue?
+  private var timeoutTask: Task<Void, Never>?
+  private var requestTask: Task<Void, Never>?
+  private var isClosed = false
+  private let requestTimeout: TimeInterval
+  private let onClose: () -> Void
 
   init(
     connection: NWConnection,
     token: String,
+    requestTimeout: TimeInterval,
     ingestHandler: @escaping ActivityHTTPServer.IngestHandler,
     listHandler: @escaping ActivityHTTPServer.ListHandler,
     browserMediaHandler: @escaping ActivityHTTPServer.BrowserMediaHandler,
-    browserDownloadHandler: @escaping ActivityHTTPServer.BrowserDownloadHandler
+    browserDownloadHandler: @escaping ActivityHTTPServer.BrowserDownloadHandler,
+    onClose: @escaping () -> Void
   ) {
     self.connection = connection
+    self.requestTimeout = requestTimeout
+    self.onClose = onClose
     self.token = token
     self.ingestHandler = ingestHandler
     self.listHandler = listHandler
@@ -200,35 +415,54 @@ private final class HTTPConnection: @unchecked Sendable {
   }
 
   func start(on queue: DispatchQueue) {
-    self.queue = queue
+    timeoutTask = Task { [weak self, requestTimeout] in
+      do { try await Task.sleep(for: .seconds(requestTimeout)) } catch { return }
+      self?.close()
+    }
     connection.start(queue: queue)
     receive()
+  }
+
+  func close() {
+    guard !isClosed else { return }
+    isClosed = true
+    timeoutTask?.cancel()
+    requestTask?.cancel()
+    connection.cancel()
+    onClose()
   }
 
   private func receive() {
     connection.receive(
       minimumIncompleteLength: 1,
       maximumLength: 16 * 1_024
-    ) { [self] data, _, isComplete, error in
-      if let data {
-        buffer.append(data)
+    ) { [weak self] data, _, isComplete, error in
+      Task { @MainActor in
+        guard let self, !self.isClosed else { return }
+        self.received(data, isComplete: isComplete, error: error)
       }
+    }
+  }
 
-      if buffer.count > Self.maximumRequestSize {
-        send(.text(status: 413, message: "Request is too large"))
-        return
-      }
+  private func received(_ data: Data?, isComplete: Bool, error: NWError?) {
+    if let data {
+      buffer.append(data)
+    }
 
-      switch HTTPRequest.parse(buffer) {
-      case .complete(let request):
-        route(request)
-      case .malformed:
-        send(.text(status: 400, message: "Malformed HTTP request"))
-      case .incomplete where isComplete || error != nil:
-        send(.text(status: 400, message: "Malformed HTTP request"))
-      case .incomplete:
-        receive()
-      }
+    if buffer.count > Self.maximumRequestSize {
+      send(.text(status: 413, message: "Request is too large"))
+      return
+    }
+
+    switch HTTPRequest.parse(buffer) {
+    case .complete(let request):
+      route(request)
+    case .malformed:
+      send(.text(status: 400, message: "Malformed HTTP request"))
+    case .incomplete where isComplete || error != nil:
+      send(.text(status: 400, message: "Malformed HTTP request"))
+    case .incomplete:
+      receive()
     }
   }
 
@@ -273,7 +507,8 @@ private final class HTTPConnection: @unchecked Sendable {
       return
     }
 
-    Task {
+    requestTask = Task {
+      guard !isClosed, !Task.isCancelled else { return }
       do {
         let activity = try await ingestHandler(event)
         let data = try ActivityCoding.makeEncoder().encode(activity)
@@ -300,7 +535,8 @@ private final class HTTPConnection: @unchecked Sendable {
       return
     }
 
-    Task {
+    requestTask = Task {
+      guard !isClosed, !Task.isCancelled else { return }
       do {
         let response = try await browserMediaHandler(event)
         let data = try ActivityCoding.makeEncoder().encode(response)
@@ -327,7 +563,8 @@ private final class HTTPConnection: @unchecked Sendable {
       return
     }
 
-    Task {
+    requestTask = Task {
+      guard !isClosed, !Task.isCancelled else { return }
       do {
         let response = try await browserDownloadHandler(event)
         let data = try ActivityCoding.makeEncoder().encode(response)
@@ -339,7 +576,8 @@ private final class HTTPConnection: @unchecked Sendable {
   }
 
   private func list() {
-    Task {
+    requestTask = Task {
+      guard !isClosed, !Task.isCancelled else { return }
       let activities = await listHandler()
       do {
         let data = try ActivityCoding.makeEncoder().encode(activities)
@@ -351,10 +589,11 @@ private final class HTTPConnection: @unchecked Sendable {
   }
 
   private func send(_ response: HTTPResponse) {
+    guard !isClosed, !Task.isCancelled else { return }
     connection.send(
       content: response.encoded,
-      completion: .contentProcessed { [connection] _ in
-        connection.cancel()
+      completion: .contentProcessed { [weak self] _ in
+        Task { @MainActor in self?.close() }
       }
     )
   }

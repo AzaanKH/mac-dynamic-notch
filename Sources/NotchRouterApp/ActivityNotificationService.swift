@@ -1,5 +1,5 @@
 import AppKit
-import Combine
+import Observation
 import NotchRouterCore
 import UserNotifications
 
@@ -28,7 +28,8 @@ enum ActivityNotificationKind: String, CaseIterable, Identifiable {
 }
 
 @MainActor
-final class ActivityNotificationService: NSObject, ObservableObject,
+@Observable
+final class ActivityNotificationService: NSObject,
   UNUserNotificationCenterDelegate
 {
   typealias AuthorizationRequester = (
@@ -46,14 +47,20 @@ final class ActivityNotificationService: NSObject, ObservableObject,
   static let focusCompletionSoundPreferenceKey =
     "focusCompletionSoundEnabled"
 
-  @Published private(set) var isEnabled: Bool
-  @Published private(set) var isRequestingAuthorization = false
-  @Published private(set) var approvalNotificationsEnabled: Bool
-  @Published private(set) var completionNotificationsEnabled: Bool
-  @Published private(set) var failureNotificationsEnabled: Bool
-  @Published private(set) var focusCompletionNotificationsEnabled: Bool
-  @Published private(set) var focusCompletionSoundEnabled: Bool
-  @Published private(set) var permissionMessage: String?
+  /// UserNotifications raises an exception outside an app bundle, such as
+  /// when the executable is launched with `swift run`.
+  nonisolated static var isNotificationCenterAvailable: Bool {
+    Bundle.main.bundleURL.pathExtension == "app"
+  }
+
+  private(set) var isEnabled: Bool
+  private(set) var isRequestingAuthorization = false
+  private(set) var approvalNotificationsEnabled: Bool
+  private(set) var completionNotificationsEnabled: Bool
+  private(set) var failureNotificationsEnabled: Bool
+  private(set) var focusCompletionNotificationsEnabled: Bool
+  private(set) var focusCompletionSoundEnabled: Bool
+  private(set) var permissionMessage: String?
 
   private let defaults: UserDefaults
   private let focusCompletionSoundPlayer: () -> Void
@@ -70,12 +77,17 @@ final class ActivityNotificationService: NSObject, ObservableObject,
       NSSound.beep()
     },
     authorizationRequester: @escaping AuthorizationRequester = { options, completion in
+      guard ActivityNotificationService.isNotificationCenterAvailable else {
+        completion(false, NotificationsUnavailableError())
+        return
+      }
       UNUserNotificationCenter.current().requestAuthorization(
         options: options,
         completionHandler: completion
       )
     },
     notificationDeliverer: @escaping NotificationDeliverer = { request in
+      guard ActivityNotificationService.isNotificationCenterAvailable else { return }
       UNUserNotificationCenter.current().add(request)
     }
   ) {
@@ -103,7 +115,7 @@ final class ActivityNotificationService: NSObject, ObservableObject,
       forKey: Self.focusCompletionSoundPreferenceKey
     )
     super.init()
-    if configuresNotificationCenter {
+    if configuresNotificationCenter, Self.isNotificationCenterAvailable {
       UNUserNotificationCenter.current().delegate = self
     }
   }
@@ -253,5 +265,11 @@ final class ActivityNotificationService: NSObject, ObservableObject,
     defaults.object(forKey: key) == nil
       ? true
       : defaults.bool(forKey: key)
+  }
+}
+
+private struct NotificationsUnavailableError: LocalizedError {
+  var errorDescription: String? {
+    "Notifications need the packaged app. Build it with ./scripts/package-app.sh."
   }
 }

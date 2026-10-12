@@ -2,7 +2,7 @@ import SwiftUI
 
 struct CompactMusicView: View {
   let snapshot: NowPlayingSnapshot
-  @ObservedObject var controller: MusicController
+  let controller: MusicController
   let hardwareNotchWidth: CGFloat
   let hardwareNotchHeight: CGFloat
   let hasPhysicalNotch: Bool
@@ -27,6 +27,10 @@ struct CompactMusicView: View {
     }
   }
 
+  private var accent: Color {
+    controller.artworkPalette?.accent ?? .pink
+  }
+
   private var physicalCompact: some View {
     HStack(spacing: 7) {
       MusicArtworkView(snapshot: snapshot, size: 19, cornerRadius: 5)
@@ -35,9 +39,8 @@ struct CompactMusicView: View {
       Color.clear
         .frame(width: max(hardwareNotchWidth - 18, 116))
 
-      Image(systemName: snapshot.isPlaying ? "waveform" : "pause.fill")
+      PlaybackIndicator(isPlaying: snapshot.isPlaying, tint: accent)
         .font(.caption.weight(.bold))
-        .dashboardTint(.pink)
         .frame(maxWidth: .infinity, alignment: .trailing)
     }
     .padding(.horizontal, 9)
@@ -50,7 +53,7 @@ struct CompactMusicView: View {
         HStack(spacing: 6) {
           Image(systemName: snapshot.source.symbolName)
             .font(.caption.weight(.semibold))
-            .dashboardTint(.pink)
+            .dashboardTint(accent)
           Text(snapshot.sourceName)
             .font(.caption.weight(.semibold))
         }
@@ -59,15 +62,15 @@ struct CompactMusicView: View {
         Color.clear
           .frame(width: max(hardwareNotchWidth - 18, 116))
 
-        Image(systemName: snapshot.isPlaying ? "waveform" : "pause.fill")
+        PlaybackIndicator(isPlaying: snapshot.isPlaying, tint: accent)
           .font(.caption.weight(.bold))
-          .dashboardTint(.pink)
           .frame(maxWidth: .infinity, alignment: .trailing)
       }
       .frame(height: max(hardwareNotchHeight - 5, 26))
 
       HStack(spacing: 9) {
         MusicArtworkView(snapshot: snapshot, size: 34, cornerRadius: 8)
+          .shadow(color: accent.opacity(0.45), radius: 8)
         trackLabels
         Spacer(minLength: 5)
         quickControls
@@ -94,9 +97,8 @@ struct CompactMusicView: View {
         .font(.callout.weight(.semibold))
         .lineLimit(1)
       Spacer(minLength: 5)
-      Image(systemName: snapshot.isPlaying ? "waveform" : "pause.fill")
+      PlaybackIndicator(isPlaying: snapshot.isPlaying, tint: accent)
         .font(.caption.weight(.bold))
-        .dashboardTint(.pink)
     }
     .padding(.horizontal, 9)
     .padding(.vertical, 6)
@@ -106,6 +108,7 @@ struct CompactMusicView: View {
     VStack(spacing: 5) {
       HStack(spacing: 9) {
         MusicArtworkView(snapshot: snapshot, size: 38, cornerRadius: 9)
+          .shadow(color: accent.opacity(0.45), radius: 8)
         trackLabels
         Spacer(minLength: 5)
         quickControls
@@ -142,22 +145,19 @@ struct CompactMusicView: View {
         Image(systemName: "backward.fill")
       }
       .buttonStyle(NotchCircularButtonStyle(size: 32, typography: .compact))
-      .focusable()
       .accessibilityLabel("Previous track")
       .disabled(!snapshot.supportsPrevious)
 
       Button(action: controller.togglePlayback) {
-        Image(systemName: snapshot.isPlaying ? "pause.fill" : "play.fill")
+        PlayPauseSymbol(isPlaying: snapshot.isPlaying)
       }
       .buttonStyle(NotchCircularButtonStyle(size: 36, isPrimary: true, typography: .compact))
-      .focusable()
       .accessibilityLabel(snapshot.isPlaying ? "Pause" : "Play")
 
       Button(action: controller.nextTrack) {
         Image(systemName: "forward.fill")
       }
       .buttonStyle(NotchCircularButtonStyle(size: 32, typography: .compact))
-      .focusable()
       .accessibilityLabel("Next track")
       .disabled(!snapshot.supportsNext)
     }

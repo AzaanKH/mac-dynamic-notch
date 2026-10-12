@@ -38,6 +38,8 @@ public struct ActivityEventRequest: Codable, Sendable {
   public var activityID: String
   public var source: String
   public var title: String
+  public var taskTitle: String?
+  public var workspace: String?
   public var state: ActivityState
   public var message: String?
   public var progress: Double?
@@ -52,11 +54,15 @@ public struct ActivityEventRequest: Codable, Sendable {
     message: String? = nil,
     progress: Double? = nil,
     actionURL: URL? = nil,
-    timestamp: Date? = nil
+    timestamp: Date? = nil,
+    taskTitle: String? = nil,
+    workspace: String? = nil
   ) {
     self.activityID = activityID
     self.source = source
     self.title = title
+    self.taskTitle = taskTitle
+    self.workspace = workspace
     self.state = state
     self.message = message
     self.progress = progress
@@ -68,6 +74,8 @@ public struct ActivityEventRequest: Codable, Sendable {
     case activityID = "activity_id"
     case source
     case title
+    case taskTitle = "task_title"
+    case workspace
     case state
     case message
     case progress
@@ -80,6 +88,8 @@ public struct ActivityEventRequest: Codable, Sendable {
     copy.activityID = activityID.trimmingCharacters(in: .whitespacesAndNewlines)
     copy.source = source.trimmingCharacters(in: .whitespacesAndNewlines)
     copy.title = title.trimmingCharacters(in: .whitespacesAndNewlines)
+    copy.taskTitle = taskTitle?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+    copy.workspace = workspace?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
     copy.message =
       message?
       .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -93,6 +103,12 @@ public struct ActivityEventRequest: Codable, Sendable {
     }
     guard !copy.title.isEmpty, copy.title.count <= 160 else {
       throw ActivityValidationError.invalidTitle
+    }
+    guard (copy.taskTitle?.count ?? 0) <= 160 else {
+      throw ActivityValidationError.invalidTaskTitle
+    }
+    guard (copy.workspace?.count ?? 0) <= 160 else {
+      throw ActivityValidationError.invalidWorkspace
     }
     guard (copy.message?.count ?? 0) <= 1_000 else {
       throw ActivityValidationError.messageTooLong
@@ -119,6 +135,8 @@ public enum ActivityValidationError: LocalizedError, Sendable {
   case invalidActivityID
   case invalidSource
   case invalidTitle
+  case invalidTaskTitle
+  case invalidWorkspace
   case messageTooLong
   case invalidProgress
   case invalidActionURL
@@ -131,6 +149,10 @@ public enum ActivityValidationError: LocalizedError, Sendable {
       "source must contain 1–80 characters"
     case .invalidTitle:
       "title must contain 1–160 characters"
+    case .invalidTaskTitle:
+      "task_title must not exceed 160 characters"
+    case .invalidWorkspace:
+      "workspace must not exceed 160 characters"
     case .messageTooLong:
       "message must not exceed 1,000 characters"
     case .invalidProgress:
@@ -164,6 +186,8 @@ public struct AIActivity: Codable, Identifiable, Sendable {
   public let id: String
   public var source: String
   public var title: String
+  public var taskTitle: String?
+  public var workspace: String?
   public var state: ActivityState
   public var message: String?
   public var progress: Double?
@@ -177,6 +201,8 @@ public struct AIActivity: Codable, Identifiable, Sendable {
     case id
     case source
     case title
+    case taskTitle = "task_title"
+    case workspace
     case state
     case message
     case progress
@@ -191,7 +217,9 @@ public struct AIActivity: Codable, Identifiable, Sendable {
     let timestamp = event.timestamp ?? now
     id = event.activityID
     source = event.source
-    title = event.title
+    taskTitle = event.taskTitle
+    workspace = event.workspace
+    title = event.taskTitle ?? event.title
     state = event.state
     message = event.message
     progress = event.progress
@@ -213,6 +241,8 @@ public struct AIActivity: Codable, Identifiable, Sendable {
     id = try container.decode(String.self, forKey: .id)
     source = try container.decode(String.self, forKey: .source)
     title = try container.decode(String.self, forKey: .title)
+    taskTitle = try container.decodeIfPresent(String.self, forKey: .taskTitle)
+    workspace = try container.decodeIfPresent(String.self, forKey: .workspace)
     state = try container.decode(ActivityState.self, forKey: .state)
     message = try container.decodeIfPresent(String.self, forKey: .message)
     progress = try container.decodeIfPresent(Double.self, forKey: .progress)
@@ -230,6 +260,8 @@ public struct AIActivity: Codable, Identifiable, Sendable {
     try container.encode(id, forKey: .id)
     try container.encode(source, forKey: .source)
     try container.encode(title, forKey: .title)
+    try container.encodeIfPresent(taskTitle, forKey: .taskTitle)
+    try container.encodeIfPresent(workspace, forKey: .workspace)
     try container.encode(state, forKey: .state)
     try container.encodeIfPresent(message, forKey: .message)
     try container.encodeIfPresent(progress, forKey: .progress)
@@ -252,10 +284,15 @@ public struct AIActivity: Codable, Identifiable, Sendable {
       : timestamp
     lastHeartbeatAt = max(lastHeartbeatAt, now)
 
+    let resolvedTaskTitle = event.taskTitle ?? taskTitle
+    let resolvedTitle = resolvedTaskTitle ?? event.title
+    let resolvedWorkspace = event.workspace ?? workspace
     let resolvedActionURL = event.actionURL ?? actionURL
     let hasVisibleChanges =
       source != event.source
-      || title != event.title
+      || title != resolvedTitle
+      || taskTitle != resolvedTaskTitle
+      || workspace != resolvedWorkspace
       || state != event.state
       || message != event.message
       || progress != event.progress
@@ -278,7 +315,9 @@ public struct AIActivity: Codable, Identifiable, Sendable {
     }
 
     source = event.source
-    title = event.title
+    title = resolvedTitle
+    taskTitle = resolvedTaskTitle
+    workspace = resolvedWorkspace
     state = event.state
     message = event.message
     progress = event.progress

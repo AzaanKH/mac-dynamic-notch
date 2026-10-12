@@ -1,4 +1,5 @@
-import Combine
+import AppKit
+import Observation
 import CoreWLAN
 import Darwin
 import Dispatch
@@ -50,21 +51,27 @@ enum ConnectionTestState: Equatable, Sendable {
 }
 
 @MainActor
-final class SystemMonitorController: ObservableObject {
+@Observable
+final class SystemMonitorController {
   static let enabledPreferenceKey = "systemSectionEnabled"
 
-  @Published private(set) var isEnabled: Bool
-  @Published private(set) var system = SystemSnapshot()
-  @Published private(set) var network = NetworkSnapshot()
-  @Published private(set) var connectionTest: ConnectionTestState = .idle
+  private(set) var isEnabled: Bool
+  private(set) var system = SystemSnapshot()
+  private(set) var network = NetworkSnapshot()
+  private(set) var connectionTest: ConnectionTestState = .idle
 
   private let defaults: UserDefaults
-  nonisolated(unsafe) private var timer: Timer?
-  private var interval: TimeInterval = 2
-  private var pathMonitor: NWPathMonitor?
+  private let lowPowerMode: () -> Bool
+  private let workspaceNotificationCenter = NSWorkspace.shared.notificationCenter
+  @ObservationIgnored nonisolated(unsafe) private var timer: Timer?
+  private var isSystemSectionVisible = false
+  private var isDisplaySleeping = false
+  var samplingInterval: TimeInterval? { timer?.timeInterval }
+  @ObservationIgnored private var pathMonitor: NWPathMonitor?
   private let pathQueue = DispatchQueue(label: "com.notchrouter.network-path")
-  private var memoryPressureSource: (any DispatchSourceMemoryPressure)?
-  nonisolated(unsafe) private var notificationObservers: [NSObjectProtocol] = []
+  @ObservationIgnored private var memoryPressureSource: (any DispatchSourceMemoryPressure)?
+  @ObservationIgnored nonisolated(unsafe) private var notificationObservers: [NSObjectProtocol] = []
+  @ObservationIgnored nonisolated(unsafe) private var workspaceObservers: [NSObjectProtocol] = []
   private var previousCPUTicks: CPUTicks?
   private var previousNetworkCounters: InterfaceCounters?
   private var previousNetworkSampleUptime: TimeInterval?
@@ -72,10 +79,22 @@ final class SystemMonitorController: ObservableObject {
   private var pathHasVPN = false
   private var receivedSinceLaunch: UInt64 = 0
   private var sentSinceLaunch: UInt64 = 0
-  private var connectionTestTask: Task<Void, Never>?
+  @ObservationIgnored private var connectionTestTask: Task<Void, Never>?
+  @ObservationIgnored private var diskRefreshTask: Task<Void, Never>?
+  @ObservationIgnored private var sampleTask: Task<Void, Never>?
+  private var pathUsesWiFi = false
+  private var pathGeneration: UInt = 0
+  private var previousWiFiRefreshUptime: TimeInterval?
+  private var previousDiskRefreshUptime: TimeInterval?
 
-  init(defaults: UserDefaults = .standard) {
+  private static let diskRefreshInterval: TimeInterval = 30
+
+  init(
+    defaults: UserDefaults = .standard,
+    lowPowerMode: @escaping () -> Bool = { ProcessInfo.processInfo.isLowPowerModeEnabled }
+  ) {
     self.defaults = defaults
+    self.lowPowerMode = lowPowerMode
     isEnabled = defaults.bool(forKey: Self.enabledPreferenceKey)
 
     notificationObservers = [
@@ -95,6 +114,19 @@ final class SystemMonitorController: ObservableObject {
       },
     ]
 
+    workspaceObservers = [
+      workspaceNotificationCenter.addObserver(
+        forName: NSWorkspace.screensDidSleepNotification, object: nil, queue: .main
+      ) { [weak self] _ in
+        Task { @MainActor in self?.setDisplaySleeping(true) }
+      },
+      workspaceNotificationCenter.addObserver(
+        forName: NSWorkspace.screensDidWakeNotification, object: nil, queue: .main
+      ) { [weak self] _ in
+        Task { @MainActor in self?.setDisplaySleeping(false) }
+      },
+    ]
+
     if isEnabled {
       start()
     }
@@ -105,8 +137,13 @@ final class SystemMonitorController: ObservableObject {
     pathMonitor?.cancel()
     memoryPressureSource?.cancel()
     connectionTestTask?.cancel()
+    diskRefreshTask?.cancel()
+    sampleTask?.cancel()
     for observer in notificationObservers {
       NotificationCenter.default.removeObserver(observer)
+    }
+    for observer in workspaceObservers {
+      workspaceNotificationCenter.removeObserver(observer)
     }
   }
 
@@ -121,13 +158,25 @@ final class SystemMonitorController: ObservableObject {
     }
   }
 
-  func setSurfaceMode(_ mode: SurfaceMode) {
-    let newInterval: TimeInterval = mode == .expanded ? 1 : 2
-    guard newInterval != interval else { return }
-    interval = newInterval
-    if isEnabled {
-      scheduleTimer()
+  func setPresentation(mode: SurfaceMode, section: NotchSection, isVisible: Bool = true) {
+    let visible = isVisible && mode == .expanded && section == .system
+    guard visible != isSystemSectionVisible else { return }
+    isSystemSectionVisible = visible
+    scheduleTimer()
+    if visible { refresh() }
+  }
+
+  func setDisplaySleeping(_ sleeping: Bool) {
+    guard sleeping != isDisplaySleeping else { return }
+    isDisplaySleeping = sleeping
+    if sleeping {
+      sampleTask?.cancel()
+      sampleTask = nil
+      diskRefreshTask?.cancel()
+      diskRefreshTask = nil
     }
+    scheduleTimer()
+    if !sleeping { refresh() }
   }
 
   func testConnection() {
@@ -140,6 +189,7 @@ final class SystemMonitorController: ObservableObject {
         configuration.timeoutIntervalForRequest = 10
         configuration.waitsForConnectivity = false
         let session = URLSession(configuration: configuration)
+        defer { session.finishTasksAndInvalidate() }
         var request = URLRequest(
           url: URL(string: "https://www.apple.com/library/test/success.html")!
         )
@@ -171,15 +221,42 @@ final class SystemMonitorController: ObservableObject {
   }
 
   func refresh() {
-    guard isEnabled else { return }
-    refreshSystemSample()
-    refreshNetworkSample()
+    guard isEnabled, !isDisplaySleeping, sampleTask == nil else { return }
+    let interfaceNames = monitoredInterfaceNames
+    let generation = pathGeneration
+    let uptime = ProcessInfo.processInfo.systemUptime
+    let includesWiFi = pathUsesWiFi
+      && (previousWiFiRefreshUptime.map { uptime - $0 >= 10 } ?? true)
+    if includesWiFi { previousWiFiRefreshUptime = uptime }
+    refreshDiskSampleIfNeeded()
+    sampleTask = Task { [weak self] in
+      let sample = await Task.detached(priority: .utility) {
+        SystemMonitorSample(
+          cpuTicks: Self.readCPUTicks(),
+          memory: Self.readMemoryUsage(),
+          counters: Self.readInterfaceCounters(restrictedTo: interfaceNames),
+          wifiSignal: includesWiFi ? Self.wifiSignalStrength() : nil,
+          uptime: ProcessInfo.processInfo.systemUptime
+        )
+      }.value
+      guard !Task.isCancelled, let self else { return }
+      self.sampleTask = nil
+      guard self.isEnabled, generation == self.pathGeneration else { return }
+      self.applySample(sample, includesWiFi: includesWiFi)
+    }
+  }
+
+  func applySample(_ sample: SystemMonitorSample, includesWiFi: Bool) {
+    refreshSystemSample(sample)
+    refreshNetworkSample(sample, includesWiFi: includesWiFi)
   }
 
   private func start() {
     previousCPUTicks = nil
     previousNetworkCounters = nil
     previousNetworkSampleUptime = nil
+    previousDiskRefreshUptime = nil
+    previousWiFiRefreshUptime = nil
     receivedSinceLaunch = 0
     sentSinceLaunch = 0
     refreshProcessState()
@@ -198,24 +275,38 @@ final class SystemMonitorController: ObservableObject {
     memoryPressureSource = nil
     connectionTestTask?.cancel()
     connectionTestTask = nil
+    diskRefreshTask?.cancel()
+    diskRefreshTask = nil
+    sampleTask?.cancel()
+    sampleTask = nil
+    pathGeneration &+= 1
+    previousDiskRefreshUptime = nil
     connectionTest = .idle
   }
 
   private func scheduleTimer() {
+    let interval: TimeInterval? = if !isEnabled || isDisplaySleeping {
+      nil
+    } else if isSystemSectionVisible {
+      system.isLowPowerModeEnabled ? 2 : 1
+    } else {
+      10
+    }
+    guard interval != samplingInterval else { return }
     timer?.invalidate()
-    let timer = Timer(
-      timeInterval: interval,
-      target: self,
-      selector: #selector(timerFired),
-      userInfo: nil,
-      repeats: true
-    )
-    timer.tolerance = min(interval * 0.15, 0.25)
+    timer = nil
+    guard let interval else { return }
+    let timer = Timer(timeInterval: interval, repeats: true) { [weak self] _ in
+      MainActor.assumeIsolated {
+        self?.timerFired()
+      }
+    }
+    timer.tolerance = interval * 0.15
     RunLoop.main.add(timer, forMode: .common)
     self.timer = timer
   }
 
-  @objc private func timerFired() {
+  private func timerFired() {
     refresh()
   }
 
@@ -238,14 +329,12 @@ final class SystemMonitorController: ObservableObject {
       queue: .main
     )
     source.setEventHandler { [weak self] in
-      guard let self, let source = self.memoryPressureSource else { return }
-      let data = source.data
-      if data.contains(.critical) {
-        self.system.memoryPressure = .critical
-      } else if data.contains(.warning) {
-        self.system.memoryPressure = .warning
-      } else {
-        self.system.memoryPressure = .normal
+      Task { @MainActor [weak self] in
+        guard let self, let source = self.memoryPressureSource else { return }
+        let data = source.data
+        let pressure: MemoryPressureLevel = data.contains(.critical) ? .critical
+          : data.contains(.warning) ? .warning : .normal
+        if self.system.memoryPressure != pressure { self.system.memoryPressure = pressure }
       }
     }
     memoryPressureSource = source
@@ -253,56 +342,92 @@ final class SystemMonitorController: ObservableObject {
   }
 
   private func apply(_ path: NetworkPathState) {
-    if path.interfaceNames != monitoredInterfaceNames {
+    pathGeneration &+= 1
+    if path.interfaceNames != monitoredInterfaceNames || path.isOnline != network.isOnline {
       monitoredInterfaceNames = path.interfaceNames
       previousNetworkCounters = nil
       previousNetworkSampleUptime = nil
+      previousWiFiRefreshUptime = nil
     }
-    network.isOnline = path.isOnline
-    network.interfaceName = path.interfaceName
-    network.hasVPN = path.hasVPN
+    var updated = network
+    updated.isOnline = path.isOnline
+    updated.interfaceName = path.interfaceName
+    updated.hasVPN = path.hasVPN
     pathHasVPN = path.hasVPN
-    network.isConstrained = path.isConstrained
-    network.isExpensive = path.isExpensive
-    network.wifiSignal = path.usesWiFi ? wifiSignalStrength() : nil
+    pathUsesWiFi = path.usesWiFi
+    updated.isConstrained = path.isConstrained
+    updated.isExpensive = path.isExpensive
+    if !path.usesWiFi { updated.wifiSignal = nil }
     if !path.isOnline {
-      network.downloadBytesPerSecond = 0
-      network.uploadBytesPerSecond = 0
+      updated.downloadBytesPerSecond = 0
+      updated.uploadBytesPerSecond = 0
       if connectionTest == .testing {
         connectionTestTask?.cancel()
         connectionTest = .failed("The connection went offline during the test.")
       }
     }
+    if updated != network { network = updated }
   }
 
-  private func refreshSystemSample() {
-    if let ticks = Self.readCPUTicks() {
+  private func refreshSystemSample(_ sample: SystemMonitorSample) {
+    var updated = system
+    if let ticks = sample.cpuTicks {
       if let previousCPUTicks {
         if ticks.used >= previousCPUTicks.used,
           ticks.total >= previousCPUTicks.total
         {
           let usedDelta = ticks.used - previousCPUTicks.used
           let totalDelta = ticks.total - previousCPUTicks.total
-          system.cpuUsage = totalDelta > 0
-            ? min(max(Double(usedDelta) / Double(totalDelta), 0), 1)
-            : 0
+          if totalDelta > 0 {
+            updated.cpuUsage = min(max(Double(usedDelta) / Double(totalDelta), 0), 1)
+          }
         }
       }
       previousCPUTicks = ticks
     }
 
-    if let memory = Self.readMemoryUsage() {
-      system.memoryUsed = memory.used
-      system.memoryTotal = memory.total
+    if let memory = sample.memory {
+      updated.memoryUsed = memory.used
+      updated.memoryTotal = memory.total
     }
-    if let disk = Self.readDiskUsage() {
-      system.diskFree = disk.free
-      system.diskTotal = disk.total
+    updateProcessState(&updated)
+    if updated != system { system = updated }
+    scheduleTimer()
+  }
+
+  private func refreshDiskSampleIfNeeded() {
+    guard diskRefreshTask == nil else { return }
+    let uptime = ProcessInfo.processInfo.systemUptime
+    if let previousDiskRefreshUptime,
+      uptime - previousDiskRefreshUptime < Self.diskRefreshInterval
+    {
+      return
     }
-    refreshProcessState()
+    previousDiskRefreshUptime = uptime
+
+    diskRefreshTask = Task { [weak self] in
+      let disk = await Task.detached(priority: .utility) {
+        Self.readDiskUsage()
+      }.value
+      guard !Task.isCancelled, let self else { return }
+      self.diskRefreshTask = nil
+      guard self.isEnabled, let disk else { return }
+      var updated = self.system
+      updated.diskFree = disk.free
+      updated.diskTotal = disk.total
+      if updated != self.system { self.system = updated }
+    }
   }
 
   private func refreshProcessState() {
+    guard isEnabled else { return }
+    var updated = system
+    updateProcessState(&updated)
+    if updated != system { system = updated }
+    scheduleTimer()
+  }
+
+  private func updateProcessState(_ system: inout SystemSnapshot) {
     system.thermalCondition = switch ProcessInfo.processInfo.thermalState {
     case .nominal: .nominal
     case .fair: .fair
@@ -310,16 +435,16 @@ final class SystemMonitorController: ObservableObject {
     case .critical: .critical
     @unknown default: .fair
     }
-    system.isLowPowerModeEnabled = ProcessInfo.processInfo.isLowPowerModeEnabled
+    system.isLowPowerModeEnabled = lowPowerMode()
   }
 
-  private func refreshNetworkSample() {
-    guard
-      let counters = Self.readInterfaceCounters(
-        restrictedTo: monitoredInterfaceNames
-      )
-    else { return }
-    let uptime = ProcessInfo.processInfo.systemUptime
+  private func refreshNetworkSample(_ sample: SystemMonitorSample, includesWiFi: Bool) {
+    var updated = network
+    if includesWiFi { updated.wifiSignal = sample.wifiSignal }
+    defer { if updated != network { network = updated } }
+    guard let counters = sample.counters else { return }
+    updated.hasVPN = pathHasVPN || counters.hasVPN
+    let uptime = sample.uptime
     defer {
       previousNetworkCounters = counters
       previousNetworkSampleUptime = uptime
@@ -338,24 +463,21 @@ final class SystemMonitorController: ObservableObject {
       : 0
     receivedSinceLaunch &+= receivedDelta
     sentSinceLaunch &+= sentDelta
-    network.downloadBytesPerSecond = Double(receivedDelta) / elapsed
-    network.uploadBytesPerSecond = Double(sentDelta) / elapsed
-    network.receivedSinceLaunch = receivedSinceLaunch
-    network.sentSinceLaunch = sentSinceLaunch
-    network.hasVPN = pathHasVPN || counters.hasVPN
-    if network.wifiSignal != nil {
-      network.wifiSignal = wifiSignalStrength()
-    }
+    updated.downloadBytesPerSecond = Double(receivedDelta) / elapsed
+    updated.uploadBytesPerSecond = Double(sentDelta) / elapsed
+    updated.receivedSinceLaunch = receivedSinceLaunch
+    updated.sentSinceLaunch = sentSinceLaunch
+
   }
 
-  private func wifiSignalStrength() -> Int? {
+  nonisolated private static func wifiSignalStrength() -> Int? {
     guard let rssi = CWWiFiClient.shared().interface()?.rssiValue(), rssi < 0 else {
       return nil
     }
     return rssi
   }
 
-  private static func readCPUTicks() -> CPUTicks? {
+  nonisolated private static func readCPUTicks() -> CPUTicks? {
     var load = host_cpu_load_info()
     var count = mach_msg_type_number_t(
       MemoryLayout<host_cpu_load_info_data_t>.size
@@ -377,7 +499,7 @@ final class SystemMonitorController: ObservableObject {
     return CPUTicks(used: user + system + nice, total: user + system + idle + nice)
   }
 
-  private static func readMemoryUsage() -> (used: UInt64, total: UInt64)? {
+  nonisolated private static func readMemoryUsage() -> (used: UInt64, total: UInt64)? {
     var statistics = vm_statistics64()
     var count = mach_msg_type_number_t(
       MemoryLayout<vm_statistics64_data_t>.size
@@ -405,7 +527,7 @@ final class SystemMonitorController: ObservableObject {
     return (total - available, total)
   }
 
-  private static func readDiskUsage() -> (free: Int64, total: Int64)? {
+  nonisolated private static func readDiskUsage() -> (free: Int64, total: Int64)? {
     do {
       let values = try URL(fileURLWithPath: "/").resourceValues(
         forKeys: [
@@ -422,7 +544,7 @@ final class SystemMonitorController: ObservableObject {
     }
   }
 
-  private static func readInterfaceCounters(
+  nonisolated private static func readInterfaceCounters(
     restrictedTo interfaceNames: Set<String>
   ) -> InterfaceCounters? {
     var firstAddress: UnsafeMutablePointer<ifaddrs>?
@@ -457,12 +579,20 @@ final class SystemMonitorController: ObservableObject {
   }
 }
 
-private struct CPUTicks {
+struct SystemMonitorSample: Sendable {
+  var cpuTicks: CPUTicks?
+  var memory: (used: UInt64, total: UInt64)?
+  var counters: InterfaceCounters?
+  var wifiSignal: Int?
+  var uptime: TimeInterval
+}
+
+struct CPUTicks: Sendable {
   let used: UInt64
   let total: UInt64
 }
 
-private struct InterfaceCounters {
+struct InterfaceCounters: Sendable {
   let received: UInt64
   let sent: UInt64
   let hasVPN: Bool

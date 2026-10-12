@@ -1,4 +1,4 @@
-import Combine
+import Observation
 import Foundation
 
 enum FocusTimerPhase: String, Codable, Sendable {
@@ -14,16 +14,17 @@ enum FocusTimerPresentationEvent: Equatable, Sendable {
 }
 
 @MainActor
-final class FocusTimerController: ObservableObject {
+@Observable
+final class FocusTimerController {
   static let defaultDurationMinutes = 25
   static let presetDurations = [15, 25, 50]
-  static let tickInterval: Duration = .seconds(1)
+  private static let tickInterval: Duration = .seconds(1)
 
-  @Published private(set) var phase: FocusTimerPhase = .idle
-  @Published private(set) var selectedDurationMinutes = defaultDurationMinutes
-  @Published private(set) var durationSeconds: TimeInterval =
+  private(set) var phase: FocusTimerPhase = .idle
+  private(set) var selectedDurationMinutes = defaultDurationMinutes
+  private(set) var durationSeconds: TimeInterval =
     TimeInterval(defaultDurationMinutes * 60)
-  @Published private(set) var remainingSeconds: TimeInterval =
+  private(set) var remainingSeconds: TimeInterval =
     TimeInterval(defaultDurationMinutes * 60)
 
   var onChange: ((FocusTimerPresentationEvent) -> Void)?

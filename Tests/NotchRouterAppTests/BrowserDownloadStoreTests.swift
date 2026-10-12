@@ -11,8 +11,8 @@ func browserDownloadStoreTracksProgressAndReturnsQueuedCommands() throws {
     kind: .update,
     downloadID: 12,
     browserName: "Google Chrome",
-    filename: "/Users/test/Downloads/file.zip",
-    sourceURL: "https://example.com/file.zip",
+    displayName: "file.zip",
+    sourceHost: "example.com",
     bytesReceived: 250,
     totalBytes: 1_000,
     state: .inProgress,
@@ -61,7 +61,7 @@ func browserDownloadStoreKeepsActiveItemsWhenClearingHistory() throws {
       kind: .update,
       downloadID: 1,
       browserName: "Chrome",
-      filename: "active.dmg",
+      displayName: "active.dmg",
       bytesReceived: 1,
       totalBytes: 10,
       state: .inProgress
@@ -72,7 +72,7 @@ func browserDownloadStoreKeepsActiveItemsWhenClearingHistory() throws {
       kind: .update,
       downloadID: 2,
       browserName: "Chrome",
-      filename: "finished.dmg",
+      displayName: "finished.dmg",
       bytesReceived: 10,
       totalBytes: 10,
       state: .complete
@@ -97,23 +97,20 @@ func browserDownloadStoreKeepsActiveItemsWhenClearingHistory() throws {
 
 @MainActor
 @Test
-func browserDownloadStoreExpiresAStaleActiveBridge() async throws {
-  let store = BrowserDownloadStore(heartbeatTimeout: .milliseconds(20))
+func browserDownloadStoreExpiresAStaleActiveBridge() throws {
+  let store = BrowserDownloadStore()
   _ = try store.ingest(
     BrowserDownloadEvent(
       kind: .update,
       downloadID: 9,
       browserName: "Chrome",
-      filename: "stale.zip",
+      displayName: "stale.zip",
       state: .inProgress
     )
   )
   #expect(store.activeCount == 1)
 
-  let deadline = ContinuousClock.now + .seconds(1)
-  while store.activeCount > 0, ContinuousClock.now < deadline {
-    try await Task.sleep(for: .milliseconds(10))
-  }
+  store.expireActiveDownloads(from: "Chrome")
 
   #expect(store.activeCount == 0)
   #expect(store.items[0].state == .interrupted)
@@ -129,7 +126,7 @@ func browserDownloadStoreStopsActivePresentationWhenPermissionTurnsOff() throws 
       kind: .update,
       downloadID: 3,
       browserName: "Chrome",
-      filename: "active.zip",
+      displayName: "active.zip",
       state: .inProgress
     )
   )

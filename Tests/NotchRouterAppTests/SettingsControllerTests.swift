@@ -132,6 +132,7 @@ func systemSectionDefaultsOffAndPersistsOptIn() {
 
   controller.setEnabled(false)
   #expect(!controller.isEnabled)
+  #expect(!defaults.bool(forKey: SystemMonitorController.enabledPreferenceKey))
 }
 
 @MainActor
@@ -209,4 +210,27 @@ func focusCompletionSoundCanPlayWithoutSystemNotifications() {
 
   #expect(!service.isEnabled)
   #expect(playCount == 1)
+}
+
+@Test
+func installedHelpersAreStaleOnlyWhenTheyDifferFromTheBundledCopy() throws {
+  let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+  try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+  defer { try? FileManager.default.removeItem(at: directory) }
+  let bundled = directory.appendingPathComponent("bundled")
+  let installed = directory.appendingPathComponent("installed")
+  try Data("helper v2".utf8).write(to: bundled)
+
+  try Data("helper v2".utf8).write(to: installed)
+  #expect(!IntegrationSettingsController.helperIsStale(installed: installed, bundled: bundled))
+
+  // An app update shipped a new helper; the copy installed earlier is outdated.
+  try Data("helper v1".utf8).write(to: installed)
+  #expect(IntegrationSettingsController.helperIsStale(installed: installed, bundled: bundled))
+
+  try FileManager.default.removeItem(at: installed)
+  #expect(IntegrationSettingsController.helperIsStale(installed: installed, bundled: bundled))
+
+  // Without a bundled copy to compare against, do not warn.
+  #expect(!IntegrationSettingsController.helperIsStale(installed: installed, bundled: nil))
 }

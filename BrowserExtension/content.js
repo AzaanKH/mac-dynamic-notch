@@ -1,3 +1,5 @@
+const extensionAPI = typeof browser !== "undefined" ? browser : chrome;
+const documentSessionID = crypto.randomUUID();
 const MEDIA_EVENTS = [
   "play",
   "playing",
@@ -7,6 +9,7 @@ const MEDIA_EVENTS = [
   "loadedmetadata",
   "durationchange",
   "seeked",
+  "ratechange",
 ];
 
 let activeMedia = null;
@@ -16,6 +19,67 @@ let lastSentAt = 0;
 let reportedMedia = false;
 let sendTimer = null;
 const observedMedia = new WeakSet();
+const knownMedia = new Set();
+const rootObservers = new Map();
+const pendingSubtrees = new Set();
+let discoveryTimer = null;
+let pendingForce = false;
+let heartbeatTimer = null;
+let reconciliationTimer = null;
+let commandTimer = null;
+let isPageActive = true;
+
+function pruneDiscovery() {
+  for (const media of knownMedia) {
+    if (!media.isConnected) knownMedia.delete(media);
+  }
+  for (const [root, observer] of rootObservers) {
+    if (root !== document && !root.host?.isConnected) {
+      observer.disconnect();
+      rootObservers.delete(root);
+    }
+  }
+}
+
+function observeRoot(root) {
+  if (rootObservers.has(root)) return;
+  const observer = new MutationObserver((records) => {
+    if (!isPageActive) return;
+    for (const record of records) {
+      for (const node of record.addedNodes) {
+        if (node.nodeType === 1) pendingSubtrees.add(node);
+      }
+    }
+    if (discoveryTimer !== null) return;
+    discoveryTimer = setTimeout(() => {
+      discoveryTimer = null;
+      const subtrees = new Set(pendingSubtrees);
+      pendingSubtrees.clear();
+      for (const node of subtrees) {
+        let ancestor = node.parentNode;
+        while (ancestor && !subtrees.has(ancestor)) ancestor = ancestor.parentNode || ancestor.host;
+        if (node.isConnected && !ancestor) discoverSubtree(node);
+      }
+      pruneDiscovery();
+      if (knownMedia.size || reportedMedia) scheduleSnapshot();
+    }, 100);
+  });
+  observer.observe(root, { childList: true, subtree: true });
+  rootObservers.set(root, observer);
+}
+
+function discoverSubtree(root) {
+  if (root === document || root.host) observeRoot(root);
+  function visit(element) {
+    if (element.matches?.("audio, video")) {
+      knownMedia.add(element);
+      observeMedia(element);
+    }
+    if (element.shadowRoot) discoverSubtree(element.shadowRoot);
+  }
+  if (root.nodeType === 1) visit(root);
+  for (const element of root.querySelectorAll("*")) visit(element);
+}
 
 function metaContent(selectors) {
   for (const selector of selectors) {
@@ -40,8 +104,14 @@ function mediaSessionMetadata() {
   }
 }
 
+// Controls are queried only within roots already found by incremental discovery.
+function queryMediaRoots(selector) {
+  return [...rootObservers.keys()].flatMap(root => [...root.querySelectorAll(selector)]);
+}
+
 function mediaElements() {
-  return [...document.querySelectorAll("audio, video")].filter((media) => {
+  pruneDiscovery();
+  return [...knownMedia].filter((media) => {
     return !media.ended
       && media.readyState > 0
       && (media.duration > 0 || media.duration === Infinity);
@@ -79,7 +149,7 @@ function matchingButton(direction) {
       ".skipControl__previous",
     ];
   for (const selector of knownSelectors) {
-    const element = document.querySelector(selector);
+    const element = queryMediaRoots(selector)[0];
     if (element && !element.disabled && element.getAttribute("aria-disabled") !== "true") {
       return element;
     }
@@ -89,7 +159,7 @@ function matchingButton(direction) {
     ? /^(next|skip)\s+(track|video|episode|song)(?:\s*\(.+\))?$/i
     : /^(previous|back)\s+(track|video|episode|song)(?:\s*\(.+\))?$/i;
 
-  return [...document.querySelectorAll("button, [role='button']")].find((element) => {
+  return queryMediaRoots("button, [role='button']").find((element) => {
     if (element.disabled || element.getAttribute("aria-disabled") === "true") return false;
     const label = (
       element.getAttribute("aria-label") ||
@@ -111,6 +181,175 @@ function absoluteHTTPURL(value) {
   }
 }
 
+let artworkRequestURL = null;
+let artworkData = null;
+let artworkAbort = null;
+let artworkFailures = 0;
+let artworkRetryAt = 0;
+
+// Pixel dimensions from a PNG, GIF, WebP, or JPEG header, or null when the
+// format is not recognized. JPEG dimensions follow the EXIF orientation that
+// createImageBitmap applies, so crops line up with the decoded image.
+function imageDimensions(bytes) {
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const has = (at, text) => at + text.length <= bytes.length
+    && [...text].every((character, index) => bytes[at + index] === character.charCodeAt(0));
+  if (bytes.length >= 24 && bytes[0] === 0x89 && has(1, "PNG") && has(12, "IHDR")) {
+    return { width: view.getUint32(16), height: view.getUint32(20) };
+  }
+  if (bytes.length >= 10 && has(0, "GIF8")) {
+    return { width: view.getUint16(6, true), height: view.getUint16(8, true) };
+  }
+  if (has(0, "RIFF") && has(8, "WEBP")) {
+    if (has(12, "VP8X") && bytes.length >= 31) {
+      return {
+        width: 1 + (view.getUint32(24, true) & 0xffffff),
+        height: 1 + (view.getUint32(27, true) & 0xffffff),
+      };
+    }
+    if (has(12, "VP8 ") && bytes.length >= 30) {
+      return { width: view.getUint16(26, true) & 0x3fff, height: view.getUint16(28, true) & 0x3fff };
+    }
+    if (has(12, "VP8L") && bytes.length >= 25) {
+      const bits = view.getUint32(21, true);
+      return { width: (bits & 0x3fff) + 1, height: ((bits >>> 14) & 0x3fff) + 1 };
+    }
+    return null;
+  }
+  if (bytes.length >= 4 && bytes[0] === 0xff && bytes[1] === 0xd8) {
+    let at = 2;
+    let orientation = 1;
+    while (at + 9 <= bytes.length) {
+      if (bytes[at] !== 0xff) return null;
+      const marker = bytes[at + 1];
+      if (marker === 0xff) { at += 1; continue; }
+      const length = view.getUint16(at + 2);
+      if (marker === 0xe1) orientation = exifOrientation(view, at + 4, at + 2 + length) ?? orientation;
+      // Start-of-frame markers carry the dimensions; C4, C8, and CC do not.
+      if (marker >= 0xc0 && marker <= 0xcf && ![0xc4, 0xc8, 0xcc].includes(marker)) {
+        const width = view.getUint16(at + 7);
+        const height = view.getUint16(at + 5);
+        // Orientations 5–8 rotate by 90°, swapping the decoded dimensions.
+        return orientation >= 5 && orientation <= 8 ? { width: height, height: width } : { width, height };
+      }
+      at += 2 + length;
+    }
+  }
+  return null;
+}
+
+// The EXIF orientation tag from an APP1 segment spanning [start, end), or null.
+function exifOrientation(view, start, end) {
+  const limit = Math.min(end, view.byteLength);
+  const exif = [0x45, 0x78, 0x69, 0x66, 0, 0];
+  if (start + 14 > limit || exif.some((byte, index) => view.getUint8(start + index) !== byte)) return null;
+  const tiff = start + 6;
+  const order = view.getUint16(tiff);
+  if (order !== 0x4949 && order !== 0x4d4d) return null;
+  const little = order === 0x4949;
+  const ifd = tiff + view.getUint32(tiff + 4, little);
+  if (ifd + 2 > limit) return null;
+  const entries = view.getUint16(ifd, little);
+  for (let index = 0; index < entries; index++) {
+    const entry = ifd + 2 + index * 12;
+    if (entry + 12 > limit) return null;
+    if (view.getUint16(entry, little) === 0x0112) return view.getUint16(entry + 8, little);
+  }
+  return null;
+}
+
+// Fetch in the content script so browser CORS and local-network restrictions apply.
+// Native code receives only a bounded thumbnail, never an address to fetch.
+async function fetchArtworkThumbnail(url, signal) {
+  const response = await fetch(url, { credentials: "omit", redirect: "error", signal });
+  const limit = 2 * 1024 * 1024;
+  if (!response.ok || !response.body) return null;
+  if (Number(response.headers.get("content-length")) > limit) {
+    await response.body.cancel();
+    return null;
+  }
+  const reader = response.body.getReader();
+  const chunks = [];
+  let count = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      count += value.byteLength;
+      if (count > limit) return null;
+      chunks.push(value);
+    }
+  } finally { await reader.cancel(); }
+  if (signal.aborted) return null;
+  const bytes = new Uint8Array(count);
+  let offset = 0;
+  for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+  // Check the size from the header, before any pixels are decoded. Formats
+  // whose size cannot be read first (BMP, AVIF, SVG, ...) are rejected, since
+  // their decoded size is unbounded; the notch shows its fallback icon.
+  const size = imageDimensions(bytes);
+  if (!size || size.width <= 0 || size.height <= 0 || size.width * size.height > 16_000_000) {
+    return null;
+  }
+  // Crop to a centered square while decoding, as the notch displays covers, so
+  // wide video thumbnails are cropped instead of stretched.
+  const side = Math.min(size.width, size.height);
+  const bitmap = await createImageBitmap(
+    new Blob([bytes]),
+    Math.floor((size.width - side) / 2),
+    Math.floor((size.height - side) / 2),
+    side,
+    side,
+    { resizeWidth: 256, resizeHeight: 256, resizeQuality: "medium" },
+  );
+  try {
+    const canvas = new OffscreenCanvas(256, 256);
+    canvas.getContext("2d").drawImage(bitmap, 0, 0, 256, 256);
+    const thumbnail = await canvas.convertToBlob({ type: "image/jpeg", quality: 0.75 });
+    if (thumbnail.size > 32768 || signal.aborted) return null;
+    const bytes = new Uint8Array(await thumbnail.arrayBuffer());
+    return btoa(String.fromCharCode(...bytes));
+  } finally { bitmap.close(); }
+}
+
+function artworkRetryDelay(failures) {
+  return Math.min(15000 * 2 ** (failures - 1), 600000);
+}
+
+function updateArtwork(url, { force = false } = {}) {
+  if (url === artworkRequestURL) {
+    // Snapshots repeat the same image. Retry only a failed request, once its
+    // backoff has elapsed (or immediately when connectivity returns).
+    if (!url || artworkData || artworkAbort || (!force && Date.now() < artworkRetryAt)) return;
+  } else {
+    artworkAbort?.abort();
+    artworkAbort = null;
+    artworkRequestURL = url;
+    artworkData = null;
+    artworkFailures = 0;
+    artworkRetryAt = 0;
+    if (!url) return;
+  }
+  const controller = new AbortController();
+  artworkAbort = controller;
+  const deadline = setTimeout(() => controller.abort(), 10000);
+  fetchArtworkThumbnail(url, controller.signal).catch(() => null).then(data => {
+    // A newer image or an ended page replaced this request.
+    if (artworkRequestURL !== url || artworkAbort !== controller) return;
+    artworkAbort = null;
+    if (data) {
+      artworkData = data;
+      artworkFailures = 0;
+      scheduleSnapshot(true);
+      return;
+    }
+    artworkFailures += 1;
+    artworkRetryAt = Date.now() + artworkRetryDelay(artworkFailures);
+  }).finally(() => clearTimeout(deadline));
+}
+
+addEventListener("online", () => updateArtwork(artworkRequestURL, { force: true }));
+
 function buildSnapshot(media) {
   const metadata = mediaSessionMetadata();
   const artwork = metadata?.artwork?.at(-1)?.src;
@@ -127,34 +366,42 @@ function buildSnapshot(media) {
     || metaContent(["meta[property='music:album']"])
     || siteName;
 
+  updateArtwork(absoluteHTTPURL(
+    artwork || metaContent(["meta[property='og:image']", "meta[name='twitter:image']"])
+  ));
   return {
-    title,
-    artist,
-    album,
-    site_name: siteName,
-    page_url: location.href,
-    artwork_url: absoluteHTTPURL(
-      artwork || metaContent(["meta[property='og:image']", "meta[name='twitter:image']"])
-    ),
+    title: title.slice(0, 500),
+    artist: artist.slice(0, 300),
+    album: album.slice(0, 300),
+    site_name: siteName.slice(0, 120),
+    page_url: location.href.slice(0, 4096),
+    artwork_data: artworkData,
     is_playing: !media.paused && !media.ended,
     duration: Number.isFinite(media.duration) ? Math.max(0, media.duration) : 0,
     position: Number.isFinite(media.currentTime) ? Math.max(0, media.currentTime) : 0,
     supports_previous: Boolean(matchingButton("previous"))
       || (Number.isFinite(media.duration) && media.currentTime > 3),
     supports_next: Boolean(matchingButton("next")),
+    supports_seeking: Number.isFinite(media.duration) && media.duration > 0 && media.seekable.length > 0,
+    playback_rate: Number.isFinite(media.playbackRate) ? media.playbackRate : 1,
+    is_background: Boolean(document.hidden),
   };
 }
 
 function sendSnapshot(force = false) {
+  if (!isPageActive) return;
   activeMedia = chooseMedia();
+  scheduleHeartbeat();
   if (!activeMedia) {
+    updateArtwork(null);
     if (reportedMedia) {
-      chrome.runtime.sendMessage({ kind: "notchrouter_media_ended" }).catch(() => {});
+      extensionAPI.runtime.sendMessage({ kind: "notchrouter_media_ended", document_session_id: documentSessionID }).catch(() => {});
       reportedMedia = false;
       lastPayload = "";
     }
     return;
   }
+  observeMedia(activeMedia);
   const snapshot = buildSnapshot(activeMedia);
   const comparison = JSON.stringify({
     ...snapshot,
@@ -164,15 +411,23 @@ function sendSnapshot(force = false) {
   lastPayload = comparison;
   lastSentAt = Date.now();
   reportedMedia = true;
-  chrome.runtime.sendMessage({
+  extensionAPI.runtime.sendMessage({
     kind: "notchrouter_media",
+    document_session_id: documentSessionID,
     media: snapshot,
   }).catch(() => {});
 }
 
 function scheduleSnapshot(force = false) {
-  clearTimeout(sendTimer);
-  sendTimer = setTimeout(() => sendSnapshot(force), 100);
+  if (!isPageActive) return;
+  pendingForce ||= force;
+  if (sendTimer !== null) return;
+  sendTimer = setTimeout(() => {
+    sendTimer = null;
+    const shouldForce = pendingForce;
+    pendingForce = false;
+    sendSnapshot(shouldForce);
+  }, 100);
 }
 
 function observeMedia(media) {
@@ -184,12 +439,79 @@ function observeMedia(media) {
 }
 
 function discoverMedia() {
-  for (const media of document.querySelectorAll("audio, video")) observeMedia(media);
-  scheduleSnapshot();
+  if (!isPageActive) return;
+  discoverSubtree(document);
+  pruneDiscovery();
+  if (knownMedia.size || reportedMedia) scheduleSnapshot();
 }
 
-chrome.runtime.onMessage.addListener((message) => {
+function scheduleHeartbeat() {
+  clearTimeout(heartbeatTimer);
+  heartbeatTimer = null;
+  if (!isPageActive || !activeMedia) return;
+  // Paused and background players still heartbeat below the native session expiry.
+  // Media events and commands publish immediately through the short debounce.
+  const delay = document.hidden || activeMedia.paused ? 5000 : 1000;
+  heartbeatTimer = setTimeout(() => {
+    heartbeatTimer = null;
+    sendSnapshot();
+  }, delay);
+}
+
+function scheduleReconciliation() {
+  clearTimeout(reconciliationTimer);
+  reconciliationTimer = null;
+  if (!isPageActive) return;
+  // attachShadow() on an existing host does not emit a DOM mutation. Keep a
+  // fallback scan, but give background pages without user interaction more time.
+  reconciliationTimer = setTimeout(() => {
+    reconciliationTimer = null;
+    discoverMedia();
+    scheduleReconciliation();
+  }, document.hidden ? 60000 : 10000);
+}
+
+function suspendPage() {
+  isPageActive = false;
+  for (const timer of [heartbeatTimer, reconciliationTimer, commandTimer, sendTimer, discoveryTimer]) {
+    clearTimeout(timer);
+  }
+  heartbeatTimer = reconciliationTimer = commandTimer = sendTimer = discoveryTimer = null;
+  pendingForce = false;
+  pendingSubtrees.clear();
+  for (const observer of rootObservers.values()) observer.disconnect();
+  rootObservers.clear();
+  knownMedia.clear();
+  activeMedia = lastPlayingMedia = null;
+  updateArtwork(null);
+  if (reportedMedia) {
+    extensionAPI.runtime.sendMessage({ kind: "notchrouter_media_ended", document_session_id: documentSessionID }).catch(() => {});
+  }
+  reportedMedia = false;
+  lastPayload = "";
+}
+
+function seekMedia(media, position) {
+  if (!Number.isFinite(position) || !Number.isFinite(media.duration) || media.duration <= 0) return;
+  const ranges = media.seekable;
+  if (!ranges.length) return;
+  const requested = Math.min(media.duration, Math.max(0, position));
+  let target = ranges.start(0);
+  let distance = Infinity;
+  for (let index = 0; index < ranges.length; index++) {
+    const candidate = Math.min(ranges.end(index), Math.max(ranges.start(index), requested));
+    if (Math.abs(candidate - requested) < distance) {
+      target = candidate;
+      distance = Math.abs(candidate - requested);
+    }
+  }
+  try { media.currentTime = target; } catch (_error) {}
+}
+
+extensionAPI.runtime.onMessage.addListener((message) => {
+  if (!isPageActive) return;
   if (!message || message.kind !== "notchrouter_command") return;
+  if (message.document_session_id && message.document_session_id !== documentSessionID) return;
   const media = chooseMedia();
   if (!media) return;
 
@@ -200,16 +522,30 @@ chrome.runtime.onMessage.addListener((message) => {
     const button = matchingButton("previous");
     if (button) button.click();
     else if (Number.isFinite(media.duration) && media.currentTime > 3) media.currentTime = 0;
+  } else if (message.command === "seek") {
+    seekMedia(media, message.seek_position);
   } else if (message.command === "next") {
     matchingButton("next")?.click();
   }
-  setTimeout(() => sendSnapshot(true), 150);
-});
-
-new MutationObserver(discoverMedia).observe(document.documentElement, {
-  childList: true,
-  subtree: true,
+  clearTimeout(commandTimer);
+  commandTimer = setTimeout(() => {
+    commandTimer = null;
+    sendSnapshot(true);
+  }, 150);
 });
 
 discoverMedia();
-setInterval(() => sendSnapshot(), 1000);
+scheduleReconciliation();
+document.addEventListener("visibilitychange", () => {
+  if (!isPageActive) return;
+  if (!document.hidden) discoverMedia();
+  scheduleSnapshot(true);
+  scheduleReconciliation();
+});
+addEventListener("pagehide", suspendPage);
+addEventListener("pageshow", () => {
+  if (isPageActive) return;
+  isPageActive = true;
+  discoverMedia();
+  scheduleReconciliation();
+});

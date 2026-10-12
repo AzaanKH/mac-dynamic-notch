@@ -17,23 +17,17 @@ struct NotchRouterApp: App {
     }
     .menuBarExtraStyle(.menu)
 
-    Settings {
-      SettingsRootView(appDelegate: appDelegate)
-    }
-    .defaultSize(width: 680, height: 540)
-    .windowResizability(.contentSize)
   }
 }
 
 private struct StatusMenuView: View {
-  @ObservedObject var appDelegate: AppDelegate
-  @Environment(\.openSettings) private var openSettings
+  let appDelegate: AppDelegate
 
   var body: some View {
     Button("Show Activity") {
       appDelegate.showNotch()
     }
-    .keyboardShortcut(.space, modifiers: .option)
+    .keyboardShortcut("n", modifiers: .option)
     Button("Show Files") {
       appDelegate.showFiles()
     }
@@ -46,6 +40,9 @@ private struct StatusMenuView: View {
     Button("Show Clipboard") {
       appDelegate.showClipboard()
     }
+    Button("Show System") {
+      appDelegate.showSystem()
+    }
     Button("Send Demo Activity") {
       appDelegate.sendDemoActivity()
     }
@@ -55,8 +52,7 @@ private struct StatusMenuView: View {
     .disabled(!appDelegate.canCheckForUpdates)
     Divider()
     Button("Settings…") {
-      NSApp.activate(ignoringOtherApps: true)
-      openSettings()
+      appDelegate.showSettings()
     }
     .keyboardShortcut(",", modifiers: .command)
     Button("Open Data Folder") {

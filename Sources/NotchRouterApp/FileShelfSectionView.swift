@@ -1,10 +1,14 @@
+import AppKit
 import SwiftUI
 
 struct FileShelfSectionView: View {
-  @ObservedObject var store: FileShelfStore
-  @ObservedObject var downloads: BrowserDownloadStore
+  let store: FileShelfStore
+  let downloads: BrowserDownloadStore
   let isDropTargeted: Bool
   @Environment(\.colorSchemeContrast) private var contrast
+  @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+  private let workspace = NSWorkspace.shared.notificationCenter
 
   private let columns = [
     GridItem(.adaptive(minimum: 145, maximum: 160), spacing: 8)
@@ -19,20 +23,35 @@ struct FileShelfSectionView: View {
 
       fileShelf
     }
+    .task(id: store.items) { await store.refreshPresentation() }
+    // A reconnected volume can make missing items available again without
+    // changing the shelf itself.
+    .onReceive(workspace.publisher(for: NSWorkspace.didMountNotification)) { _ in
+      Task { await store.refreshPresentation() }
+    }
+    .onReceive(workspace.publisher(for: NSWorkspace.didUnmountNotification)) { _ in
+      Task { await store.refreshPresentation() }
+    }
   }
 
   private var fileShelf: some View {
     ZStack {
       RoundedRectangle(cornerRadius: 16, style: .continuous)
-        .strokeBorder(
-          isDropTargeted
-            ? Color.orange
-            : Color.white.opacity(contrast == .increased ? 0.8 : 0.14),
-          style: StrokeStyle(
-            lineWidth: isDropTargeted || contrast == .increased ? 2 : 1,
-            dash: isDropTargeted ? [] : [5, 5]
-          )
-        )
+        .fill(.orange.opacity(isDropTargeted ? 0.08 : 0))
+        .overlay {
+          RoundedRectangle(cornerRadius: 16, style: .continuous)
+            .strokeBorder(
+              isDropTargeted
+                ? Color.orange
+                : Color.white.opacity(contrast == .increased ? 0.8 : 0.14),
+              style: StrokeStyle(
+                lineWidth: isDropTargeted || contrast == .increased ? 2 : 1,
+                dash: isDropTargeted ? [] : [5, 5]
+              )
+            )
+        }
+        .shadow(color: .orange.opacity(isDropTargeted ? 0.45 : 0), radius: 12)
+        .scaleEffect(isDropTargeted && !reduceMotion ? 1.015 : 1)
         .padding(.horizontal, 13)
         .padding(.bottom, 10)
 
@@ -41,6 +60,7 @@ struct FileShelfSectionView: View {
           Image(systemName: isDropTargeted ? "arrow.down.doc.fill" : "tray.and.arrow.down")
             .font(.system(size: 27, weight: .light))
             .dashboardTint(isDropTargeted ? .orange : .white.opacity(0.74))
+            .symbolSwap(on: isDropTargeted)
           Text(isDropTargeted ? "Release to add" : "Drop files on the notch")
             .font(.headline)
           Text("Open, reveal, AirDrop, or drag them out later.")
@@ -50,7 +70,6 @@ struct FileShelfSectionView: View {
             store.chooseFiles()
           }
           .buttonStyle(NotchAccentButtonStyle(tint: .blue))
-          .focusable()
         }
       } else {
         VStack(spacing: 4) {
@@ -59,12 +78,11 @@ struct FileShelfSectionView: View {
               store.chooseFiles()
             }
             .buttonStyle(NotchSubtleButtonStyle())
-            .focusable()
 
             Spacer()
 
             Button {
-              store.removeMissingItems()
+              Task { await store.removeMissingItems() }
             } label: {
               Label(
                 store.missingItemCount == 0
@@ -76,7 +94,6 @@ struct FileShelfSectionView: View {
               )
             }
             .buttonStyle(NotchSubtleButtonStyle())
-            .focusable()
             .help("Remove shelf entries whose files no longer exist")
           }
           .padding(.horizontal, 20)
@@ -86,10 +103,12 @@ struct FileShelfSectionView: View {
             LazyVGrid(columns: columns, spacing: 8) {
               ForEach(store.items) { item in
                 FileShelfCard(item: item, store: store)
+                  .notchListRowTransition()
               }
             }
             .padding(.horizontal, 20)
             .padding(.vertical, 4)
+            .animatesListChanges(store.items.map(\.id))
           }
         }
       }
@@ -104,11 +123,15 @@ struct FileShelfSectionView: View {
           .padding(.bottom, 17)
       }
     }
+    .animation(
+      reduceMotion ? NotchMotion.reduced : .spring(duration: 0.3, bounce: 0.3),
+      value: isDropTargeted
+    )
   }
 }
 private struct FileShelfCard: View {
   let item: ShelfItem
-  @ObservedObject var store: FileShelfStore
+  let store: FileShelfStore
 
   var body: some View {
     draggableCard
@@ -116,7 +139,7 @@ private struct FileShelfCard: View {
 
   @ViewBuilder
   private var draggableCard: some View {
-    if let url = store.resolvedURL(for: item) {
+    if let url = store.presentations[item.id]?.url {
       card.draggable(url)
     } else {
       card
@@ -126,7 +149,8 @@ private struct FileShelfCard: View {
   private var card: some View {
     VStack(alignment: .leading, spacing: 7) {
       HStack(spacing: 8) {
-        Image(nsImage: store.icon(for: item))
+        Image(nsImage: store.presentations[item.id]?.icon
+          ?? NSImage(systemSymbolName: item.isDirectory ? "folder" : "doc", accessibilityDescription: nil)!)
           .resizable()
           .scaledToFit()
           .frame(width: 28, height: 28)
@@ -142,33 +166,27 @@ private struct FileShelfCard: View {
 
       HStack(spacing: 3) {
         Button {
-          store.quickLook(item)
+          Task { await store.quickLook(item) }
         } label: {
           Image(systemName: "eye")
         }
         .buttonStyle(NotchIconButtonStyle())
-        .focusable()
-        .disabled(!isAvailable)
         .accessibilityLabel("Quick Look \(item.name)")
 
         Button {
-          store.reveal(item)
+          Task { await store.reveal(item) }
         } label: {
           Image(systemName: "magnifyingglass")
         }
         .buttonStyle(NotchIconButtonStyle())
-        .focusable()
-        .disabled(!isAvailable)
         .accessibilityLabel("Reveal \(item.name)")
 
         Button {
-          store.airDrop(item)
+          Task { await store.airDrop(item) }
         } label: {
           Image(systemName: "airplayaudio")
         }
         .buttonStyle(NotchIconButtonStyle())
-        .focusable()
-        .disabled(!isAvailable)
         .accessibilityLabel("AirDrop \(item.name)")
 
         Button {
@@ -177,7 +195,6 @@ private struct FileShelfCard: View {
           Image(systemName: "xmark")
         }
         .buttonStyle(NotchIconButtonStyle())
-        .focusable()
         .accessibilityLabel("Remove \(item.name)")
       }
     }
@@ -185,16 +202,17 @@ private struct FileShelfCard: View {
     .dashboardSurface(cornerRadius: 13)
     .contentShape(Rectangle())
     .onTapGesture(count: 2) {
-      store.open(item)
+      Task { await store.open(item) }
     }
     .help("Double-click to open")
   }
 
   private var isAvailable: Bool {
-    store.resolvedURL(for: item) != nil
+    store.presentations[item.id]?.url != nil
   }
 
   private var itemStatus: String {
+    guard store.presentations[item.id] != nil else { return "Checking…" }
     guard isAvailable else {
       return item.isDirectory ? "Missing folder" : "Missing file"
     }
