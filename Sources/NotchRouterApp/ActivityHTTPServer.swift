@@ -44,6 +44,8 @@ final class ActivityHTTPServer {
   private let browserDownloadHandler: BrowserDownloadHandler
   private var listener: NWListener?
   private var legacyListener: NWListener?
+  /// Bumped on every legacy toggle so a superseded delayed start is dropped.
+  private var legacyGeneration = 0
   private var connections: [UUID: HTTPConnection] = [:]
   /// Invalidates in-flight socket preparation when the server is stopped or
   /// restarted before it finishes.
@@ -155,7 +157,7 @@ final class ActivityHTTPServer {
     }
     listener = newListener
     newListener.start(queue: queue)
-    if legacyTCPEnabled { startLegacyListener() }
+    if legacyTCPEnabled { scheduleLegacyListener() }
   }
 
   private func makeListener(socketURL: URL?) throws -> NWListener {
@@ -181,12 +183,32 @@ final class ActivityHTTPServer {
   func setLegacyTCPEnabled(_ enabled: Bool) {
     guard socketURL != nil else { return }
     legacyTCPEnabled = enabled
-    legacyListener?.cancel()
-    legacyListener = nil
+    legacyGeneration &+= 1
+    if let legacyListener {
+      self.legacyListener = nil
+      retire([legacyListener])
+    }
     legacyTCPState = .stopped
     // Drop accepted requests as well when withdrawing legacy access.
     closeConnections()
-    if enabled, listener != nil { startLegacyListener() }
+    if enabled, listener != nil { scheduleLegacyListener() }
+  }
+
+  /// Starts the TCP listener once any retiring listener has released the port,
+  /// unless a later toggle or shutdown has superseded this request.
+  private func scheduleLegacyListener() {
+    legacyTCPState = .starting
+    let generation = legacyGeneration
+    let retirement = listenerRetirement
+    Task { [weak self] in
+      await retirement?.value
+      guard let self, generation == self.legacyGeneration else { return }
+      guard self.legacyTCPEnabled, self.listener != nil else {
+        self.legacyTCPState = .stopped
+        return
+      }
+      self.startLegacyListener()
+    }
   }
 
   private func startLegacyListener() {
@@ -228,6 +250,7 @@ final class ActivityHTTPServer {
 
   func stop() {
     startGeneration &+= 1
+    legacyGeneration &+= 1
     retireListeners(includingLegacy: true)
     legacyTCPState = .stopped
     closeConnections()
@@ -241,6 +264,10 @@ final class ActivityHTTPServer {
       retiring.append(legacyListener)
       self.legacyListener = nil
     }
+    retire(retiring)
+  }
+
+  private func retire(_ retiring: [NWListener]) {
     guard !retiring.isEmpty else { return }
     let earlier = listenerRetirement
     let released = retiring.map(Self.retire)

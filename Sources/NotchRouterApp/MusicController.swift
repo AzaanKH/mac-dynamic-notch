@@ -120,9 +120,10 @@ final class MusicController: NSObject {
   private var refreshTask: Task<Void, Never>?
   private var transportRefreshTask: Task<Void, Never>?
   @ObservationIgnored private let nativeControls = NativeControlQueue()
-  @ObservationIgnored private var pendingSkip: PendingSkip?
+  @ObservationIgnored private var pendingPosition: PendingPosition?
 
-  private struct PendingSkip {
+  /// The last seek target sent before the player reported a new snapshot.
+  private struct PendingPosition {
     let identity: String
     let sampledAt: Date
     let target: Double
@@ -225,29 +226,37 @@ final class MusicController: NSObject {
   }
 
   func togglePlayback() {
+    pendingPosition = nil
     executeControl(.playPause)
   }
 
   func nextTrack() {
+    pendingPosition = nil
     executeControl(.next)
   }
 
   func previousTrack() {
+    pendingPosition = nil
     executeControl(.previous)
   }
 
   func seek(to position: Double) {
     guard let snapshot = nowPlaying, snapshot.canSeek, position.isFinite else { return }
-    executeControl(.seek(min(snapshot.duration, max(0, position))))
+    let target = min(snapshot.duration, max(0, position))
+    pendingPosition = PendingPosition(
+      identity: snapshot.identity, sampledAt: snapshot.sampledAt,
+      target: target, issuedAt: dateProvider()
+    )
+    executeControl(.seek(target))
   }
 
   func skip(by seconds: Double) {
     guard let snapshot = nowPlaying else { return }
     let now = dateProvider()
     var base = snapshot.elapsed(at: now)
-    // Repeated skips before the player reports back build on the previous
-    // target rather than the stale snapshot. A new snapshot resets this.
-    if let pending = pendingSkip, pending.identity == snapshot.identity,
+    // Skips before the player reports back build on the last seek target
+    // rather than the stale snapshot. A new snapshot resets this.
+    if let pending = pendingPosition, pending.identity == snapshot.identity,
       pending.sampledAt == snapshot.sampledAt
     {
       let played = snapshot.isPlaying
@@ -255,13 +264,7 @@ final class MusicController: NSObject {
         : 0
       base = pending.target + played
     }
-    let target = snapshot.duration > 0
-      ? min(snapshot.duration, max(0, base + seconds))
-      : max(0, base + seconds)
-    pendingSkip = PendingSkip(
-      identity: snapshot.identity, sampledAt: snapshot.sampledAt, target: target, issuedAt: now
-    )
-    seek(to: target)
+    seek(to: base + seconds)
   }
 
   func openSource(_ source: MusicSource) {

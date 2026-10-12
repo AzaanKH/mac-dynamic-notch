@@ -444,3 +444,31 @@ func repeatedSkipsBuildOnThePreviousTargetUntilThePlayerReportsBack() throws {
   controller.skip(by: 15)
   #expect(try deliveredCommands(controller, heartbeat: heartbeat(at: 46), now: now) == ["seek 46"])
 }
+
+@MainActor
+@Test
+func skipsBuildOnAnInterveningSeekAndResetAfterOtherTransportCommands() throws {
+  let identifier = UUID().uuidString
+  let defaults = try #require(UserDefaults(suiteName: identifier))
+  defer { defaults.removePersistentDomain(forName: identifier) }
+  let now = Date(timeIntervalSince1970: 9_000)
+  let controller = MusicController(defaults: defaults, dateProvider: { now })
+  let heartbeat = try seekableBrowserSession(controller, position: 1, now: now)
+
+  // A slider seek between two skips becomes the base for the next skip.
+  controller.skip(by: 15)
+  controller.seek(to: 100)
+  controller.skip(by: 15)
+  #expect(try deliveredCommands(controller, heartbeat: heartbeat, now: now) == ["seek 115"])
+
+  // Toggling playback forgets the pending target, so the skip starts from
+  // the last reported position again.
+  let toggled = MusicController(defaults: defaults, dateProvider: { now })
+  let toggledHeartbeat = try seekableBrowserSession(toggled, position: 1, now: now)
+  toggled.skip(by: 15)
+  toggled.togglePlayback()
+  toggled.skip(by: 15)
+  #expect(try deliveredCommands(toggled, heartbeat: toggledHeartbeat, now: now) == [
+    "seek 16", "play_pause", "seek 16",
+  ])
+}

@@ -6,8 +6,10 @@ import Testing
 @testable import NotchRouterApp
 
 @MainActor
-private func securityServer(socketURL: URL? = nil, timeout: TimeInterval = 2, limit: Int = 64) -> ActivityHTTPServer {
-  ActivityHTTPServer(port: 0, token: "old-token", socketURL: socketURL,
+private func securityServer(
+  port: UInt16 = 0, socketURL: URL? = nil, timeout: TimeInterval = 2, limit: Int = 64
+) -> ActivityHTTPServer {
+  ActivityHTTPServer(port: port, token: "old-token", socketURL: socketURL,
     requestTimeout: timeout, connectionLimit: limit,
     ingestHandler: { AIActivity(event: try $0.validated()) }, listHandler: { [] },
     browserMediaHandler: { _ in BrowserMediaBridgeResponse(status: "ok") },
@@ -232,4 +234,53 @@ func restartingAReadySocketServerRepeatedlyNeverSeesItsOwnSocketAsInUse() async 
   try await eventually { server.state == .ready }
   let health = try await LocalAPIClient.request(path: "/v1/health", socketURL: socketURL)
   #expect(health.status == 200)
+}
+
+/// A loopback port that was free a moment ago, for tests that need to rebind it.
+private func unusedLoopbackPort() throws -> UInt16 {
+  let fd = socket(AF_INET, SOCK_STREAM, 0)
+  guard fd >= 0 else { throw POSIXError(.EBADF) }
+  defer { close(fd) }
+  var address = sockaddr_in()
+  address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+  address.sin_family = sa_family_t(AF_INET)
+  address.sin_addr.s_addr = inet_addr("127.0.0.1")
+  var length = socklen_t(MemoryLayout<sockaddr_in>.size)
+  let bound = withUnsafeMutablePointer(to: &address) { pointer in
+    pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+      bind(fd, $0, length) == 0 && getsockname(fd, $0, &length) == 0
+    }
+  }
+  guard bound else { throw POSIXError(.EADDRINUSE) }
+  return UInt16(bigEndian: address.sin_port)
+}
+
+@MainActor
+@Test
+func togglingLegacyTCPRepeatedlyRebindsTheSamePort() async throws {
+  let directory = URL(fileURLWithPath: "/tmp/notch-legacy-\(UUID().uuidString)")
+  defer { try? FileManager.default.removeItem(at: directory) }
+  let port = try unusedLoopbackPort()
+  let server = securityServer(port: port, socketURL: directory.appendingPathComponent("api.sock"))
+  defer { server.stop() }
+  server.start()
+  try await eventually { server.state == .ready }
+  server.setLegacyTCPEnabled(true)
+  try await eventually { server.legacyTCPState == .ready || server.legacyTCPState.canRetry }
+  try #require(server.legacyTCPState == .ready, "Initial bind failed: \(server.legacyTCPState)")
+
+  for toggle in 1...20 {
+    // Turn it off and straight back on while the old listener still holds the port.
+    server.setLegacyTCPEnabled(false)
+    server.setLegacyTCPEnabled(true)
+    try await eventually { server.legacyTCPState == .ready || server.legacyTCPState.canRetry }
+    #expect(server.legacyTCPState == .ready, "Toggle \(toggle) failed: \(server.legacyTCPState)")
+    guard server.legacyTCPState == .ready else { return }
+  }
+
+  let connection = NWConnection(host: "127.0.0.1", port: NWEndpoint.Port(rawValue: port)!, using: .tcp)
+  defer { connection.cancel() }
+  connection.start(queue: .global())
+  try await send(connection, "GET /v1/health HTTP/1.1\r\n\r\n")
+  #expect(await response(connection).hasPrefix("HTTP/1.1 200"))
 }
