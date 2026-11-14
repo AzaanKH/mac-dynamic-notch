@@ -165,6 +165,7 @@ func identicalUpdatesActAsHeartbeatsWithoutFloodingHistory() {
   #expect(!changed)
   #expect(activity.lastHeartbeatAt == heartbeat)
   #expect(activity.history.count == 1)
+  #expect(activity.updatedAt == start)
   let expired = activity.expireIfNeeded(
     at: start.addingTimeInterval(500),
     after: 300

@@ -112,6 +112,26 @@ func privateSocketAuthenticatesAndWorksWhileLegacyTCPIsDisabled() async throws {
 
 @MainActor
 @Test
+func oversizedDeclaredBodyIsRejectedBeforeItIsSent() async throws {
+  // A long timeout shows the reply comes from the declared length, not expiry.
+  let server = securityServer(timeout: 30)
+  defer { server.stop() }
+  server.start()
+  try await eventually { server.state == .ready }
+  let port = try #require(server.listeningPort)
+  let connection = NWConnection(
+    host: "127.0.0.1", port: NWEndpoint.Port(rawValue: port)!, using: .tcp)
+  defer { connection.cancel() }
+  connection.start(queue: .global())
+  try await send(
+    connection,
+    "POST /v1/activities HTTP/1.1\r\nAuthorization: Bearer old-token\r\n"
+      + "Content-Length: 1000000\r\n\r\n")
+  #expect(await response(connection).hasPrefix("HTTP/1.1 413 "))
+}
+
+@MainActor
+@Test
 func incompleteRequestsExpireAndShutdownClosesAcceptedConnections() async throws {
   let server = securityServer(timeout: 0.15, limit: 1)
   defer { server.stop() }

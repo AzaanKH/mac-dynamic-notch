@@ -368,6 +368,47 @@ func clearingAndDismissingActivitiesPersistAfterFlush() async throws {
   await reloadedStore.flushPersistence()
 }
 
+@MainActor
+@Test
+func heartbeatsDoNotReorderConcurrentActivities() async throws {
+  let directory = FileManager.default.temporaryDirectory
+    .appendingPathComponent(UUID().uuidString, isDirectory: true)
+  defer { try? FileManager.default.removeItem(at: directory) }
+
+  var now = Date(timeIntervalSince1970: 1_000)
+  let store = ActivityStore(
+    storageURL: directory.appendingPathComponent("activities.json"),
+    dateProvider: { now }
+  )
+  let older = ActivityEventRequest(
+    activityID: "older",
+    source: "Codex",
+    title: "Run tests",
+    state: .running
+  )
+  try store.ingest(older)
+  now = now.addingTimeInterval(30)
+  try store.ingest(
+    ActivityEventRequest(
+      activityID: "newer",
+      source: "Codex",
+      title: "Write docs",
+      state: .running
+    )
+  )
+
+  now = now.addingTimeInterval(30)
+  try store.ingest(older)
+
+  #expect(store.activities.map(\.id) == ["newer", "older"])
+  #expect(store.activeActivity?.id == "newer")
+
+  // The heartbeat still counts as liveness: without it, the older activity
+  // would already be past the five-minute window here.
+  #expect(!store.expireStaleActivities(at: now.addingTimeInterval(269)))
+  await store.flushPersistence()
+}
+
 private func permissions(of url: URL) throws -> Int {
   let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
   let value = try #require(attributes[.posixPermissions] as? NSNumber)

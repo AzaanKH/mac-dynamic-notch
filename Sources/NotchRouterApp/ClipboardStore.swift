@@ -193,12 +193,20 @@ final class ClipboardStore: NSObject {
   private var expiryTimer: Timer?
   private var imageCaptureGeneration: UInt = 0
   private let imageCache = NSCache<NSString, NSImage>()
+  private let frontmostApplication: @MainActor () -> ClipboardSourceApplication?
+  /// Apps that have been frontmost since the previous poll. macOS does not
+  /// report which app wrote the pasteboard, so a change is attributed to every
+  /// app that could have been in front when it happened.
+  private var recentFrontmostBundleIdentifiers: Set<String> = []
 
   init(
     storageURL: URL = AppPaths.clipboardFile,
     pasteboard: NSPasteboard = .general,
-    defaults: UserDefaults = .standard
+    defaults: UserDefaults = .standard,
+    frontmostApplication: @escaping @MainActor () -> ClipboardSourceApplication? =
+      ClipboardStore.workspaceFrontmostApplication
   ) {
+    self.frontmostApplication = frontmostApplication
     self.storageURL = storageURL
     historyWriter = HistoryWriter(storageURL: storageURL)
     imageDirectoryURL = storageURL.deletingPathExtension()
@@ -423,11 +431,20 @@ final class ClipboardStore: NSObject {
       lastChangeCount = pasteboard.changeCount
       return
     }
+    let frontmost = frontmostApplication()
+    var possibleWriters = recentFrontmostBundleIdentifiers
+    if let bundleIdentifier = frontmost?.bundleIdentifier {
+      possibleWriters.insert(bundleIdentifier)
+    }
+    // The app in front now is also the one in front when the next interval begins.
+    recentFrontmostBundleIdentifiers = Set([frontmost?.bundleIdentifier].compactMap { $0 })
+
     guard pasteboard.changeCount != lastChangeCount else { return }
     lastChangeCount = pasteboard.changeCount
 
-    let source = sourceApplication()
-    guard !isExcluded(bundleIdentifier: source?.bundleIdentifier) else { return }
+    // Switching away from an excluded app before the poll must not expose its copy.
+    guard !possibleWriters.contains(where: isExcluded) else { return }
+    let source = displayedSource(frontmost)
     let types = pasteboard.types ?? []
     guard Self.shouldCapture(types: types) else { return }
 
@@ -480,11 +497,41 @@ final class ClipboardStore: NSObject {
       repeats: true
     )
     timer?.tolerance = 0.4
+
+    recentFrontmostBundleIdentifiers = Set(
+      [frontmostApplication()?.bundleIdentifier].compactMap { $0 }
+    )
+    let workspaceNotifications = NSWorkspace.shared.notificationCenter
+    workspaceNotifications.removeObserver(
+      self, name: NSWorkspace.didActivateApplicationNotification, object: nil
+    )
+    workspaceNotifications.addObserver(
+      self,
+      selector: #selector(applicationDidActivate(_:)),
+      name: NSWorkspace.didActivateApplicationNotification,
+      object: nil
+    )
   }
 
   private func stopPolling() {
     timer?.invalidate()
     timer = nil
+    NSWorkspace.shared.notificationCenter.removeObserver(
+      self, name: NSWorkspace.didActivateApplicationNotification, object: nil
+    )
+    recentFrontmostBundleIdentifiers.removeAll()
+  }
+
+  @objc private func applicationDidActivate(_ notification: Notification) {
+    let application =
+      notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
+    noteApplicationActivated(bundleIdentifier: application?.bundleIdentifier)
+  }
+
+  /// Records an app that came to the front between polls.
+  func noteApplicationActivated(bundleIdentifier: String?) {
+    guard isPolling, let bundleIdentifier else { return }
+    recentFrontmostBundleIdentifiers.insert(bundleIdentifier)
   }
 
   private func load() {
@@ -527,19 +574,23 @@ final class ClipboardStore: NSObject {
     await historyWriter.flush()
   }
 
-  private func sourceApplication() -> ClipboardSourceApplication? {
-    let frontmostApplication = NSWorkspace.shared.frontmostApplication
-    guard frontmostApplication?.bundleIdentifier != Bundle.main.bundleIdentifier else {
-      return nil
-    }
-    guard
-      let name = frontmostApplication?.localizedName,
-      !name.isEmpty
-    else { return nil }
+  static func workspaceFrontmostApplication() -> ClipboardSourceApplication? {
+    guard let application = NSWorkspace.shared.frontmostApplication else { return nil }
     return ClipboardSourceApplication(
-      name: name,
-      bundleIdentifier: frontmostApplication?.bundleIdentifier
+      name: application.localizedName ?? "",
+      bundleIdentifier: application.bundleIdentifier
     )
+  }
+
+  /// The label saved with an entry. NotchRouter itself and unnamed apps are
+  /// not shown as a source.
+  private func displayedSource(
+    _ application: ClipboardSourceApplication?
+  ) -> ClipboardSourceApplication? {
+    guard let application, !application.name.isEmpty,
+      application.bundleIdentifier != Bundle.main.bundleIdentifier
+    else { return nil }
+    return application
   }
 
   private func capturedImageData() -> Data? {
@@ -805,9 +856,8 @@ final class ClipboardStore: NSObject {
     removeExpiredEntries()
   }
 
-  private func isExcluded(bundleIdentifier: String?) -> Bool {
-    guard let bundleIdentifier else { return false }
-    return excludedApplications.contains {
+  private func isExcluded(_ bundleIdentifier: String) -> Bool {
+    excludedApplications.contains {
       $0.bundleIdentifier.caseInsensitiveCompare(bundleIdentifier) == .orderedSame
     }
   }
@@ -886,7 +936,7 @@ final class ClipboardStore: NSObject {
   }
 }
 
-private struct ClipboardSourceApplication: Sendable {
+struct ClipboardSourceApplication: Sendable {
   let name: String
   let bundleIdentifier: String?
 }

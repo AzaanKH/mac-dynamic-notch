@@ -32,7 +32,8 @@ placeholder files, and documents that repeat existing instructions.
 ## Verification and reporting
 
 Use `swift test --filter <test-name>` for a focused change and `swift test` for
-changes across the package. CI runs `swift test`. Test observable behavior,
+changes across the package. Use `node --test BrowserExtension/tests/*.test.cjs`
+for browser extension changes. CI runs both. Test observable behavior,
 failure paths, and wire formats. Avoid tests that only restate constants or
 round-trip synthesized Codable conformance without checking the external format.
 Isolate test defaults, temporary files, ports, and pasteboards.

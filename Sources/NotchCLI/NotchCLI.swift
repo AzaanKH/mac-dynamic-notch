@@ -52,14 +52,22 @@ enum NotchCLI {
   }
 
   private static func send(arguments: [String]) async throws {
-    let options = try parseOptions(arguments)
+    let options = try parseOptions(
+      arguments,
+      allowed: [
+        "id", "source", "title", "state", "message", "progress", "action-url",
+        "task-title", "workspace",
+      ]
+    )
     guard let activityID = options["id"],
       let source = options["source"],
       let title = options["title"],
-      let stateValue = options["state"],
-      let state = ActivityState(rawValue: stateValue)
+      let stateValue = options["state"]
     else {
       throw CLIError.missingSendArguments
+    }
+    guard let state = ActivityState(rawValue: stateValue) else {
+      throw CLIError.invalidState(stateValue)
     }
 
     let progress: Double?
@@ -72,6 +80,16 @@ enum NotchCLI {
       progress = nil
     }
 
+    let actionURL: URL?
+    if let rawActionURL = options["action-url"] {
+      guard let url = URL(string: rawActionURL), url.scheme != nil else {
+        throw CLIError.invalidActionURL(rawActionURL)
+      }
+      actionURL = url
+    } else {
+      actionURL = nil
+    }
+
     let event = ActivityEventRequest(
       activityID: activityID,
       source: source,
@@ -79,7 +97,9 @@ enum NotchCLI {
       state: state,
       message: options["message"],
       progress: progress,
-      actionURL: options["action-url"].flatMap(URL.init(string:))
+      actionURL: actionURL,
+      taskTitle: options["task-title"],
+      workspace: options["workspace"]
     )
     let body = try ActivityCoding.makeEncoder().encode(event)
     let response = try await request(
@@ -154,56 +174,9 @@ enum NotchCLI {
 
   private static func installCodexHooks() throws {
     let executablePath = try installCodexAdapterExecutable()
-    let command = "\(shellQuote(executablePath)) codex-hook"
-    let codexDirectory = FileManager.default.homeDirectoryForCurrentUser
-      .appendingPathComponent(".codex", isDirectory: true)
-    let hooksURL = codexDirectory.appendingPathComponent("hooks.json")
+    try CodexHooksFile.install(command: "\(shellQuote(executablePath)) codex-hook")
 
-    try FileManager.default.createDirectory(
-      at: codexDirectory,
-      withIntermediateDirectories: true
-    )
-
-    var root: [String: Any] = [
-      "description": "Publishes Codex task titles, response excerpts, and lifecycle state to local NotchRouter."
-    ]
-    if FileManager.default.fileExists(atPath: hooksURL.path) {
-      let data = try Data(contentsOf: hooksURL)
-      guard let existing = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-        throw CLIError.invalidHooksFile
-      }
-      root = existing
-    }
-
-    let hooksValue = root["hooks"]
-    guard hooksValue == nil || hooksValue is [String: Any] else {
-      throw CLIError.invalidHooksFile
-    }
-    var hooks = hooksValue as? [String: Any] ?? [:]
-    for eventName in ["UserPromptSubmit", "PermissionRequest", "PostToolUse", "Stop"] {
-      let groupsValue = hooks[eventName]
-      guard groupsValue == nil || groupsValue is [[String: Any]] else {
-        throw CLIError.invalidHooksFile
-      }
-      var groups = removingCodexAdapterHandlers(
-        from: groupsValue as? [[String: Any]] ?? []
-      )
-      groups.append([
-        "hooks": [
-          [
-            "type": "command",
-            "command": command,
-            "timeout": 2,
-          ]
-        ]
-      ])
-      hooks[eventName] = groups
-    }
-    root["hooks"] = hooks
-
-    try writeHooks(root, to: hooksURL)
-
-    print("Installed Codex lifecycle hooks in \(hooksURL.path)")
+    print("Installed Codex lifecycle hooks in \(CodexHooksFile.defaultURL.path)")
     print("Restart T3 Code, then review and trust the new hooks with /hooks.")
   }
 
@@ -231,33 +204,15 @@ enum NotchCLI {
   }
 
   private static func removeCodexHooks() throws {
-    let hooksURL = FileManager.default.homeDirectoryForCurrentUser
-      .appendingPathComponent(".codex", isDirectory: true)
-      .appendingPathComponent("hooks.json")
-    guard FileManager.default.fileExists(atPath: hooksURL.path) else {
+    let path = CodexHooksFile.defaultURL.path
+    switch try CodexHooksFile.remove() {
+    case .noFile:
       print("No Codex hooks file exists; nothing to remove.")
-      return
+    case .nothingToRemove:
+      print("No NotchRouter hooks are installed in \(path); nothing to remove.")
+    case .removed:
+      print("Removed NotchRouter's Codex lifecycle hooks from \(path)")
     }
-
-    let data = try Data(contentsOf: hooksURL)
-    guard var root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-      var hooks = root["hooks"] as? [String: Any]
-    else {
-      throw CLIError.invalidHooksFile
-    }
-
-    for eventName in ["UserPromptSubmit", "PermissionRequest", "PostToolUse", "Stop"] {
-      guard let groups = hooks[eventName] as? [[String: Any]] else { continue }
-      let filtered = removingCodexAdapterHandlers(from: groups)
-      if filtered.isEmpty {
-        hooks.removeValue(forKey: eventName)
-      } else {
-        hooks[eventName] = filtered
-      }
-    }
-    root["hooks"] = hooks
-    try writeHooks(root, to: hooksURL)
-    print("Removed NotchRouter's Codex lifecycle hooks from \(hooksURL.path)")
   }
 
   private static func installBrowserExtension() throws {
@@ -290,7 +245,10 @@ enum NotchCLI {
     return response.body
   }
 
-  private static func parseOptions(_ arguments: [String]) throws -> [String: String] {
+  private static func parseOptions(
+    _ arguments: [String],
+    allowed: Set<String>
+  ) throws -> [String: String] {
     var result: [String: String] = [:]
     var index = 0
     while index < arguments.count {
@@ -298,7 +256,15 @@ enum NotchCLI {
       guard argument.hasPrefix("--"), index + 1 < arguments.count else {
         throw CLIError.invalidOption(argument)
       }
-      result[String(argument.dropFirst(2))] = arguments[index + 1]
+      let name = String(argument.dropFirst(2))
+      // A misspelled or repeated option would otherwise be dropped silently.
+      guard allowed.contains(name) else {
+        throw CLIError.unknownOption(argument)
+      }
+      guard result[name] == nil else {
+        throw CLIError.repeatedOption(argument)
+      }
+      result[name] = arguments[index + 1]
       index += 2
     }
     return result
@@ -319,6 +285,7 @@ enum NotchCLI {
         notchctl remove-codex-hooks
         notchctl install-browser-extension
         notchctl remove-browser-extension
+        notchctl browser-extension-status
 
       CODEX ADAPTER
         codex-hook reads a Codex lifecycle hook from standard input.
@@ -331,6 +298,8 @@ enum NotchCLI {
         --message TEXT
         --progress 0.0...1.0
         --action-url URL
+        --task-title TEXT   shown in place of the title and kept across updates
+        --workspace NAME
 
       HEARTBEATS
         Re-send an identical nonterminal activity at least once a minute.
@@ -340,37 +309,6 @@ enum NotchCLI {
 
   private static func shellQuote(_ value: String) -> String {
     "'\(value.replacingOccurrences(of: "'", with: "'\\''"))'"
-  }
-
-  private static func removingCodexAdapterHandlers(
-    from groups: [[String: Any]]
-  ) -> [[String: Any]] {
-    groups.compactMap { group in
-      guard let handlers = group["hooks"] as? [[String: Any]] else {
-        return group
-      }
-      let remainingHandlers = handlers.filter { handler in
-        guard let command = handler["command"] as? String else { return true }
-        return !(command.contains("notchctl") && command.hasSuffix(" codex-hook"))
-      }
-      guard !remainingHandlers.isEmpty else { return nil }
-      var updatedGroup = group
-      updatedGroup["hooks"] = remainingHandlers
-      return updatedGroup
-    }
-  }
-
-  private static func writeHooks(_ root: [String: Any], to url: URL) throws {
-    var data = try JSONSerialization.data(
-      withJSONObject: root,
-      options: [.prettyPrinted, .sortedKeys]
-    )
-    data.append(0x0A)
-    try data.write(to: url, options: .atomic)
-    try FileManager.default.setAttributes(
-      [.posixPermissions: 0o600],
-      ofItemAtPath: url.path
-    )
   }
 }
 
@@ -467,9 +405,12 @@ private enum CLIError: LocalizedError {
   case unknownCommand(String)
   case missingSendArguments
   case invalidProgress(String)
+  case invalidState(String)
+  case invalidActionURL(String)
   case invalidOption(String)
+  case unknownOption(String)
+  case repeatedOption(String)
   case invalidResponse
-  case invalidHooksFile
   case server(status: Int, message: String)
 
   var errorDescription: String? {
@@ -480,12 +421,19 @@ private enum CLIError: LocalizedError {
       "send requires --id, --source, --title, and --state."
     case .invalidProgress(let value):
       "'\(value)' is not a valid progress value."
+    case .invalidState(let value):
+      "'\(value)' is not a valid state. Use "
+        + ActivityState.allCases.map(\.rawValue).joined(separator: ", ") + "."
+    case .invalidActionURL(let value):
+      "'\(value)' is not a valid action URL."
     case .invalidOption(let option):
       "Invalid option near '\(option)'. Options require a value."
+    case .unknownOption(let option):
+      "Unknown option '\(option)'. Run notchctl help."
+    case .repeatedOption(let option):
+      "Option '\(option)' was given more than once."
     case .invalidResponse:
       "NotchRouter returned an invalid HTTP response."
-    case .invalidHooksFile:
-      "~/.codex/hooks.json is not a JSON object."
     case .server(let status, let message):
       "NotchRouter returned HTTP \(status): \(message)"
     }

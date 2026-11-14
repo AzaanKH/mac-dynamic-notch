@@ -212,10 +212,16 @@ and auto-expiry. Choose an expiry period under **Settings → General**.
 
 Known sensitive pasteboard markers are rejected before content is read. The
 menu-bar integration token is also written using a concealed pasteboard type
-and explicitly suppressed from history. Apps selected under **Settings →
-Privacy → Clipboard history** are also excluded by bundle identifier before
-their pasteboard contents are read. Content-based secret detection is not
+and explicitly suppressed from history. Content-based secret detection is not
 attempted, so clipboard capture should remain visibly opt-in.
+
+Apps selected under **Settings → Privacy → Clipboard history** are excluded by
+bundle identifier before the pasteboard contents are read. macOS does not report
+which app wrote the pasteboard, so NotchRouter skips a copy when an excluded app
+was in front at any point since its previous check, about 1.5 seconds earlier.
+Switching away from an excluded app right after copying is covered, and a copy
+made in another app within that window is skipped as well. An excluded app that
+writes the clipboard while it is never in front cannot be recognized.
 
 To fully close NotchRouter, hover over it and use the red power button at the
 end of the shortcut row, expand it and use the power button in the top-right
@@ -252,8 +258,12 @@ Valid states are `queued`, `running`, `needs_approval`, `stale`, `succeeded`,
 `failed`, and `cancelled`. NotchRouter automatically marks any nonterminal
 activity as `stale` (shown as **Disconnected**) when it receives no update for
 five minutes. Send an identical nonterminal update at least once a minute as a
-heartbeat; heartbeats refresh liveness without adding duplicate history or
-reopening the notch.
+heartbeat; heartbeats refresh liveness without adding duplicate history,
+reordering activities, or reopening the notch.
+
+`--task-title` (`task_title` in JSON) replaces the title on the card and is kept
+across later updates that omit it. `--workspace` (`workspace`) labels the
+project. `notchctl send` rejects unknown or repeated options.
 
 Useful diagnostics:
 
