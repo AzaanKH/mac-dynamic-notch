@@ -759,8 +759,8 @@ private struct MusicQueryBatch: Sendable {
   let errorMessage: String?
 }
 
-private enum MusicScriptRunner {
-  nonisolated static func query(
+enum MusicScriptRunner {
+  nonisolated fileprivate static func query(
     sources: [MusicSource],
     timeout: TimeInterval
   ) async -> MusicQueryBatch {
@@ -782,7 +782,7 @@ private enum MusicScriptRunner {
     )
   }
 
-  nonisolated static func control(
+  nonisolated fileprivate static func control(
     _ control: MusicControl,
     source: MusicSource,
     timeout: TimeInterval
@@ -834,7 +834,7 @@ private enum MusicScriptRunner {
       """
   }
 
-  nonisolated private static func parse(
+  nonisolated static func parse(
     _ output: String,
     source: MusicSource
   ) -> NowPlayingSnapshot? {
@@ -853,8 +853,8 @@ private enum MusicScriptRunner {
       artist: values[2],
       album: values[3],
       isPlaying: state == "playing",
-      duration: Double(values[4]) ?? 0,
-      position: Double(values[5]) ?? 0,
+      duration: seconds(from: values[4]),
+      position: seconds(from: values[5]),
       artworkURL: URL(string: values[6]),
       sourceName: source.displayName,
       sourceURL: nil,
@@ -862,6 +862,13 @@ private enum MusicScriptRunner {
       supportsPrevious: true,
       supportsNext: true
     )
+  }
+
+  /// AppleScript writes reals with the system decimal separator, so a
+  /// comma-decimal locale reports "215,306". It never adds grouping separators.
+  nonisolated private static func seconds(from text: String) -> Double {
+    let value = Double(text.replacingOccurrences(of: ",", with: ".")) ?? 0
+    return value.isFinite && value >= 0 ? value : 0
   }
 
   nonisolated private static func run(

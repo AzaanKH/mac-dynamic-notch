@@ -472,3 +472,25 @@ func skipsBuildOnAnInterveningSeekAndResetAfterOtherTransportCommands() throws {
     "seek 16", "play_pause", "seek 16",
   ])
 }
+
+@Test
+func nativePlayerOutputParsesTimesWrittenWithADecimalComma() throws {
+  let separator = String(UnicodeScalar(31))
+  func output(duration: String, position: String) -> String {
+    ["playing", "Song", "Artist", "Album", duration, position, ""]
+      .joined(separator: separator) + "\n"
+  }
+
+  let comma = try #require(
+    MusicScriptRunner.parse(output(duration: "215,306", position: "12,5"), source: .spotify)
+  )
+  #expect(comma.duration == 215.306)
+  #expect(comma.position == 12.5)
+  #expect(comma.canSeek)
+
+  let point = try #require(
+    MusicScriptRunner.parse(output(duration: "1,2345E+4", position: "0.25"), source: .appleMusic)
+  )
+  #expect(point.duration == 12_345)
+  #expect(point.position == 0.25)
+}
