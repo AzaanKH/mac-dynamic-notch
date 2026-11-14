@@ -588,3 +588,70 @@ private func waitForClipboardImage(in store: ClipboardStore) async throws {
 private enum ClipboardPollingTestError: Error {
   case timedOut
 }
+
+@MainActor
+@Test
+func clipboardSkipsCopiesWhenAnExcludedAppWasInFrontSinceTheLastPoll() async {
+  let suiteName = "ClipboardExclusionWindowTests.\(UUID().uuidString)"
+  let defaults = UserDefaults(suiteName: suiteName)!
+  let storageURL = FileManager.default.temporaryDirectory
+    .appendingPathComponent("ClipboardExclusionWindowTests-\(UUID().uuidString).json")
+  let pasteboard = NSPasteboard(
+    name: NSPasteboard.Name("ClipboardExclusionWindowTests.\(UUID().uuidString)")
+  )
+  defer {
+    defaults.removePersistentDomain(forName: suiteName)
+    pasteboard.releaseGlobally()
+    try? FileManager.default.removeItem(at: storageURL)
+  }
+
+  let secret = ClipboardSourceApplication(
+    name: "Secret App", bundleIdentifier: "com.example.Secret")
+  let editor = ClipboardSourceApplication(
+    name: "Editor", bundleIdentifier: "com.example.Editor")
+  var frontmost = editor
+  let store = ClipboardStore(
+    storageURL: storageURL,
+    pasteboard: pasteboard,
+    defaults: defaults,
+    frontmostApplication: { frontmost }
+  )
+  store.excludeApplication(bundleIdentifier: "com.example.Secret", name: "Secret App")
+  store.setEnabled(true)
+
+  func copy(_ text: String) {
+    pasteboard.clearContents()
+    pasteboard.setString(text, forType: .string)
+  }
+
+  // Copied in the excluded app, which is still in front at the poll.
+  frontmost = secret
+  store.noteApplicationActivated(bundleIdentifier: secret.bundleIdentifier)
+  copy("in front at the poll")
+  store.captureIfChanged()
+  #expect(store.entries.isEmpty)
+
+  // Copied in the excluded app, then switched away before the poll.
+  copy("left before the poll")
+  frontmost = editor
+  store.noteApplicationActivated(bundleIdentifier: editor.bundleIdentifier)
+  store.captureIfChanged()
+  #expect(store.entries.isEmpty)
+
+  // Visited the excluded app briefly between two polls of another app.
+  store.captureIfChanged()
+  store.noteApplicationActivated(bundleIdentifier: secret.bundleIdentifier)
+  copy("brief visit")
+  store.noteApplicationActivated(bundleIdentifier: editor.bundleIdentifier)
+  store.captureIfChanged()
+  #expect(store.entries.isEmpty)
+
+  // Once a full interval passes without the excluded app, capture resumes.
+  copy("from the editor")
+  store.captureIfChanged()
+  #expect(store.entries.map(\.text) == ["from the editor"])
+  #expect(store.entries.first?.sourceApplication == "Editor")
+
+  store.setEnabled(false)
+  await store.flushPersistence()
+}
