@@ -60,12 +60,15 @@ public enum CodexHooksFile {
     guard FileManager.default.fileExists(atPath: url.path) else { return .noFile }
 
     var root = try readRoot(at: url)
-    guard var hooks = try hooksObject(in: root) else { return .nothingToRemove }
+    // NotchRouter only writes arrays of groups, so any other shape holds none
+    // of its handlers and is left alone rather than rejected.
+    guard var hooks = root["hooks"] as? [String: Any] else { return .nothingToRemove }
 
     var didRemove = false
     for eventName in eventNames {
-      let existing = try groups(for: eventName, in: hooks)
-      guard containsAdapterHandler(existing) else { continue }
+      guard let existing = hooks[eventName] as? [[String: Any]],
+        containsAdapterHandler(existing)
+      else { continue }
       didRemove = true
       let filtered = removingAdapterHandlers(from: existing)
       if filtered.isEmpty {

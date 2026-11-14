@@ -129,24 +129,30 @@ func removingLeavesAFileWithoutNotchRouterHooksUntouched() throws {
 }
 
 @Test
-func unsupportedFilesAreRejectedWithoutBeingRewritten() throws {
+func unsupportedFilesAreNeverRewritten() throws {
   let url = try temporaryHooksURL()
   defer { removeDirectory(of: url) }
 
-  for contents in [
-    "not json",
-    "[]",
-    #"{"hooks":[]}"#,
-    #"{"hooks":{"Stop":{"hooks":[]}}}"#,
-    #"{"hooks":{"Stop":["say done"]}}"#,
+  // Removal only fails when the file cannot be read as a JSON object. Any other
+  // unexpected shape cannot hold a NotchRouter handler.
+  for (contents, removalFails) in [
+    ("not json", true),
+    ("[]", true),
+    (#"{"hooks":[]}"#, false),
+    (#"{"hooks":{"Stop":{"hooks":[]}}}"#, false),
+    (#"{"hooks":{"Stop":["say done"]}}"#, false),
   ] {
     let original = Data(contents.utf8)
     try original.write(to: url)
     #expect(throws: CodexHooksFileError.self) {
       try CodexHooksFile.install(command: adapterCommand, at: url)
     }
-    #expect(throws: CodexHooksFileError.self) {
-      try CodexHooksFile.remove(at: url)
+    if removalFails {
+      #expect(throws: CodexHooksFileError.self) {
+        try CodexHooksFile.remove(at: url)
+      }
+    } else {
+      #expect(try CodexHooksFile.remove(at: url) == .nothingToRemove)
     }
     #expect(try Data(contentsOf: url) == original)
   }
