@@ -52,14 +52,22 @@ enum NotchCLI {
   }
 
   private static func send(arguments: [String]) async throws {
-    let options = try parseOptions(arguments)
+    let options = try parseOptions(
+      arguments,
+      allowed: [
+        "id", "source", "title", "state", "message", "progress", "action-url",
+        "task-title", "workspace",
+      ]
+    )
     guard let activityID = options["id"],
       let source = options["source"],
       let title = options["title"],
-      let stateValue = options["state"],
-      let state = ActivityState(rawValue: stateValue)
+      let stateValue = options["state"]
     else {
       throw CLIError.missingSendArguments
+    }
+    guard let state = ActivityState(rawValue: stateValue) else {
+      throw CLIError.invalidState(stateValue)
     }
 
     let progress: Double?
@@ -72,6 +80,16 @@ enum NotchCLI {
       progress = nil
     }
 
+    let actionURL: URL?
+    if let rawActionURL = options["action-url"] {
+      guard let url = URL(string: rawActionURL), url.scheme != nil else {
+        throw CLIError.invalidActionURL(rawActionURL)
+      }
+      actionURL = url
+    } else {
+      actionURL = nil
+    }
+
     let event = ActivityEventRequest(
       activityID: activityID,
       source: source,
@@ -79,7 +97,9 @@ enum NotchCLI {
       state: state,
       message: options["message"],
       progress: progress,
-      actionURL: options["action-url"].flatMap(URL.init(string:))
+      actionURL: actionURL,
+      taskTitle: options["task-title"],
+      workspace: options["workspace"]
     )
     let body = try ActivityCoding.makeEncoder().encode(event)
     let response = try await request(
@@ -290,7 +310,10 @@ enum NotchCLI {
     return response.body
   }
 
-  private static func parseOptions(_ arguments: [String]) throws -> [String: String] {
+  private static func parseOptions(
+    _ arguments: [String],
+    allowed: Set<String>
+  ) throws -> [String: String] {
     var result: [String: String] = [:]
     var index = 0
     while index < arguments.count {
@@ -298,7 +321,15 @@ enum NotchCLI {
       guard argument.hasPrefix("--"), index + 1 < arguments.count else {
         throw CLIError.invalidOption(argument)
       }
-      result[String(argument.dropFirst(2))] = arguments[index + 1]
+      let name = String(argument.dropFirst(2))
+      // A misspelled or repeated option would otherwise be dropped silently.
+      guard allowed.contains(name) else {
+        throw CLIError.unknownOption(argument)
+      }
+      guard result[name] == nil else {
+        throw CLIError.repeatedOption(argument)
+      }
+      result[name] = arguments[index + 1]
       index += 2
     }
     return result
@@ -319,6 +350,7 @@ enum NotchCLI {
         notchctl remove-codex-hooks
         notchctl install-browser-extension
         notchctl remove-browser-extension
+        notchctl browser-extension-status
 
       CODEX ADAPTER
         codex-hook reads a Codex lifecycle hook from standard input.
@@ -331,6 +363,8 @@ enum NotchCLI {
         --message TEXT
         --progress 0.0...1.0
         --action-url URL
+        --task-title TEXT   shown in place of the title and kept across updates
+        --workspace NAME
 
       HEARTBEATS
         Re-send an identical nonterminal activity at least once a minute.
@@ -467,7 +501,11 @@ private enum CLIError: LocalizedError {
   case unknownCommand(String)
   case missingSendArguments
   case invalidProgress(String)
+  case invalidState(String)
+  case invalidActionURL(String)
   case invalidOption(String)
+  case unknownOption(String)
+  case repeatedOption(String)
   case invalidResponse
   case invalidHooksFile
   case server(status: Int, message: String)
@@ -480,8 +518,17 @@ private enum CLIError: LocalizedError {
       "send requires --id, --source, --title, and --state."
     case .invalidProgress(let value):
       "'\(value)' is not a valid progress value."
+    case .invalidState(let value):
+      "'\(value)' is not a valid state. Use "
+        + ActivityState.allCases.map(\.rawValue).joined(separator: ", ") + "."
+    case .invalidActionURL(let value):
+      "'\(value)' is not a valid action URL."
     case .invalidOption(let option):
       "Invalid option near '\(option)'. Options require a value."
+    case .unknownOption(let option):
+      "Unknown option '\(option)'. Run notchctl help."
+    case .repeatedOption(let option):
+      "Option '\(option)' was given more than once."
     case .invalidResponse:
       "NotchRouter returned an invalid HTTP response."
     case .invalidHooksFile:

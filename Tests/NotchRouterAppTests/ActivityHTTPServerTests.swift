@@ -95,6 +95,21 @@ func requestParserWaitsForADeclaredBodyWithoutOverflowingRangeMath() {
   }
 }
 
+@Test
+func requestParserReportsADeclaredBodyThatCannotFitTheLimit() {
+  let headers = "POST /v1/activities HTTP/1.1\r\nContent-Length: 10\r\n\r\n"
+  let data = Data(headers.utf8)
+
+  guard case .tooLarge = HTTPRequest.parse(data, maximumSize: data.count + 9) else {
+    Issue.record("Expected a body one byte over the limit to be too large")
+    return
+  }
+  guard case .incomplete = HTTPRequest.parse(data, maximumSize: data.count + 10) else {
+    Issue.record("Expected a body that exactly fits to keep waiting")
+    return
+  }
+}
+
 @MainActor
 @Test
 func serverCanStartStopAndRestart() async throws {

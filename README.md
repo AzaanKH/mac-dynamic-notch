@@ -252,8 +252,12 @@ Valid states are `queued`, `running`, `needs_approval`, `stale`, `succeeded`,
 `failed`, and `cancelled`. NotchRouter automatically marks any nonterminal
 activity as `stale` (shown as **Disconnected**) when it receives no update for
 five minutes. Send an identical nonterminal update at least once a minute as a
-heartbeat; heartbeats refresh liveness without adding duplicate history or
-reopening the notch.
+heartbeat; heartbeats refresh liveness without adding duplicate history,
+reordering activities, or reopening the notch.
+
+`--task-title` (`task_title` in JSON) replaces the title on the card and is kept
+across later updates that omit it. `--workspace` (`workspace`) labels the
+project. `notchctl send` rejects unknown or repeated options.
 
 Useful diagnostics:
 

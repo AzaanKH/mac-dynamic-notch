@@ -454,9 +454,11 @@ private final class HTTPConnection {
       return
     }
 
-    switch HTTPRequest.parse(buffer) {
+    switch HTTPRequest.parse(buffer, maximumSize: Self.maximumRequestSize) {
     case .complete(let request):
       route(request)
+    case .tooLarge:
+      send(.text(status: 413, message: "Request is too large"))
     case .malformed:
       send(.text(status: 400, message: "Malformed HTTP request"))
     case .incomplete where isComplete || error != nil:
@@ -608,10 +610,13 @@ struct HTTPRequest {
   enum ParseResult {
     case incomplete
     case malformed
+    case tooLarge
     case complete(HTTPRequest)
   }
 
-  static func parse(_ data: Data) -> ParseResult {
+  /// With `maximumSize`, a declared body that cannot fit is reported as soon as
+  /// the headers arrive instead of waiting for bytes that would be rejected.
+  static func parse(_ data: Data, maximumSize: Int? = nil) -> ParseResult {
     let separator = Data("\r\n\r\n".utf8)
     guard let headerRange = data.range(of: separator) else {
       return .incomplete
@@ -657,6 +662,9 @@ struct HTTPRequest {
 
     let bodyStart = headerRange.upperBound
     guard bodyStart <= data.count else { return .malformed }
+    if let maximumSize, contentLength > maximumSize - bodyStart {
+      return .tooLarge
+    }
     guard contentLength <= data.count - bodyStart else { return .incomplete }
     let bodyEnd = bodyStart + contentLength
 

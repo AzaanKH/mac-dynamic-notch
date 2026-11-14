@@ -165,6 +165,11 @@ final class BrowserDownloadStore {
       if event.estimatedEndTime == nil {
         updatedItem.estimatedEndTime = items[index].estimatedEndTime
       }
+      // Progress alone keeps the item's place, so concurrent downloads do not
+      // trade places on every update and a repeated report is not a change.
+      if updatedItem.state == items[index].state {
+        updatedItem.updatedAt = items[index].updatedAt
+      }
       guard updatedItem != items[index] else { return false }
       items[index] = updatedItem
     } else {

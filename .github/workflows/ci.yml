@@ -27,3 +27,6 @@ jobs:
 
       - name: Run test suite
         run: swift test
+
+      - name: Run browser bridge tests
+        run: node --test BrowserExtension/tests/*.test.cjs

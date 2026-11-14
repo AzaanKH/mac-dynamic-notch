@@ -298,15 +298,18 @@ public struct AIActivity: Codable, Identifiable, Sendable {
       || progress != event.progress
       || actionURL != resolvedActionURL
 
-    if hasVisibleChanges {
-      appendHistory(
-        ActivityUpdate(
-          state: event.state,
-          message: event.message,
-          timestamp: effectiveTimestamp
-        )
-      )
+    // A heartbeat refreshes liveness only. Leaving `updatedAt` alone keeps
+    // concurrent activities from trading places every time one checks in.
+    guard hasVisibleChanges else {
+      return false
     }
+    appendHistory(
+      ActivityUpdate(
+        state: event.state,
+        message: event.message,
+        timestamp: effectiveTimestamp
+      )
+    )
 
     // A fresh delivery can reconnect an expired activity even when an integration
     // reuses an older semantic timestamp.
@@ -323,7 +326,7 @@ public struct AIActivity: Codable, Identifiable, Sendable {
     progress = event.progress
     actionURL = resolvedActionURL
     updatedAt = effectiveTimestamp
-    return hasVisibleChanges
+    return true
   }
 
   /// Moves a nonterminal activity to a recoverable disconnected state when heartbeats stop.

@@ -140,6 +140,42 @@ func browserDownloadStoreStopsActivePresentationWhenPermissionTurnsOff() throws 
   #expect(store.items[0].error == "Browser download access is off.")
 }
 
+@MainActor
+@Test
+func browserDownloadProgressKeepsOrderAndRepeatedReportsAreNotChanges() async throws {
+  let store = BrowserDownloadStore()
+  var changeCount = 0
+  store.onChange = { changeCount += 1 }
+
+  func progress(_ downloadID: Int, bytes: Int64) -> BrowserDownloadEvent {
+    BrowserDownloadEvent(
+      kind: .update,
+      downloadID: downloadID,
+      browserName: "Chrome",
+      displayName: "file-\(downloadID).zip",
+      bytesReceived: bytes,
+      totalBytes: 100,
+      state: .inProgress
+    )
+  }
+
+  _ = try store.ingest(progress(1, bytes: 10))
+  // Keep the two start times distinct so the expected order is unambiguous.
+  try await Task.sleep(for: .milliseconds(2))
+  _ = try store.ingest(progress(2, bytes: 10))
+  #expect(store.items.map(\.downloadID) == [2, 1])
+  #expect(changeCount == 2)
+
+  try await Task.sleep(for: .milliseconds(2))
+  _ = try store.ingest(progress(1, bytes: 50))
+  #expect(store.items.map(\.downloadID) == [2, 1])
+  #expect(store.items[1].bytesReceived == 50)
+  #expect(changeCount == 3)
+
+  _ = try store.ingest(progress(1, bytes: 50))
+  #expect(changeCount == 3)
+}
+
 @Test
 func chargingEstimateFormatsCalculatingMinutesAndHours() {
   #expect(
