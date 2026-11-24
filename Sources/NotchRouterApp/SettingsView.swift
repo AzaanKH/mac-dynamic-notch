@@ -587,51 +587,24 @@ private struct IntegrationSettingsView: View {
         )
       }
 
-      SettingsCard(title: "Codex and T3 Code", symbol: "terminal") {
-        HStack(spacing: 8) {
-          Image(
-            systemName: controller.codexHooksNeedUpdate
-              ? "exclamationmark.triangle.fill"
-              : controller.codexHooksInstalled ? "checkmark.circle.fill" : "circle.dashed"
+      SettingsCard(title: "Coding agents", symbol: "terminal") {
+        ForEach(CodingAgent.allCases, id: \.self) { agent in
+          agentHooksRow(agent)
+        }
+
+        if controller.agentHooksNeedUpdate {
+          Label(
+            "Installed hooks use an outdated helper and may not reach NotchRouter. Reinstall them to update it.",
+            systemImage: "exclamationmark.triangle.fill"
           )
-          .foregroundStyle(
-            controller.codexHooksNeedUpdate
-              ? .orange : controller.codexHooksInstalled ? .green : .secondary
-          )
-          Text(
-            controller.codexHooksNeedUpdate
-              ? "Hooks use an outdated helper and may not reach NotchRouter"
-              : controller.codexHooksInstalled
-                ? "Lifecycle hooks are installed"
-                : "Lifecycle hooks are not installed"
-          )
-          Spacer()
-          if controller.isRunningCodexSetup {
-            ProgressView()
-              .controlSize(.small)
-          }
+          .font(.caption)
+          .foregroundStyle(.orange)
         }
 
         SettingsMessage(
-          "The adapter saves task titles from prompts, workspace names, tool names, and final response excerpts locally in NotchRouter. Titles are limited to 160 characters and responses to 1,000 characters.",
+          "Hooks are user-level, so they also cover T3 Code threads that use that agent; each T3 Code thread appears as one activity. They save task titles from prompts, workspace names, tool names, and final response excerpts locally in NotchRouter. Titles are limited to 160 characters and responses to 1,000 characters.",
           color: .secondary
         )
-
-        HStack {
-          Button(
-            controller.codexHooksNeedUpdate
-              ? "Update Hooks"
-              : controller.codexHooksInstalled ? "Reinstall Hooks" : "Install Hooks"
-          ) {
-            controller.installCodexHooks()
-          }
-          Button("Remove Hooks") {
-            controller.removeCodexHooks()
-          }
-          .disabled(!controller.codexHooksInstalled)
-        }
-        .controlSize(.small)
-        .disabled(controller.isRunningCodexSetup)
 
         if let message = controller.operationMessage {
           SettingsMessage(message, color: .secondary)
@@ -715,13 +688,43 @@ private struct IntegrationSettingsView: View {
       Button("Cancel", role: .cancel) {}
     } message: {
       Text(
-        "Existing third-party clients will stop working until they use the new token. The bundled CLI and Codex adapter read the updated token automatically."
+        "Existing third-party clients will stop working until they use the new token. The bundled CLI and the Codex and Claude Code adapters read the updated token automatically."
       )
     }
   }
 
   private var maskedToken: String {
     String(repeating: "•", count: 32)
+  }
+
+  private func agentHooksRow(_ agent: CodingAgent) -> some View {
+    let installed = controller.hooksInstalled(for: agent)
+    return HStack(spacing: 8) {
+      Image(systemName: installed ? "checkmark.circle.fill" : "circle.dashed")
+        .foregroundStyle(installed ? .green : .secondary)
+      VStack(alignment: .leading, spacing: 1) {
+        Text(agent.displayName)
+        Text(installed ? "Lifecycle hooks are installed" : "Lifecycle hooks are not installed")
+          .font(.caption)
+          .foregroundStyle(.secondary)
+      }
+      Spacer()
+      if controller.isRunningAgentSetup {
+        ProgressView()
+          .controlSize(.small)
+      }
+      Button(installed ? "Reinstall" : "Install") {
+        controller.installHooks(for: agent)
+      }
+      Button("Remove") {
+        controller.removeHooks(for: agent)
+      }
+      .disabled(!installed)
+    }
+    .controlSize(.small)
+    .disabled(controller.isRunningAgentSetup)
+    .accessibilityElement(children: .contain)
+    .accessibilityLabel("\(agent.displayName) hooks")
   }
 
   private var serverStatusLabel: String {

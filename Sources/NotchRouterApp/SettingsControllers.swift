@@ -211,19 +211,21 @@ final class DisplaySelectionController {
 final class IntegrationSettingsController {
   private(set) var token: String
   private(set) var operationMessage: String?
-  private(set) var isRunningCodexSetup = false
+  private(set) var isRunningAgentSetup = false
   private(set) var codexHooksInstalled = false
+  private(set) var claudeHooksInstalled = false
   private(set) var browserOperationMessage: String?
   private(set) var isRunningBrowserSetup = false
   private(set) var browserExtensionInstalled = false
   /// Installed integrations keep running the helper copied at install time.
   /// After an app update that copy can be outdated (for example still using
   /// TCP), so offer an explicit update instead of failing silently.
-  private(set) var codexHooksNeedUpdate = false
+  /// Codex and Claude Code hooks run the same installed helper.
+  private(set) var agentHooksNeedUpdate = false
   private(set) var browserBridgeNeedsUpdate = false
   // Comparisons run in the background; only the newest result may publish,
   // so a check that started before an install or removal cannot win.
-  @ObservationIgnored private var codexHelperCheck = 0
+  @ObservationIgnored private var agentHelperCheck = 0
   @ObservationIgnored private var browserHelperCheck = 0
 
   let endpoint: String
@@ -240,7 +242,7 @@ final class IntegrationSettingsController {
     self.server = server
     self.clipboard = clipboard
     endpoint = "http://localhost/v1/activities"
-    refreshCodexHookStatus()
+    refreshAgentHookStatus()
     refreshBrowserExtensionStatus()
   }
 
@@ -291,12 +293,16 @@ final class IntegrationSettingsController {
     server.start()
   }
 
-  func installCodexHooks() {
-    runCodexSetup(command: "install-codex-hooks")
+  func installHooks(for agent: CodingAgent) {
+    runAgentSetup(command: agent == .codex ? "install-codex-hooks" : "install-claude-hooks")
   }
 
-  func removeCodexHooks() {
-    runCodexSetup(command: "remove-codex-hooks")
+  func removeHooks(for agent: CodingAgent) {
+    runAgentSetup(command: agent == .codex ? "remove-codex-hooks" : "remove-claude-hooks")
+  }
+
+  func hooksInstalled(for agent: CodingAgent) -> Bool {
+    agent == .codex ? codexHooksInstalled : claudeHooksInstalled
   }
 
   func installBrowserExtension() {
@@ -351,23 +357,23 @@ final class IntegrationSettingsController {
     NSWorkspace.shared.open(AppPaths.applicationSupportDirectory)
   }
 
-  private func runCodexSetup(command: String) {
-    guard !isRunningCodexSetup else { return }
+  private func runAgentSetup(command: String) {
+    guard !isRunningAgentSetup else { return }
     guard let executableURL = Self.notchCLIURL() else {
       operationMessage =
         "notchctl was not found. Build the packaged app before installing hooks."
       return
     }
 
-    isRunningCodexSetup = true
+    isRunningAgentSetup = true
     operationMessage = nil
     Task { [weak self] in
       let result = await Task.detached(priority: .userInitiated) {
         Self.run(executableURL: executableURL, arguments: [command])
       }.value
       guard let self else { return }
-      self.isRunningCodexSetup = false
-      self.refreshCodexHookStatus()
+      self.isRunningAgentSetup = false
+      self.refreshAgentHookStatus()
       self.operationMessage = result.message
     }
   }
@@ -393,11 +399,12 @@ final class IntegrationSettingsController {
     }
   }
 
-  private func refreshCodexHookStatus() {
-    codexHooksInstalled = Self.codexHooksAreInstalled()
-    let installed = codexHooksInstalled
-    codexHelperCheck &+= 1
-    let check = codexHelperCheck
+  private func refreshAgentHookStatus() {
+    codexHooksInstalled = AgentHooksFile.codex.isInstalled()
+    claudeHooksInstalled = AgentHooksFile.claudeCode.isInstalled()
+    let installed = codexHooksInstalled || claudeHooksInstalled
+    agentHelperCheck &+= 1
+    let check = agentHelperCheck
     Task { [weak self] in
       let stale = await Task.detached(priority: .utility) {
         installed && Self.helperIsStale(
@@ -405,8 +412,8 @@ final class IntegrationSettingsController {
           bundled: Self.notchCLIURL()
         )
       }.value
-      guard let self, check == self.codexHelperCheck else { return }
-      self.codexHooksNeedUpdate = stale
+      guard let self, check == self.agentHelperCheck else { return }
+      self.agentHooksNeedUpdate = stale
     }
   }
 
@@ -527,17 +534,6 @@ final class IntegrationSettingsController {
       }
       buffer.append(data)
     }
-  }
-
-  nonisolated private static func codexHooksAreInstalled() -> Bool {
-    let hooksURL = FileManager.default.homeDirectoryForCurrentUser
-      .appendingPathComponent(".codex", isDirectory: true)
-      .appendingPathComponent("hooks.json")
-    guard
-      let data = try? Data(contentsOf: hooksURL),
-      let text = String(data: data, encoding: .utf8)
-    else { return false }
-    return text.contains("notchctl") && text.contains("codex-hook")
   }
 
   nonisolated private static func browserExtensionIsInstalled() -> Bool {

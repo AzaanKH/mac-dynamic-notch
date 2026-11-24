@@ -155,7 +155,17 @@ private final class LocalAPIExchange: @unchecked Sendable {
         queue.asyncAfter(deadline: .now() + timeout, execute: deadline)
         connection.stateUpdateHandler = { [weak self] state in
           guard let self else { return }
-          if case .failed(let error) = state { self.finish(.failure(error)) }
+          switch state {
+          case .failed(let error): self.finish(.failure(error))
+          // With no listener (NotchRouter closed, stale socket), the
+          // connection waits and retries until the deadline instead of
+          // failing. Hooks wait on every request, so give up at once. Other
+          // waiting reasons, such as a brief network path change, can still
+          // recover before the deadline.
+          case .waiting(.posix(let code)) where code == .ECONNREFUSED || code == .ENOENT:
+            self.finish(.failure(NWError.posix(code)))
+          default: break
+          }
         }
         connection.start(queue: queue)
         connection.send(content: request, completion: .contentProcessed { [weak self] error in
