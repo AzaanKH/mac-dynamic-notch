@@ -85,8 +85,15 @@ Choose **Music → Enable Music Controls**. When Apple Music or Spotify is
 running, macOS may request Automation permission for that app. The integration
 reads the current title, artist, album, duration, position, and playback state
 and exposes previous, play/pause, and next controls. Spotify's current artwork
-URL supplies the cover image; Apple Music uses a native fallback because its
-public scripting metadata does not expose an artwork URL.
+URL supplies the cover image. Apple Music's cover is read from the current
+track's artwork data once per track (matched by its persistent ID), not on every
+poll, and only a 256-pixel JPEG thumbnail of it is kept; tracks without artwork
+keep the native fallback.
+
+With Apple Music, the Music section also shows shuffle, repeat (off, all, one),
+and favorite controls. Each sends the target state to Music, so a repeated click
+cannot reverse a command that has not been reflected yet. Older Music versions
+call favorite "love"; the same control works there.
 
 The hover mini-player and expanded Music section also expose the current system
 output volume. The slider follows output-device and keyboard volume changes,
@@ -99,21 +106,28 @@ shortcuts to the other sections. A deliberate click opens the full Music section
 immediately. Playback changes update the compact artwork and playback state but
 never open the mini-player on their own.
 
-When artwork is available (Spotify or the browser bridge), NotchRouter samples
+When artwork is available (Apple Music, Spotify, or the browser bridge), NotchRouter samples
 the cover art and tints the notch with a soft ambient glow derived from the
 dominant color. The compact playback glyph, progress bar, and play button pick
 up the same accent. Colors are normalized for legibility on black and cached per
 artwork URL. Increased Contrast suppresses the glow; Reduce Motion limits
-transitions. Apple Music's native fallback keeps the default pink
-accent because its scripting metadata exposes no artwork URL.
+transitions. Tracks without artwork keep the default pink accent.
 
-Previous and next schedule fast follow-up polls after the player accepts the
-command, so new metadata replaces the old track without waiting for the regular
-eight-second playback poll.
+Track and playback changes appear immediately. Music and Spotify post a
+system notification whenever either changes, and NotchRouter re-reads the player
+as soon as one arrives (it also re-reads when a player quits). Notifications are
+observed with immediate delivery, because macOS otherwise holds them while
+NotchRouter is in the background. They only trigger a query; the query remains
+the single source of what is shown. Polling continues as a backup: every 8
+seconds while playing and 30 while paused until a player's first notification,
+then every 20 and 60 seconds, which still catches seeks made inside the player.
+Previous and next also schedule fast follow-up queries after the player accepts
+the command.
 
 Each script request runs away from the UI and has a timeout, so a stalled player
-cannot freeze the notch. Polling stops completely when music support is
-disabled.
+cannot freeze the notch. Waiting for a script holds no thread: process exit,
+output, and the timeout each resume the request when they happen. Polling and
+notification observers stop completely when music support is disabled.
 
 NotchRouter also holds a per-user process lock. Launching another installed or
 development copy brings the existing instance forward instead of creating a
@@ -165,6 +179,8 @@ header before decoding. Other formats, and sites that prevent artwork access,
 retain the fallback icon. Legacy extensions can still report playback, but their artwork
 URLs are never fetched by native code. Native Spotify artwork is restricted to
 recognized Spotify HTTPS hosts, with an 8 MB streaming limit and bounded decoding.
+Apple Music artwork never touches the network; it is read locally from Music
+with the same 8 MB and decoding limits.
 
 The same setup is available from the CLI:
 

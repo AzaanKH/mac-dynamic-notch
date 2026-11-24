@@ -73,6 +73,13 @@ func musicPollingAdaptsToPlaybackState() {
     ) == 30
   )
   #expect(MusicController.pollInterval(for: nil) == 30)
+  // Once players are known to post change notifications, polls are a backup.
+  #expect(
+    MusicController.pollInterval(
+      for: snapshot(title: "Playing", isPlaying: true), receivesNotifications: true
+    ) == 20
+  )
+  #expect(MusicController.pollInterval(for: nil, receivesNotifications: true) == 60)
 }
 
 @MainActor

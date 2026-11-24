@@ -38,7 +38,7 @@ func artworkRejectsUnknownDestinationsAndBoundsDeclaredAndActualBodies() async t
   }
 }
 
-private func png(width: Int, height: Int) throws -> Data {
+func png(width: Int, height: Int) throws -> Data {
   let context = try #require(CGContext(data: nil, width: width, height: height, bitsPerComponent: 8,
     bytesPerRow: width * 4, space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
   let image = try #require(context.makeImage())

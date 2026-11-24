@@ -2,9 +2,11 @@ import CoreGraphics
 import Foundation
 import ImageIO
 
-/// Browser artwork is transferred as bytes. Only the native Spotify integration uses a URL.
+/// Browser and Apple Music artwork arrive as bytes. Only the native Spotify
+/// integration uses a URL.
 enum ArtworkSource: Hashable, Sendable {
   case browser(Data)
+  case appleMusic(Data)
   case spotify(URL)
 }
 
@@ -55,6 +57,7 @@ actor ArtworkLoader {
     let data: Data?
     switch source {
     case .browser(let bytes): data = bytes.count <= maximumBrowserBytes ? bytes : nil
+    case .appleMusic(let bytes): data = bytes
     case .spotify(let url): data = try? await download(url: url)
     }
     guard let data else { return nil }
@@ -104,6 +107,25 @@ actor ArtworkLoader {
       kCGImageSourceCreateThumbnailWithTransform: true,
       kCGImageSourceShouldCacheImmediately: true,
     ] as CFDictionary)
+  }
+}
+
+extension ArtworkLoader {
+  /// Re-encodes a cover as the same bounded thumbnail the views display, so
+  /// only a few kilobytes are kept instead of the original image.
+  nonisolated static func thumbnailJPEG(from data: Data) -> Data? {
+    guard let image = decode(data) else { return nil }
+    let output = NSMutableData()
+    guard
+      let destination = CGImageDestinationCreateWithData(
+        output, "public.jpeg" as CFString, 1, nil
+      )
+    else { return nil }
+    CGImageDestinationAddImage(
+      destination, image,
+      [kCGImageDestinationLossyCompressionQuality: 0.85] as CFDictionary
+    )
+    return CGImageDestinationFinalize(destination) ? output as Data : nil
   }
 }
 
