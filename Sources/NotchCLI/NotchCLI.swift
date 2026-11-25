@@ -161,11 +161,19 @@ enum NotchCLI {
     do {
       let input = FileHandle.standardInput.readDataToEndOfFile()
       let hook = try JSONDecoder().decode(AgentHookEvent.self, from: input)
-      let host = AgentHookHost(environment: ProcessInfo.processInfo.environment)
-      guard var event = hook.activityEvent(agent: agent, host: host) else { return }
+      let host = AgentHookHost(environment: ProcessInfo.processInfo.environment, agent: agent)
+      let stateStore = AgentHookStateStore()
+      // A delegated helper's work already shows on the thread that started it.
+      let activityID = hook.activityID(agent: agent, host: host)
+      if hook.startsDelegatedTurn(agent: agent, host: host) {
+        try stateStore.hide(activityID)
+        return
+      }
+      guard !stateStore.isHidden(activityID),
+        var event = hook.activityEvent(agent: agent, host: host)
+      else { return }
       event.timestamp = startedAt
 
-      let stateStore = AgentHookStateStore()
       guard try stateStore.shouldPublish(event) else {
         return
       }
@@ -323,7 +331,7 @@ enum NotchCLI {
         Each T3 Code thread is one activity, whichever agent it uses.
 
       STATES
-        queued, running, needs_approval, stale, succeeded, failed, cancelled
+        queued, running, needs_approval, limited, stale, succeeded, failed, cancelled
 
       SEND OPTIONS
         --message TEXT

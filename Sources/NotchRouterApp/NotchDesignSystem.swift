@@ -227,21 +227,30 @@ struct MusicAmbientGlow: View {
 struct ActivityStatusGlyph: View {
   let state: ActivityState
   let size: CGFloat
+  /// When the activity last changed. Running work pulses once per change.
+  var lastUpdate: Date?
   @Environment(\.colorSchemeContrast) private var contrast
   @Environment(\.accessibilityReduceMotion) private var reduceMotion
   @State private var approvalBounces = 0
+  @State private var updatePulses = 0
 
   var body: some View {
     Image(systemName: state.symbolName)
       .font(.system(size: size * 0.43, weight: .semibold))
       .dashboardTint(state.tint)
-      .symbolEffect(.pulse, isActive: state == .running && !reduceMotion)
+      // A pulse that repeats while work runs redraws the notch every frame
+      // for as long as an agent works, which is hours with long-lived agent
+      // threads. One pulse per update still shows the work is alive.
+      .symbolEffect(.pulse, options: .nonRepeating, value: updatePulses)
       .symbolEffect(.bounce, options: .repeat(2), value: approvalBounces)
       .symbolSwap(on: state)
       // Bounce only on the change into approval, not when a view is created
       // already in that state or when the request is resolved.
       .onChange(of: state) { _, newState in
         if newState == .needsApproval, !reduceMotion { approvalBounces += 1 }
+      }
+      .onChange(of: lastUpdate) { _, _ in
+        if state == .running, !reduceMotion { updatePulses += 1 }
       }
       .frame(width: size, height: size)
       .background(
@@ -437,6 +446,7 @@ extension ActivityState {
     case .queued: "Queued"
     case .running: "Working"
     case .needsApproval: "Needs review"
+    case .limited: "Limited"
     case .stale: "Disconnected"
     case .succeeded: "Completed"
     case .failed: "Failed"
@@ -449,6 +459,7 @@ extension ActivityState {
     case .queued: "clock"
     case .running: "sparkles"
     case .needsApproval: "hand.raised.fill"
+    case .limited: "hourglass"
     case .stale: "wifi.slash"
     case .succeeded: "checkmark"
     case .failed: "exclamationmark"
@@ -461,6 +472,7 @@ extension ActivityState {
     case .queued: .gray
     case .running: .cyan
     case .needsApproval: .orange
+    case .limited: .yellow
     case .stale: .gray
     case .succeeded: .green
     case .failed: .red
@@ -473,6 +485,7 @@ extension ActivityState {
     case .queued: "Queued"
     case .running: "Work is in progress"
     case .needsApproval: "Your review is required"
+    case .limited: "Waiting for a usage limit to reset"
     case .stale: "No recent heartbeat"
     case .succeeded: "Completed successfully"
     case .failed: "The activity failed"

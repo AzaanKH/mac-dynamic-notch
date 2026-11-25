@@ -270,10 +270,12 @@ Update the same `--id` when its state changes:
   --action-url "https://example.com/reviews/42"
 ```
 
-Valid states are `queued`, `running`, `needs_approval`, `stale`, `succeeded`,
-`failed`, and `cancelled`. NotchRouter automatically marks any nonterminal
-activity as `stale` (shown as **Disconnected**) when it receives no update for
-five minutes. Send an identical nonterminal update at least once a minute as a
+Valid states are `queued`, `running`, `needs_approval`, `limited`, `stale`,
+`succeeded`, `failed`, and `cancelled`. Use `limited` (shown as **Limited**) for
+work paused until a usage or rate limit resets; it is listed under Attention
+and does not count as in progress. NotchRouter automatically marks any other
+nonterminal activity as `stale` (shown as **Disconnected**) when it receives no
+update for five minutes. Send an identical nonterminal update at least once a minute as a
 heartbeat; heartbeats refresh liveness without adding duplicate history,
 reordering activities, or reopening the notch.
 
@@ -318,17 +320,28 @@ Notification      → —                             needs_approval (permission
 PostToolUse       → running (periodic heartbeat)  running (periodic heartbeat)
 Stop              → succeeded, or failed without  succeeded (“Turn finished.” without
                     a final response              a text reply)
+StopFailure       → —                             limited for a usage limit (“You've hit
+                                                  your 5-hour limit · resets 6:30pm”),
+                                                  otherwise failed with the API error
 SessionEnd        → —                             cancelled, only if still in progress
 ```
 
-**Identity.** Inside T3 Code, each thread is one activity, labelled “Codex · T3
-Code” or “Claude Code · T3 Code”, keyed by the `T3CODE_THREAD_ID` that T3 Code
-gives every agent process. Switching a thread between agents updates the same
-row, and no thread is reported twice. Outside T3 Code, Codex activities are per
-turn and Claude Code activities per session. Claude Code subagents share their
-parent's session, so their tool use updates the parent's activity. Threads that
-T3 Code starts on an agent's behalf (delegated reviews and similar helpers) are
-not shown.
+**Identity.** Activities from agents that T3 Code starts are labelled “Codex ·
+T3 Code” or “Claude Code · T3 Code”. T3 Code starts Claude Code once per thread
+with that thread's `T3CODE_THREAD_ID`, so each Claude thread is one activity
+across turns. T3 Code runs one Codex server for all threads, which has no thread
+ID, so Codex activities are per turn, as they are outside T3 Code. Claude Code
+activities outside T3 Code are per session. A T3 Code thread ID is used only
+when the agent carries T3 Code's launch marker (`CLAUDE_CODE_ENTRYPOINT=t3-code`
+or Codex's `T3` originator): T3 Code's terminals also set the variable, and an
+editor or CLI opened from one would otherwise be filed under that thread.
+Claude Code subagents share their parent's session, so their tool use updates
+the parent's activity. Work that T3 Code delegates to a helper (reviews and
+similar) is not shown, because the thread that delegated it already is: Claude
+helpers are recognized by their delegated thread ID, Codex helpers by the brief
+that starts their turn. Messages T3 Code sends in place of the user, such as
+delegation briefs and “Delegated task … [completed]” notices, never become
+titles.
 
 The adapters publish the workspace name, lifecycle state, tool name, and a
 final response excerpt of up to 1,000 characters to local NotchRouter. A
@@ -344,7 +357,7 @@ running events are coalesced to one heartbeat per minute.
 **Cost.** A hook run takes about 9 ms (12 ms including the shell the agent
 starts it in). Claude Code runs the frequent hooks, `PostToolUse` and
 `UserPromptSubmit`, in the background (`"async": true`), so they do not hold up
-tool calls. `Stop`, `SessionEnd`, and approval hooks stay synchronous because
+tool calls. `Stop`, `StopFailure`, `SessionEnd`, and approval hooks stay synchronous because
 they are rare and carry the states that must arrive. Codex hooks are
 synchronous. Each event carries the time its hook started, so a background hook
 that finishes late cannot move an activity back to running. The installed

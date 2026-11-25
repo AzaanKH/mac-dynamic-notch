@@ -227,7 +227,10 @@ func claudeHooksMergeIntoSettingsWithoutDisturbingOtherSettings() throws {
     ((installed[eventName]?.last?["hooks"] as? [[String: Any]])?.first?["async"] as? Bool) == true
   }
   #expect(isAsync("PostToolUse") && isAsync("UserPromptSubmit"))
-  #expect(!isAsync("Stop") && !isAsync("SessionEnd") && !isAsync("PermissionRequest") && !isAsync("Notification"))
+  #expect(
+    !isAsync("Stop") && !isAsync("StopFailure") && !isAsync("SessionEnd") && !isAsync("PermissionRequest")
+      && !isAsync("Notification")
+  )
 
   // Codex handlers are not Claude handlers, in either direction.
   #expect(!AgentHooksFile.codex.isInstalled(at: url))
@@ -314,4 +317,27 @@ func reinstallingKeepsEveryHookInPlaceForCodexTrust() throws {
   try file.install(command: updated, at: url)
   #expect(commands(in: try hooks(at: url)["Stop"]) == [updated, "other-tool stop"])
   #expect(commands(in: try hooks(at: url)["PostToolUse"]) == [updated])
+}
+
+@Test
+func installsFromAnEarlierVersionReportTheEventsTheyLack() throws {
+  let url = try temporaryHooksURL()
+  defer { removeDirectory(of: url) }
+  let claudeCommand = "'/Users/me/Library/Application Support/NotchRouter/bin/notchctl' claude-hook"
+  let file = AgentHooksFile.claudeCode
+  #expect(!file.isMissingEvents(at: url), "Nothing installed, nothing to update")
+
+  // An install made before StopFailure was registered.
+  try file.install(command: claudeCommand, at: url)
+  var root = try #require(try JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any])
+  var table = try #require(root["hooks"] as? [String: Any])
+  table["StopFailure"] = nil
+  root["hooks"] = table
+  try JSONSerialization.data(withJSONObject: root).write(to: url)
+  #expect(file.isInstalled(at: url))
+  #expect(file.isMissingEvents(at: url))
+
+  try file.install(command: claudeCommand, at: url)
+  #expect(!file.isMissingEvents(at: url))
+  #expect(commands(in: try hooks(at: url)["StopFailure"]) == [claudeCommand])
 }

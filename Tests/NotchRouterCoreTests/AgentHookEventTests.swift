@@ -184,30 +184,146 @@ func claudeCodeHooksMapToActivityStates() throws {
 
 @Test
 func t3CodeThreadsAreOneActivityAcrossAgentsAndSkipDelegatedThreads() throws {
-  let host = AgentHookHost(environment: ["T3CODE_THREAD_ID": "723a8c12-7e6b-4058-b605-9d5b83905d81"])
-  let codex = try #require(
-    AgentHookEvent(sessionID: "codex-session", turnID: "turn-1", cwd: "/tmp/notch", hookEventName: "UserPromptSubmit")
-      .activityEvent(agent: .codex, host: host)
+  let thread = "723a8c12-7e6b-4058-b605-9d5b83905d81"
+  let claudeHost = AgentHookHost(
+    environment: ["CLAUDE_CODE_ENTRYPOINT": "t3-code", "T3CODE_THREAD_ID": thread], agent: .claudeCode
   )
   let claude = try #require(
     AgentHookEvent(sessionID: "claude-session", turnID: nil, cwd: "/tmp/notch", hookEventName: "Stop", lastAssistantMessage: "Done")
-      .activityEvent(agent: .claudeCode, host: host)
+      .activityEvent(agent: .claudeCode, host: claudeHost)
   )
-  #expect(codex.activityID == "t3-723a8c12-7e6b-4058-b605-9d5b83905d81")
-  #expect(claude.activityID == codex.activityID, "Switching agents updates the same row")
-  #expect(codex.source == "Codex · T3 Code")
+  #expect(claude.activityID == "t3-\(thread)")
   #expect(claude.source == "Claude Code · T3 Code")
 
+  // A Codex process serving one thread joins the same row.
+  let codexHost = AgentHookHost(
+    environment: ["CODEX_INTERNAL_ORIGINATOR_OVERRIDE": "T3", "T3CODE_THREAD_ID": thread], agent: .codex
+  )
+  let codex = try #require(
+    AgentHookEvent(sessionID: "codex-session", turnID: "turn-1", cwd: "/tmp/notch", hookEventName: "UserPromptSubmit")
+      .activityEvent(agent: .codex, host: codexHost)
+  )
+  #expect(codex.activityID == claude.activityID, "Switching agents updates the same row")
+  #expect(codex.source == "Codex · T3 Code")
+
   // Threads T3 starts on an agent's behalf, such as reviews, are not shown.
-  let delegated = AgentHookHost(environment: ["T3CODE_THREAD_ID": "thread:delegated-task:command%3Amcp%3Areview"])
+  let delegated = AgentHookHost(
+    environment: [
+      "CLAUDE_CODE_ENTRYPOINT": "t3-code",
+      "T3CODE_THREAD_ID": "thread:delegated-task:command%3Amcp%3Areview",
+    ],
+    agent: .claudeCode
+  )
   #expect(delegated.isDelegatedT3Thread)
   #expect(
     AgentHookEvent(sessionID: "s", turnID: nil, cwd: "/tmp", hookEventName: "UserPromptSubmit")
       .activityEvent(agent: .claudeCode, host: delegated) == nil
   )
 
-  #expect(AgentHookHost(environment: ["T3CODE_THREAD_ID": "  "]).t3ThreadID == nil)
-  #expect(AgentHookHost(environment: [:]).t3ThreadID == nil)
+  let blank = AgentHookHost(environment: ["CLAUDE_CODE_ENTRYPOINT": "t3-code", "T3CODE_THREAD_ID": "  "], agent: .claudeCode)
+  #expect(blank.isT3 && blank.t3ThreadID == nil)
+  #expect(AgentHookHost(environment: [:], agent: .claudeCode) == AgentHookHost())
+}
+
+@Test
+func t3ThreadIDCountsOnlyForAgentsThatT3CodeLaunched() throws {
+  // T3 Code's terminals set the thread ID too, so an editor or CLI opened
+  // from one inherits it. Those sessions are not that thread.
+  let leaked = ["T3CODE_THREAD_ID": "cb56324d-88b3-410e-a9f1-fbfe84265edf", "T3CODE_PROJECT_ROOT": "/p"]
+  let vscodeCodex = AgentHookHost(
+    environment: leaked.merging(["CODEX_INTERNAL_ORIGINATOR_OVERRIDE": "codex_vscode"]) { $1 }, agent: .codex
+  )
+  let terminalClaude = AgentHookHost(
+    environment: leaked.merging(["CLAUDE_CODE_ENTRYPOINT": "cli"]) { $1 }, agent: .claudeCode
+  )
+  #expect(vscodeCodex == AgentHookHost())
+  #expect(terminalClaude == AgentHookHost())
+  let turn = AgentHookEvent(sessionID: "s", turnID: "turn-9", cwd: "/tmp/p", hookEventName: "UserPromptSubmit")
+  #expect(turn.activityEvent(agent: .codex, host: vscodeCodex)?.activityID == "codex-turn-9")
+  #expect(turn.activityEvent(agent: .codex, host: vscodeCodex)?.source == "Codex")
+
+  // T3 Code's shared Codex server serves every thread and has no thread ID:
+  // its turns are labelled as T3 Code work and keyed per turn.
+  let sharedServer = AgentHookHost(
+    environment: ["CODEX_INTERNAL_ORIGINATOR_OVERRIDE": "T3", "T3CODE_CLI_PATH": "/x/t3"], agent: .codex
+  )
+  #expect(sharedServer.isT3 && sharedServer.t3ThreadID == nil)
+  let event = try #require(turn.activityEvent(agent: .codex, host: sharedServer))
+  #expect(event.activityID == "codex-turn-9")
+  #expect(event.source == "Codex · T3 Code")
+}
+
+@Test
+func codexTurnsThatT3DelegatesAreRecognizedByTheirBrief() {
+  let t3 = AgentHookHost(isT3: true)
+  func prompt(_ text: String, _ name: String = "UserPromptSubmit") -> AgentHookEvent {
+    AgentHookEvent(sessionID: "s", turnID: "t", cwd: "/tmp/p", hookEventName: name, prompt: text)
+  }
+  let brief = prompt(
+    "[T3 Code: the agent in T3 thread \"92d36bc1\" sent this message, not the user.] Act as the test sub-agent."
+  )
+  #expect(brief.startsDelegatedTurn(agent: .codex, host: t3))
+  #expect(!brief.startsDelegatedTurn(agent: .codex, host: AgentHookHost()), "Only inside T3 Code")
+  #expect(!brief.startsDelegatedTurn(agent: .claudeCode, host: t3), "Claude helpers have their own thread ID")
+  #expect(!prompt("Fix the build").startsDelegatedTurn(agent: .codex, host: t3))
+}
+
+@Test
+func messagesT3CodeSendsForTheUserNeverBecomeTitles() throws {
+  let host = AgentHookHost(isT3: true, t3ThreadID: "92d36bc1")
+  for notice in [
+    "Delegated task node:delegated-task:command%3Amcp%3A68bf%3Adelegate-task%3Asol-147-r2 (Sol review R2: PR #147) [completed]. Use task_status with taskId …",
+    "Delegated task node:delegated-task:limit-resume%3Athread%3Adelegated-task (Resume) [completed].",
+    "[T3 Code: the agent in T3 thread \"x\" sent this message, not the user.] Please rebase.",
+  ] {
+    let event = try #require(
+      AgentHookEvent(sessionID: "s", turnID: nil, cwd: "/tmp/p", hookEventName: "UserPromptSubmit", prompt: notice)
+        .activityEvent(agent: .claudeCode, host: host)
+    )
+    #expect(event.state == .running, "The agent is working on it")
+    // No task title, so NotchRouter keeps the title it already has.
+    #expect(event.taskTitle == nil)
+  }
+}
+
+@Test
+func claudeStopFailureWaitsOutUsageLimitsAndFailsOnOtherErrors() throws {
+  let input = Data(
+    """
+    {"session_id":"abc","cwd":"/Users/me/fantasy-draft","hook_event_name":"StopFailure",
+     "error":"rate_limit","error_details":"429",
+     "last_assistant_message":"You've hit your 5-hour limit · resets 6:30pm (America/Los_Angeles)"}
+    """.utf8
+  )
+  let hook = try JSONDecoder().decode(AgentHookEvent.self, from: input)
+  let limited = try #require(hook.activityEvent(agent: .claudeCode))
+  #expect(limited.state == .limited)
+  #expect(limited.message == "You've hit your 5-hour limit · resets 6:30pm (America/Los_Angeles)")
+  #expect(!limited.state.isTerminal, "The thread resumes after the reset")
+
+  let silent = AgentHookEvent(sessionID: "s", turnID: nil, cwd: "/tmp/p", hookEventName: "StopFailure", error: "rate_limit")
+  #expect(silent.activityEvent(agent: .claudeCode)?.message == "Waiting for a usage limit to reset.")
+
+  let overloaded = AgentHookEvent(
+    sessionID: "s", turnID: nil, cwd: "/tmp/p", hookEventName: "StopFailure",
+    lastAssistantMessage: "API Error: Repeated 529 Overloaded errors", error: "overloaded"
+  )
+  #expect(overloaded.activityEvent(agent: .claudeCode)?.state == .failed)
+  #expect(overloaded.activityEvent(agent: .claudeCode)?.message == "API Error: Repeated 529 Overloaded errors")
+  #expect(overloaded.activityEvent(agent: .codex) == nil, "Codex has no such hook")
+}
+
+@Test
+func hiddenTurnsStayHiddenForTheirLaterHooks() throws {
+  let directory = FileManager.default.temporaryDirectory
+    .appendingPathComponent("AgentHookHidden-\(UUID().uuidString)", isDirectory: true)
+  defer { try? FileManager.default.removeItem(at: directory) }
+  let store = AgentHookStateStore(directory: directory)
+  #expect(!store.isHidden("codex-turn-1"))
+  try store.hide("codex-turn-1")
+  #expect(store.isHidden("codex-turn-1"))
+  #expect(!store.isHidden("codex-turn-2"))
+  #expect(AgentHookStateStore(directory: directory).isHidden("codex-turn-1"), "Hooks run in separate processes")
 }
 
 @Test

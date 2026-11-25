@@ -294,7 +294,7 @@ private struct ActivityCard: View {
   var body: some View {
     VStack(alignment: .leading, spacing: 9) {
       HStack(alignment: .top, spacing: 9) {
-        ActivityStatusGlyph(state: activity.state, size: 25)
+        ActivityStatusGlyph(state: activity.state, size: 25, lastUpdate: activity.updatedAt)
 
         VStack(alignment: .leading, spacing: 3) {
           HStack(spacing: 5) {
@@ -345,10 +345,6 @@ private struct ActivityCard: View {
         }
         .buttonStyle(NotchSubtleButtonStyle())
         .accessibilityValue(showsDetails ? "Expanded" : "Collapsed")
-
-        Text(activity.history.count == 1 ? "1 update" : "\(activity.history.count) updates")
-          .font(.caption)
-          .dashboardTertiaryText()
 
         Spacer()
 

@@ -102,6 +102,21 @@ public struct AgentHookStateStore: Sendable {
     }
   }
 
+  /// Keeps every later hook of `activityID` from being shown. Used for turns
+  /// that a delegated helper runs, which only their first hook identifies.
+  public func hide(_ activityID: String) throws {
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    cleanupExpiredFiles()
+    let url = stateURL(for: activityID).deletingPathExtension().appendingPathExtension("hidden")
+    try Data().write(to: url, options: .atomic)
+    try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+  }
+
+  public func isHidden(_ activityID: String) -> Bool {
+    let url = stateURL(for: activityID).deletingPathExtension().appendingPathExtension("hidden")
+    return FileManager.default.fileExists(atPath: url.path)
+  }
+
   /// Serializes record's read, check, and write across hook processes. The
   /// kernel releases the lock if a holder exits, so a killed hook cannot
   /// leave it held.
@@ -134,7 +149,7 @@ public struct AgentHookStateStore: Sendable {
       return
     }
     let cutoff = Date().addingTimeInterval(-7 * 24 * 60 * 60)
-    for file in files where file.pathExtension == "state" {
+    for file in files where ["state", "hidden"].contains(file.pathExtension) {
       guard let values = try? file.resourceValues(forKeys: [.contentModificationDateKey]),
         let modifiedAt = values.contentModificationDate,
         modifiedAt < cutoff

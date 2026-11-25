@@ -45,6 +45,9 @@ public struct AgentHooksFile: Sendable {
       Registration(eventName: "PostToolUse", matcher: "*", isAsync: true),
       Registration(eventName: "Notification", matcher: "permission_prompt"),
       Registration(eventName: "Stop", matcher: nil),
+      // Runs instead of Stop when an API error, such as a usage limit, ends
+      // the turn. Without it the activity would stay "Working".
+      Registration(eventName: "StopFailure", matcher: nil),
       Registration(eventName: "SessionEnd", matcher: nil),
     ],
     defaultURL: FileManager.default.homeDirectoryForCurrentUser
@@ -108,6 +111,18 @@ public struct AgentHooksFile: Sendable {
     else { return false }
     return eventNames.contains { eventName in
       (hooks[eventName] as? [[String: Any]]).map(containsAdapterHandler) ?? false
+    }
+  }
+
+  /// Whether an install from an earlier version lacks an event this version
+  /// registers. Reinstalling adds it.
+  public func isMissingEvents(at url: URL? = nil) -> Bool {
+    guard let root = try? readRoot(at: url ?? defaultURL),
+      let hooks = root["hooks"] as? [String: Any],
+      isInstalled(at: url)
+    else { return false }
+    return eventNames.contains { eventName in
+      !((hooks[eventName] as? [[String: Any]]).map(containsAdapterHandler) ?? false)
     }
   }
 

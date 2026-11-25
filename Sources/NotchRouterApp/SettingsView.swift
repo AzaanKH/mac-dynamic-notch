@@ -294,7 +294,7 @@ private struct NotificationSettingsView: View {
         .disabled(!service.isEnabled)
 
         SettingsMessage(
-          "Queued, running, stale, and cancelled updates stay in the notch without generating a system notification.",
+          "Queued, running, limited, stale, and cancelled updates stay in the notch without generating a system notification.",
           color: .secondary
         )
       }

@@ -407,10 +407,11 @@ final class IntegrationSettingsController {
     let check = agentHelperCheck
     Task { [weak self] in
       let stale = await Task.detached(priority: .utility) {
-        installed && Self.helperIsStale(
-          installed: Self.installedHelperURL("notchctl"),
-          bundled: Self.notchCLIURL()
-        )
+        installed
+          && (Self.helperIsStale(
+            installed: Self.installedHelperURL("notchctl"),
+            bundled: Self.notchCLIURL()
+          ) || AgentHooksFile.codex.isMissingEvents() || AgentHooksFile.claudeCode.isMissingEvents())
       }.value
       guard let self, check == self.agentHelperCheck else { return }
       self.agentHooksNeedUpdate = stale
