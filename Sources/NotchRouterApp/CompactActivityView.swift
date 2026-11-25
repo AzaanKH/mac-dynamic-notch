@@ -39,7 +39,7 @@ struct CompactActivityView: View {
   private func physicalNotchLayout(_ activity: AIActivity) -> some View {
     HStack(spacing: 8) {
       HStack(spacing: 7) {
-        ActivityStatusGlyph(state: activity.state, size: 19)
+        ActivityStatusGlyph(state: activity.state, size: 19, lastUpdate: activity.updatedAt)
         Text(activity.source)
           .font(.callout.weight(.semibold))
           .lineLimit(1)
@@ -67,7 +67,7 @@ struct CompactActivityView: View {
 
   private func softwareNotchLayout(_ activity: AIActivity) -> some View {
     HStack(spacing: 9) {
-      ActivityStatusGlyph(state: activity.state, size: isPeek ? 24 : 20)
+      ActivityStatusGlyph(state: activity.state, size: isPeek ? 24 : 20, lastUpdate: activity.updatedAt)
 
       VStack(alignment: .leading, spacing: 2) {
         HStack(spacing: 5) {

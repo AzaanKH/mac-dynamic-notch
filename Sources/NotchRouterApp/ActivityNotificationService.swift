@@ -254,7 +254,7 @@ final class ActivityNotificationService: NSObject,
     case .needsApproval: .approval
     case .succeeded: .completion
     case .failed: .failure
-    case .queued, .running, .stale, .cancelled: nil
+    case .queued, .running, .limited, .stale, .cancelled: nil
     }
   }
 

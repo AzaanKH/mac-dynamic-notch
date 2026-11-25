@@ -15,7 +15,7 @@ extension ActivityState {
     switch self {
     case .queued, .running:
       .active
-    case .needsApproval:
+    case .needsApproval, .limited:
       .attentionRequired
     case .stale, .succeeded, .failed, .cancelled:
       .completed
@@ -199,14 +199,14 @@ final class ActivityStore {
     }
   }
 
+  /// A limited agent is listed with attention items but sorts after work in
+  /// progress, so the closed notch keeps showing what is still running.
   private func priority(of state: ActivityState) -> Int {
-    switch state.activityGroup {
-    case .attentionRequired:
-      return 0
-    case .active:
-      return 1
-    case .completed:
-      return 2
+    switch state {
+    case .needsApproval: 0
+    case .queued, .running: 1
+    case .limited: 2
+    case .stale, .succeeded, .failed, .cancelled: 3
     }
   }
 

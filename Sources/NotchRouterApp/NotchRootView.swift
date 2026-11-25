@@ -220,7 +220,7 @@ struct NotchRootView: View {
     if viewModel.presentation.primary == .music, let snapshot = music.nowPlaying {
       MusicArtworkView(snapshot: snapshot, size: 18, cornerRadius: 4)
     } else if viewModel.presentation.primary == .agent, let activity = store.activeActivity {
-      ActivityStatusGlyph(state: activity.state, size: 16)
+      ActivityStatusGlyph(state: activity.state, size: 16, lastUpdate: activity.updatedAt)
     } else {
       Image(systemName: viewModel.presentation.primary?.symbolName ?? "sparkles")
     }

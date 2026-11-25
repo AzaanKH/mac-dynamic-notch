@@ -11,6 +11,9 @@ public enum ActivityState: String, Codable, CaseIterable, Sendable {
   case queued
   case running
   case needsApproval = "needs_approval"
+  /// Paused by a usage or rate limit until it resets. The agent resumes on
+  /// its own (T3 Code retries after the reset), so nothing is in progress.
+  case limited
   case stale
   case succeeded
   case failed
@@ -20,7 +23,7 @@ public enum ActivityState: String, Codable, CaseIterable, Sendable {
     switch self {
     case .stale, .succeeded, .failed, .cancelled:
       true
-    case .queued, .running, .needsApproval:
+    case .queued, .running, .needsApproval, .limited:
       false
     }
   }
@@ -335,7 +338,8 @@ public struct AIActivity: Codable, Identifiable, Sendable {
     at now: Date = Date(),
     after expiryWindow: TimeInterval = ActivityLiveness.defaultExpiryWindow
   ) -> Bool {
-    guard !state.isTerminal,
+    // A limited agent sends nothing until its limit resets, often hours later.
+    guard !state.isTerminal, state != .limited,
       now.timeIntervalSince(lastHeartbeatAt) >= max(0, expiryWindow)
     else {
       return false

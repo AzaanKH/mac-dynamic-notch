@@ -85,8 +85,15 @@ Choose **Music → Enable Music Controls**. When Apple Music or Spotify is
 running, macOS may request Automation permission for that app. The integration
 reads the current title, artist, album, duration, position, and playback state
 and exposes previous, play/pause, and next controls. Spotify's current artwork
-URL supplies the cover image; Apple Music uses a native fallback because its
-public scripting metadata does not expose an artwork URL.
+URL supplies the cover image. Apple Music's cover is read from the current
+track's artwork data once per track (matched by its persistent ID), not on every
+poll, and only a 256-pixel JPEG thumbnail of it is kept; tracks without artwork
+keep the native fallback.
+
+With Apple Music, the Music section also shows shuffle, repeat (off, all, one),
+and favorite controls. Each sends the target state to Music, so a repeated click
+cannot reverse a command that has not been reflected yet. Older Music versions
+call favorite "love"; the same control works there.
 
 The hover mini-player and expanded Music section also expose the current system
 output volume. The slider follows output-device and keyboard volume changes,
@@ -99,21 +106,28 @@ shortcuts to the other sections. A deliberate click opens the full Music section
 immediately. Playback changes update the compact artwork and playback state but
 never open the mini-player on their own.
 
-When artwork is available (Spotify or the browser bridge), NotchRouter samples
+When artwork is available (Apple Music, Spotify, or the browser bridge), NotchRouter samples
 the cover art and tints the notch with a soft ambient glow derived from the
 dominant color. The compact playback glyph, progress bar, and play button pick
 up the same accent. Colors are normalized for legibility on black and cached per
 artwork URL. Increased Contrast suppresses the glow; Reduce Motion limits
-transitions. Apple Music's native fallback keeps the default pink
-accent because its scripting metadata exposes no artwork URL.
+transitions. Tracks without artwork keep the default pink accent.
 
-Previous and next schedule fast follow-up polls after the player accepts the
-command, so new metadata replaces the old track without waiting for the regular
-eight-second playback poll.
+Track and playback changes appear immediately. Music and Spotify post a
+system notification whenever either changes, and NotchRouter re-reads the player
+as soon as one arrives (it also re-reads when a player quits). Notifications are
+observed with immediate delivery, because macOS otherwise holds them while
+NotchRouter is in the background. They only trigger a query; the query remains
+the single source of what is shown. Polling continues as a backup: every 8
+seconds while playing and 30 while paused until a player's first notification,
+then every 20 and 60 seconds, which still catches seeks made inside the player.
+Previous and next also schedule fast follow-up queries after the player accepts
+the command.
 
 Each script request runs away from the UI and has a timeout, so a stalled player
-cannot freeze the notch. Polling stops completely when music support is
-disabled.
+cannot freeze the notch. Waiting for a script holds no thread: process exit,
+output, and the timeout each resume the request when they happen. Polling and
+notification observers stop completely when music support is disabled.
 
 NotchRouter also holds a per-user process lock. Launching another installed or
 development copy brings the existing instance forward instead of creating a
@@ -165,6 +179,8 @@ header before decoding. Other formats, and sites that prevent artwork access,
 retain the fallback icon. Legacy extensions can still report playback, but their artwork
 URLs are never fetched by native code. Native Spotify artwork is restricted to
 recognized Spotify HTTPS hosts, with an 8 MB streaming limit and bounded decoding.
+Apple Music artwork never touches the network; it is read locally from Music
+with the same 8 MB and decoding limits.
 
 The same setup is available from the CLI:
 
@@ -254,10 +270,12 @@ Update the same `--id` when its state changes:
   --action-url "https://example.com/reviews/42"
 ```
 
-Valid states are `queued`, `running`, `needs_approval`, `stale`, `succeeded`,
-`failed`, and `cancelled`. NotchRouter automatically marks any nonterminal
-activity as `stale` (shown as **Disconnected**) when it receives no update for
-five minutes. Send an identical nonterminal update at least once a minute as a
+Valid states are `queued`, `running`, `needs_approval`, `limited`, `stale`,
+`succeeded`, `failed`, and `cancelled`. Use `limited` (shown as **Limited**) for
+work paused until a usage or rate limit resets; it is listed under Attention
+and does not count as in progress. NotchRouter automatically marks any other
+nonterminal activity as `stale` (shown as **Disconnected**) when it receives no
+update for five minutes. Send an identical nonterminal update at least once a minute as a
 heartbeat; heartbeats refresh liveness without adding duplicate history,
 reordering activities, or reopening the notch.
 
@@ -273,50 +291,95 @@ Useful diagnostics:
 .build/NotchRouter.app/Contents/Resources/bin/notchctl list
 ```
 
-### T3 Code and Codex adapter
+### Coding agent adapters: Codex, Claude Code, and T3 Code
 
-T3 Code uses the Codex app server, so the same Codex lifecycle hooks can publish
-its working state to NotchRouter. Build the release CLI, install the user-level
-hooks, and restart T3 Code:
+NotchRouter installs opt-in, user-level lifecycle hooks for Codex and Claude
+Code. Because they are user-level, they also cover T3 Code: T3 Code runs Codex
+through the Codex app server and Claude through Claude Code, and both read the
+same user hooks. Install either or both from **Settings → Integrations → Coding
+agents**, or from the CLI:
 
 ```sh
 swift build -c release
-.build/release/notchctl install-codex-hooks
+.build/release/notchctl install-codex-hooks    # ~/.codex/hooks.json
+.build/release/notchctl install-claude-hooks   # ~/.claude/settings.json
 ```
 
-In a new Codex or T3 Code conversation, open `/hooks` and trust the four
-NotchRouter hooks. Codex intentionally requires this review whenever a new or
-changed command hook is installed.
+Codex requires you to review new or changed command hooks: in a new Codex or T3
+Code conversation, open `/hooks` and trust the NotchRouter hooks. Claude Code
+loads them in new sessions; running sessions pick them up after you review them
+with `/hooks`.
 
-The adapter maps lifecycle events as follows:
+The adapters map lifecycle events as follows:
 
 ```text
-UserPromptSubmit  → running
-PermissionRequest → needs_approval
-PostToolUse       → running (and periodic heartbeat)
-Stop              → succeeded (or failed when no final response exists)
+                    Codex                         Claude Code
+UserPromptSubmit  → running                       running
+PermissionRequest → needs_approval                needs_approval
+Notification      → —                             needs_approval (permission prompts only)
+PostToolUse       → running (periodic heartbeat)  running (periodic heartbeat)
+Stop              → succeeded, or failed without  succeeded (“Turn finished.” without
+                    a final response              a text reply)
+StopFailure       → —                             limited for a usage limit (“You've hit
+                                                  your 5-hour limit · resets 6:30pm”),
+                                                  otherwise failed with the API error
+SessionEnd        → —                             cancelled, only if still in progress
 ```
 
-It publishes the turn identifier, workspace name, lifecycle state, tool name,
-and a final response excerpt of up to 1,000 characters to local NotchRouter.
-A `task_title` label or the hook's `prompt` supplies a task title of up to 160
+**Identity.** Activities from agents that T3 Code starts are labelled “Codex ·
+T3 Code” or “Claude Code · T3 Code”. T3 Code starts Claude Code once per thread
+with that thread's `T3CODE_THREAD_ID`, so each Claude thread is one activity
+across turns. T3 Code runs one Codex server for all threads, which has no thread
+ID, so Codex activities are per turn, as they are outside T3 Code. Claude Code
+activities outside T3 Code are per session. A T3 Code thread ID is used only
+when the agent carries T3 Code's launch marker (`CLAUDE_CODE_ENTRYPOINT=t3-code`
+or Codex's `T3` originator): T3 Code's terminals also set the variable, and an
+editor or CLI opened from one would otherwise be filed under that thread.
+Claude Code subagents share their parent's session, so their tool use updates
+the parent's activity. Work that T3 Code delegates to a helper (reviews and
+similar) is not shown, because the thread that delegated it already is: Claude
+helpers are recognized by their delegated thread ID, Codex helpers by the brief
+that starts their turn. Messages T3 Code sends in place of the user, such as
+delegation briefs and “Delegated task … [completed]” notices, never become
+titles.
+
+The adapters publish the workspace name, lifecycle state, tool name, and a
+final response excerpt of up to 1,000 characters to local NotchRouter. A
+`task_title` label or the hook's `prompt` supplies a task title of up to 160
 characters, retained across later updates. If neither is supplied, the card
 uses “AI work”. Show details expands the saved message and dated update history.
 Prompt and response excerpts may contain sensitive task content and are saved
-in local activity history. The adapter does not read transcripts or tool output.
+in local activity history. The adapters do not read transcripts or tool output.
 Delivery is best-effort: if NotchRouter is closed, the hook exits successfully
-and never interrupts Codex. Changed details publish immediately; identical
-running events are coalesced to one heartbeat per minute. Re-running the installer is
-safe and updates the existing NotchRouter commands without replacing unrelated
-hooks or the `notify` command in `~/.codex/config.toml`. The installer copies a
+and never interrupts the agent. Changed details publish immediately; identical
+running events are coalesced to one heartbeat per minute.
+
+**Cost.** A hook run takes about 9 ms (12 ms including the shell the agent
+starts it in). Claude Code runs the frequent hooks, `PostToolUse` and
+`UserPromptSubmit`, in the background (`"async": true`), so they do not hold up
+tool calls. `Stop`, `StopFailure`, `SessionEnd`, and approval hooks stay synchronous because
+they are rare and carry the states that must arrive. Codex hooks are
+synchronous. Each event carries the time its hook started, so a background hook
+that finishes late cannot move an activity back to running. The installed
+command checks for the helper first (`[ ! -x helper ] || helper claude-hook`),
+so a settings file copied to a Mac without NotchRouter, for example through
+dotfiles, costs about 4 ms per hook and reports no errors. A Mac where the
+installer never ran has no hooks and no cost.
+
+Re-running an installer is safe. It updates only NotchRouter's commands and
+leaves unrelated hooks, matchers, and settings in place (including Codex's
+`notify` command in `~/.codex/config.toml` and every other Claude Code setting).
+The files are rewritten with sorted keys and user-only permissions; a file that
+does not have the expected structure is left unchanged. Each installer copies a
 standalone `notchctl` to `~/Library/Application Support/NotchRouter/bin`, so the
-hook does not depend on the repository or its `.build` directory remaining in
+hooks do not depend on the repository or its `.build` directory remaining in
 place.
 
 To remove only the NotchRouter hooks:
 
 ```sh
 .build/release/notchctl remove-codex-hooks
+.build/release/notchctl remove-claude-hooks
 ```
 
 ## Integrate another app

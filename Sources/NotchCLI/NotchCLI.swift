@@ -1,4 +1,3 @@
-import CryptoKit
 import Foundation
 import NotchRouterCore
 
@@ -33,11 +32,17 @@ enum NotchCLI {
     case "health":
       try await health()
     case "codex-hook":
-      await codexHook()
+      await agentHook(.codex)
+    case "claude-hook":
+      await agentHook(.claudeCode)
     case "install-codex-hooks":
-      try installCodexHooks()
+      try installHooks(.codex)
+    case "install-claude-hooks":
+      try installHooks(.claudeCode)
     case "remove-codex-hooks":
-      try removeCodexHooks()
+      try removeHooks(.codex)
+    case "remove-claude-hooks":
+      try removeHooks(.claudeCode)
     case "install-browser-extension":
       try installBrowserExtension()
     case "remove-browser-extension":
@@ -148,13 +153,27 @@ enum NotchCLI {
     print(String(data: data, encoding: .utf8) ?? "OK")
   }
 
-  private static func codexHook() async {
+  private static func agentHook(_ agent: CodingAgent) async {
+    // Background hooks can be delivered out of order. Stamping each event
+    // with the moment its hook started lets NotchRouter and the state store
+    // ignore an update that arrives after a newer one.
+    let startedAt = Date()
     do {
       let input = FileHandle.standardInput.readDataToEndOfFile()
-      let hook = try JSONDecoder().decode(CodexHookEvent.self, from: input)
-      guard let event = hook.activityEvent() else { return }
+      let hook = try JSONDecoder().decode(AgentHookEvent.self, from: input)
+      let host = AgentHookHost(environment: ProcessInfo.processInfo.environment, agent: agent)
+      let stateStore = AgentHookStateStore()
+      // A delegated helper's work already shows on the thread that started it.
+      let activityID = hook.activityID(agent: agent, host: host)
+      if hook.startsDelegatedTurn(agent: agent, host: host) {
+        try stateStore.hide(activityID)
+        return
+      }
+      guard !stateStore.isHidden(activityID),
+        var event = hook.activityEvent(agent: agent, host: host)
+      else { return }
+      event.timestamp = startedAt
 
-      let stateStore = CodexHookStateStore()
       guard try stateStore.shouldPublish(event) else {
         return
       }
@@ -168,19 +187,33 @@ enum NotchCLI {
       )
       try stateStore.record(event)
     } catch {
-      // Hooks are advisory. A closed NotchRouter app must never interrupt Codex.
+      // Hooks are advisory. A closed NotchRouter app must never interrupt an agent.
     }
   }
 
-  private static func installCodexHooks() throws {
-    let executablePath = try installCodexAdapterExecutable()
-    try CodexHooksFile.install(command: "\(shellQuote(executablePath)) codex-hook")
-
-    print("Installed Codex lifecycle hooks in \(CodexHooksFile.defaultURL.path)")
-    print("Restart T3 Code, then review and trust the new hooks with /hooks.")
+  private static func hooksFile(_ agent: CodingAgent) -> AgentHooksFile {
+    switch agent {
+    case .codex: .codex
+    case .claudeCode: .claudeCode
+    }
   }
 
-  private static func installCodexAdapterExecutable() throws -> String {
+  private static func installHooks(_ agent: CodingAgent) throws {
+    let file = hooksFile(agent)
+    let executablePath = try installAdapterExecutable()
+    try file.install(command: file.command(helperPath: executablePath))
+
+    print("Installed \(agent.displayName) lifecycle hooks in \(file.defaultURL.path)")
+    switch agent {
+    case .codex:
+      print("Restart T3 Code, then review and trust the new hooks with /hooks.")
+    case .claudeCode:
+      print("New Claude Code sessions, including T3 Code's Claude threads, use them.")
+      print("Already-running sessions pick them up after you review them with /hooks.")
+    }
+  }
+
+  private static func installAdapterExecutable() throws -> String {
     let sourceURL =
       Bundle.main.executableURL
       ?? URL(fileURLWithPath: CommandLine.arguments[0]).standardizedFileURL
@@ -203,15 +236,16 @@ enum NotchCLI {
     return destinationURL.path
   }
 
-  private static func removeCodexHooks() throws {
-    let path = CodexHooksFile.defaultURL.path
-    switch try CodexHooksFile.remove() {
+  private static func removeHooks(_ agent: CodingAgent) throws {
+    let file = hooksFile(agent)
+    let path = file.defaultURL.path
+    switch try file.remove() {
     case .noFile:
-      print("No Codex hooks file exists; nothing to remove.")
+      print("\(path) does not exist; nothing to remove.")
     case .nothingToRemove:
       print("No NotchRouter hooks are installed in \(path); nothing to remove.")
     case .removed:
-      print("Removed NotchRouter's Codex lifecycle hooks from \(path)")
+      print("Removed NotchRouter's \(agent.displayName) lifecycle hooks from \(path)")
     }
   }
 
@@ -283,16 +317,21 @@ enum NotchCLI {
         notchctl token
         notchctl install-codex-hooks
         notchctl remove-codex-hooks
+        notchctl install-claude-hooks
+        notchctl remove-claude-hooks
         notchctl install-browser-extension
         notchctl remove-browser-extension
         notchctl browser-extension-status
 
-      CODEX ADAPTER
-        codex-hook reads a Codex lifecycle hook from standard input.
-        install-codex-hooks adds user-level hooks for T3 Code and Codex.
+      AGENT ADAPTERS
+        codex-hook and claude-hook read a lifecycle hook from standard input.
+        install-codex-hooks adds user-level hooks for Codex and T3 Code's
+        Codex threads. install-claude-hooks adds them to Claude Code's user
+        settings, covering the Claude Code CLI and T3 Code's Claude threads.
+        Each T3 Code thread is one activity, whichever agent it uses.
 
       STATES
-        queued, running, needs_approval, stale, succeeded, failed, cancelled
+        queued, running, needs_approval, limited, stale, succeeded, failed, cancelled
 
       SEND OPTIONS
         --message TEXT
@@ -305,99 +344,6 @@ enum NotchCLI {
         Re-send an identical nonterminal activity at least once a minute.
       """
     )
-  }
-
-  private static func shellQuote(_ value: String) -> String {
-    "'\(value.replacingOccurrences(of: "'", with: "'\\''"))'"
-  }
-}
-
-private struct CodexHookStateStore {
-  private let directory = AppPaths.applicationSupportDirectory
-    .appendingPathComponent("codex-adapter-state", isDirectory: true)
-
-  private struct Publication: Codable {
-    let state: ActivityState
-    let fingerprint: String
-  }
-
-  private func fingerprint(_ event: ActivityEventRequest) throws -> String {
-    let encoder = ActivityCoding.makeEncoder()
-    encoder.outputFormatting = [.sortedKeys]
-    return SHA256.hash(data: try encoder.encode(event))
-      .map { String(format: "%02x", $0) }.joined()
-  }
-
-  func shouldPublish(
-    _ event: ActivityEventRequest,
-    now: Date = Date()
-  ) throws -> Bool {
-    let activityID = event.activityID
-    // Legacy files contain only a state string. Publish once to upgrade them.
-    guard let data = try? Data(contentsOf: stateURL(for: activityID)),
-      let previous = try? JSONDecoder().decode(Publication.self, from: data),
-      previous.state == event.state,
-      previous.fingerprint == (try fingerprint(event))
-    else {
-      return true
-    }
-    guard !event.state.isTerminal else {
-      return false
-    }
-    guard
-      let values = try? stateURL(for: activityID).resourceValues(
-        forKeys: [.contentModificationDateKey]
-      ),
-      let lastPublishedAt = values.contentModificationDate
-    else {
-      return true
-    }
-    return now.timeIntervalSince(lastPublishedAt) >= ActivityLiveness.heartbeatInterval
-  }
-
-  func record(_ event: ActivityEventRequest) throws {
-    let activityID = event.activityID
-    try FileManager.default.createDirectory(
-      at: directory,
-      withIntermediateDirectories: true
-    )
-    cleanupExpiredFiles()
-    let url = stateURL(for: activityID)
-    let publication = Publication(state: event.state, fingerprint: try fingerprint(event))
-    try JSONEncoder().encode(publication).write(to: url, options: .atomic)
-    try FileManager.default.setAttributes(
-      [.posixPermissions: 0o600],
-      ofItemAtPath: url.path
-    )
-  }
-
-  private func stateURL(for activityID: String) -> URL {
-    let digest = SHA256.hash(data: Data(activityID.utf8))
-      .map { String(format: "%02x", $0) }
-      .joined()
-    return directory.appendingPathComponent("\(digest).state")
-  }
-
-  private func cleanupExpiredFiles() {
-    guard
-      let files = try? FileManager.default.contentsOfDirectory(
-        at: directory,
-        includingPropertiesForKeys: [.contentModificationDateKey],
-        options: [.skipsHiddenFiles]
-      )
-    else {
-      return
-    }
-    let cutoff = Date().addingTimeInterval(-7 * 24 * 60 * 60)
-    for file in files where file.pathExtension == "state" {
-      guard let values = try? file.resourceValues(forKeys: [.contentModificationDateKey]),
-        let modifiedAt = values.contentModificationDate,
-        modifiedAt < cutoff
-      else {
-        continue
-      }
-      try? FileManager.default.removeItem(at: file)
-    }
   }
 }
 

@@ -304,3 +304,32 @@ func togglingLegacyTCPRepeatedlyRebindsTheSamePort() async throws {
   try await send(connection, "GET /v1/health HTTP/1.1\r\n\r\n")
   #expect(await response(connection).hasPrefix("HTTP/1.1 200"))
 }
+
+@Test
+func requestToAClosedAppFailsImmediatelyInsteadOfWaitingForTheTimeout() async throws {
+  // A socket file left behind by a NotchRouter that is no longer running.
+  let directory = URL(fileURLWithPath: "/tmp/notch-stale-\(UUID().uuidString)")
+  try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+  defer { try? FileManager.default.removeItem(at: directory) }
+  let socketURL = directory.appendingPathComponent("api.sock")
+  let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+  var address = sockaddr_un()
+  address.sun_family = sa_family_t(AF_UNIX)
+  withUnsafeMutableBytes(of: &address.sun_path) { $0.copyBytes(from: Array(socketURL.path.utf8) + [0]) }
+  let bound = withUnsafePointer(to: &address) {
+    $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+      bind(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+    }
+  }
+  close(fd)
+  #expect(bound == 0)
+  chmod(socketURL.path, 0o600)
+  try LocalAPISocket.validateServer(at: socketURL)
+
+  let started = Date()
+  do {
+    _ = try await LocalAPIClient.request(path: "/v1/health", socketURL: socketURL, timeout: 4)
+    Issue.record("Nothing is listening, so the request must fail")
+  } catch {}
+  #expect(Date().timeIntervalSince(started) < 0.5, "Agent hooks wait on this request")
+}

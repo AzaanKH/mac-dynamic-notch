@@ -116,10 +116,58 @@ func everyActivityStateBelongsToOnePresentationGroup() {
   #expect(ActivityState.queued.activityGroup == .active)
   #expect(ActivityState.running.activityGroup == .active)
   #expect(ActivityState.needsApproval.activityGroup == .attentionRequired)
+  #expect(ActivityState.limited.activityGroup == .attentionRequired)
   #expect(ActivityState.stale.activityGroup == .completed)
   #expect(ActivityState.failed.activityGroup == .completed)
   #expect(ActivityState.succeeded.activityGroup == .completed)
   #expect(ActivityState.cancelled.activityGroup == .completed)
+}
+
+@MainActor
+@Test
+func limitedWorkWaitsForItsResetWithoutHidingWorkInProgress() async throws {
+  let directory = FileManager.default.temporaryDirectory
+    .appendingPathComponent(UUID().uuidString, isDirectory: true)
+  defer { try? FileManager.default.removeItem(at: directory) }
+
+  var now = Date(timeIntervalSince1970: 1_000)
+  let store = ActivityStore(
+    storageURL: directory.appendingPathComponent("activities.json"),
+    expiryWindow: 300,
+    dateProvider: { now }
+  )
+  try store.ingest(
+    ActivityEventRequest(activityID: "working", source: "Codex", title: "Run tests", state: .running)
+  )
+  now = now.addingTimeInterval(30)
+  try store.ingest(
+    ActivityEventRequest(
+      activityID: "limited", source: "Claude Code · T3 Code", title: "Draft board", state: .limited,
+      message: "You've hit your 5-hour limit · resets 6:30pm (America/Los_Angeles)"
+    )
+  )
+
+  // Newer, but the closed notch keeps showing the work that is running, and
+  // a paused thread is not counted as in progress.
+  #expect(store.activities.map(\.id) == ["working", "limited"])
+  #expect(store.activeActivity?.id == "working")
+  #expect(store.activeCount == 1)
+  #expect(store.count(in: .attentionRequired) == 1)
+
+  // Hours pass with no hook: the running work disconnects, the limited
+  // thread keeps waiting for its reset.
+  #expect(store.expireStaleActivities(at: now.addingTimeInterval(3 * 60 * 60)))
+  #expect(store.activities.first { $0.id == "working" }?.state == .stale)
+  #expect(store.activities.first { $0.id == "limited" }?.state == .limited)
+  #expect(store.activeActivity?.id == "limited")
+
+  // T3 Code resumes the thread after the reset.
+  try store.ingest(
+    ActivityEventRequest(activityID: "limited", source: "Claude Code · T3 Code", title: "Draft board", state: .running)
+  )
+  #expect(store.activities.first?.id == "limited")
+  #expect(store.activeCount == 1)
+  await store.flushPersistence()
 }
 
 @MainActor

@@ -53,10 +53,19 @@ struct NowPlayingSnapshot: Equatable, Sendable {
   var playbackRate: Double = 1
   var sampledAt: Date = Date()
   var artworkData: Data?
+  /// Apple Music's persistent ID for the track, used to match its cover.
+  var trackID: String?
+  /// Apple Music only; `nil` hides the control.
+  var shuffleEnabled: Bool?
+  var repeatMode: MusicRepeatMode?
+  var isFavorite: Bool?
 
   var artworkSource: ArtworkSource? {
-    if source == .browser { return artworkData.map(ArtworkSource.browser) }
-    return artworkURL.map(ArtworkSource.spotify)
+    switch source {
+    case .browser: artworkData.map(ArtworkSource.browser)
+    case .appleMusic: artworkData.map(ArtworkSource.appleMusic)
+    case .spotify: artworkURL.map(ArtworkSource.spotify)
+    }
   }
 
   var canSeek: Bool {
@@ -96,6 +105,15 @@ final class MusicController: NSObject {
   static let preferenceKey = "musicIntegrationEnabled"
   static let playingPollInterval: TimeInterval = 8
   static let inactivePollInterval: TimeInterval = 30
+  /// Once a player has posted a change notification, polling is only a
+  /// backup for missed notifications and for seeks made inside the player.
+  static let notifiedPlayingPollInterval: TimeInterval = 20
+  static let notifiedInactivePollInterval: TimeInterval = 60
+  /// Posted by Music and Spotify whenever the track or playback state changes.
+  static let playerChangeNotifications: [MusicSource: Notification.Name] = [
+    .appleMusic: Notification.Name("com.apple.Music.playerInfo"),
+    .spotify: Notification.Name("com.spotify.client.PlaybackStateChanged"),
+  ]
   private static let transportRefreshDelays: [Duration] = [
     .milliseconds(120),
     .milliseconds(480),
@@ -105,6 +123,8 @@ final class MusicController: NSObject {
   /// tabs and unloaded pages still end their sessions explicitly.
   static let backgroundBrowserSessionTimeout: TimeInterval = 90
   static let artworkPaletteCacheLimit = 12
+  /// Failed Apple Music cover reads are retried on later polls up to this many times.
+  static let appleMusicArtworkAttempts = 3
 
   private(set) var isEnabled: Bool
   private(set) var nowPlaying: NowPlayingSnapshot?
@@ -131,6 +151,25 @@ final class MusicController: NSObject {
   }
   private var refreshAfterCurrentTask = false
   private var nativeSnapshots: [NowPlayingSnapshot] = []
+  /// The cover for one Apple Music track. It is read once per track, not on
+  /// every poll, because the bytes can be large.
+  private struct AppleMusicArtwork {
+    let trackID: String
+    var data: Data?
+    var isSettled = false
+    var failures = 0
+  }
+  @ObservationIgnored private var appleMusicArtwork: AppleMusicArtwork?
+  @ObservationIgnored private var appleMusicArtworkTask: Task<Void, Never>?
+  /// Whether an Apple Music cover read is running. Lets tests wait for it.
+  var isLoadingAppleMusicArtwork: Bool { appleMusicArtworkTask != nil }
+  /// Whether a native player query is running. Lets tests wait for it.
+  var isRefreshing: Bool { refreshTask != nil }
+  private let nativePlayer: NativePlayerClient
+  @ObservationIgnored private var isObservingPlayers = false
+  /// Set by the first change notification. Until then polling stays fast,
+  /// in case a player version does not post notifications.
+  @ObservationIgnored private(set) var receivesPlayerNotifications = false
   private var browserSessions: [String: BrowserSession] = [:]
   private var pendingBrowserCommands: [String: [PendingBrowserControl]] = [:]
   private var artworkPaletteCache: [ArtworkSource: MusicArtworkPalette] = [:]
@@ -159,16 +198,66 @@ final class MusicController: NSObject {
     artworkPaletteLoader: @escaping @Sendable (ArtworkSource) async -> MusicArtworkPalette? = {
       await MusicArtworkPalette.load(source: $0)
     },
+    nativePlayer: NativePlayerClient = .live,
     dateProvider: @escaping () -> Date = Date.init
   ) {
     self.artworkPaletteLoader = artworkPaletteLoader
+    self.nativePlayer = nativePlayer
     self.dateProvider = dateProvider
     self.defaults = defaults
     isEnabled = defaults.bool(forKey: Self.preferenceKey)
     super.init()
     if isEnabled {
+      startObservingPlayers()
       refresh()
     }
+  }
+
+  /// Distributed notifications are held back while an app is inactive unless
+  /// they are observed with `.deliverImmediately`. NotchRouter is almost never
+  /// the active app, so the block-based API would delay them until a click.
+  private func startObservingPlayers() {
+    guard nativePlayer.observesSystemNotifications, !isObservingPlayers else { return }
+    isObservingPlayers = true
+    let center = DistributedNotificationCenter.default()
+    for name in Self.playerChangeNotifications.values {
+      center.addObserver(
+        self,
+        selector: #selector(playerStateDidChange(_:)),
+        name: name,
+        object: nil,
+        suspensionBehavior: .deliverImmediately
+      )
+    }
+    NSWorkspace.shared.notificationCenter.addObserver(
+      self,
+      selector: #selector(applicationDidTerminate(_:)),
+      name: NSWorkspace.didTerminateApplicationNotification,
+      object: nil
+    )
+  }
+
+  private func stopObservingPlayers() {
+    guard isObservingPlayers else { return }
+    isObservingPlayers = false
+    DistributedNotificationCenter.default().removeObserver(self)
+    NSWorkspace.shared.notificationCenter.removeObserver(self)
+  }
+
+  /// A player changed track or state. The notification only triggers a
+  /// query; the query stays the single source of truth for what is shown.
+  @objc func playerStateDidChange(_ notification: Notification) {
+    guard isEnabled else { return }
+    receivesPlayerNotifications = true
+    refresh(priority: true)
+  }
+
+  @objc private func applicationDidTerminate(_ notification: Notification) {
+    let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
+    guard isEnabled,
+      MusicSource.nativeCases.contains(where: { $0.bundleIdentifier == app?.bundleIdentifier })
+    else { return }
+    refresh(priority: true)
   }
 
   func setEnabled(_ enabled: Bool) {
@@ -177,8 +266,11 @@ final class MusicController: NSObject {
     permissionMessage = nil
 
     if enabled {
+      startObservingPlayers()
       refresh(allowsPermissionPrompt: true)
     } else {
+      stopObservingPlayers()
+      receivesPlayerNotifications = false
       nativeControls.cancelPending()
       stopPolling()
       refreshTask?.cancel()
@@ -186,6 +278,9 @@ final class MusicController: NSObject {
       transportRefreshTask?.cancel()
       transportRefreshTask = nil
       refreshAfterCurrentTask = false
+      appleMusicArtworkTask?.cancel()
+      appleMusicArtworkTask = nil
+      appleMusicArtwork = nil
       nativeSnapshots = []
       selectNowPlaying()
     }
@@ -203,18 +298,16 @@ final class MusicController: NSObject {
       return
     }
 
-    let runningSources = MusicSource.nativeCases.filter(isRunning)
+    let runningSources = nativePlayer.runningSources()
     guard !runningSources.isEmpty else {
       apply(MusicQueryBatch(snapshots: [], errorMessage: nil))
       return
     }
 
+    let query = nativePlayer.query
     refreshTask = Task { [weak self] in
       let timeout = allowsPermissionPrompt ? 15.0 : 2.0
-      let batch = await MusicScriptRunner.query(
-        sources: runningSources,
-        timeout: timeout
-      )
+      let batch = await query(runningSources, timeout)
       guard let self, !Task.isCancelled else { return }
       self.refreshTask = nil
       self.apply(batch)
@@ -238,6 +331,30 @@ final class MusicController: NSObject {
   func previousTrack() {
     pendingPosition = nil
     executeControl(.previous)
+  }
+
+  /// Shuffle, repeat, and favorite are Apple Music only. Each sends the
+  /// target state rather than a toggle, so a repeated click cannot undo a
+  /// command that has not been reflected by a query yet.
+  func toggleShuffle() {
+    guard let snapshot = nowPlaying, snapshot.source == .appleMusic,
+      let enabled = snapshot.shuffleEnabled
+    else { return }
+    executeControl(.setShuffle(!enabled))
+  }
+
+  func cycleRepeat() {
+    guard let snapshot = nowPlaying, snapshot.source == .appleMusic,
+      let mode = snapshot.repeatMode
+    else { return }
+    executeControl(.setRepeat(mode.next))
+  }
+
+  func toggleFavorite() {
+    guard let snapshot = nowPlaying, snapshot.source == .appleMusic,
+      let favorite = snapshot.isFavorite
+    else { return }
+    executeControl(.setFavorite(!favorite))
   }
 
   func seek(to position: Double) {
@@ -334,17 +451,24 @@ final class MusicController: NSObject {
   }
 
   static func pollInterval(
-    for snapshot: NowPlayingSnapshot?
+    for snapshot: NowPlayingSnapshot?,
+    receivesNotifications: Bool = false
   ) -> TimeInterval {
-    snapshot?.isPlaying == true
-      ? playingPollInterval
-      : inactivePollInterval
+    switch (snapshot?.isPlaying == true, receivesNotifications) {
+    case (true, false): playingPollInterval
+    case (false, false): inactivePollInterval
+    case (true, true): notifiedPlayingPollInterval
+    case (false, true): notifiedInactivePollInterval
+    }
   }
 
   private func scheduleNextPoll() {
     timer?.invalidate()
     timer = Timer.scheduledTimer(
-      timeInterval: Self.pollInterval(for: nowPlaying),
+      timeInterval: Self.pollInterval(
+        for: nowPlaying,
+        receivesNotifications: receivesPlayerNotifications
+      ),
       target: self,
       selector: #selector(poll),
       userInfo: nil,
@@ -391,17 +515,65 @@ final class MusicController: NSObject {
     browserExpiryTimer = timer
   }
 
-  private func isRunning(_ source: MusicSource) -> Bool {
-    NSWorkspace.shared.runningApplications.contains {
-      $0.bundleIdentifier == source.bundleIdentifier
-    }
-  }
-
-  private func apply(_ batch: MusicQueryBatch) {
-    nativeSnapshots = batch.snapshots
+  func apply(_ batch: MusicQueryBatch) {
+    nativeSnapshots = batch.snapshots.map(attachingAppleMusicArtwork)
+    requestAppleMusicArtworkIfNeeded()
     selectNowPlaying()
     permissionMessage = nowPlaying == nil ? batch.errorMessage : nil
     scheduleNextPoll()
+  }
+
+  private func attachingAppleMusicArtwork(
+    to snapshot: NowPlayingSnapshot
+  ) -> NowPlayingSnapshot {
+    guard snapshot.source == .appleMusic,
+      let trackID = snapshot.trackID,
+      let artwork = appleMusicArtwork, artwork.trackID == trackID
+    else { return snapshot }
+    var snapshot = snapshot
+    snapshot.artworkData = artwork.data
+    return snapshot
+  }
+
+  private func requestAppleMusicArtworkIfNeeded() {
+    guard
+      let trackID = nativeSnapshots.first(where: { $0.source == .appleMusic })?.trackID
+    else {
+      appleMusicArtworkTask?.cancel()
+      appleMusicArtworkTask = nil
+      appleMusicArtwork = nil
+      return
+    }
+    if let artwork = appleMusicArtwork, artwork.trackID == trackID {
+      guard appleMusicArtworkTask == nil, !artwork.isSettled,
+        artwork.failures < Self.appleMusicArtworkAttempts
+      else { return }
+    } else {
+      appleMusicArtworkTask?.cancel()
+      appleMusicArtworkTask = nil
+      appleMusicArtwork = AppleMusicArtwork(trackID: trackID)
+    }
+
+    let fetch = nativePlayer.artwork
+    appleMusicArtworkTask = Task { [weak self] in
+      let result = await fetch(trackID)
+      guard let self, !Task.isCancelled,
+        var artwork = self.appleMusicArtwork, artwork.trackID == trackID
+      else { return }
+      self.appleMusicArtworkTask = nil
+      switch result {
+      case .artwork(let data):
+        artwork.data = data
+        artwork.isSettled = true
+      case .unavailable:
+        artwork.isSettled = true
+      case .failed:
+        artwork.failures += 1
+      }
+      self.appleMusicArtwork = artwork
+      self.nativeSnapshots = self.nativeSnapshots.map(self.attachingAppleMusicArtwork)
+      self.selectNowPlaying()
+    }
   }
 
   private func selectNowPlaying() {
@@ -514,21 +686,18 @@ final class MusicController: NSObject {
     guard isEnabled else { return }
     let source =
       nowPlaying?.source
-      ?? MusicSource.nativeCases.first(where: isRunning)
+      ?? nativePlayer.runningSources().first
     guard let source else { return }
     let requestsPeek =
       control == .next
       || control == .previous
       || (control == .playPause && nowPlaying?.isPlaying != true)
 
+    let run = nativePlayer.control
     nativeControls.enqueue(control, source: source) { [weak self] control, source in
       // The integration can be disabled while this command waits its turn.
       guard let self, self.isEnabled else { return }
-      let error = await MusicScriptRunner.control(
-        control,
-        source: source,
-        timeout: 2
-      )
+      let error = await run(control, source)
       self.permissionMessage = error
       if error == nil, requestsPeek {
         self.onChange?(.userTransport)
@@ -562,6 +731,8 @@ final class MusicController: NSObject {
       guard snapshot.canSeek else { return }
       command = .seek
       position = target
+    case .setShuffle, .setRepeat, .setFavorite:
+      return
     }
     var commands = pendingBrowserCommands[sessionID] ?? []
     // A seek merges only into a seek queued directly before it, so it never
@@ -677,6 +848,46 @@ enum MusicControl: Equatable, Sendable {
   case next
   case previous
   case seek(Double)
+  case setShuffle(Bool)
+  case setRepeat(MusicRepeatMode)
+  case setFavorite(Bool)
+}
+
+enum MusicRepeatMode: String, Equatable, Sendable {
+  case off, all, one
+
+  /// Follows Music's own button: off, then all, then one.
+  var next: MusicRepeatMode {
+    switch self {
+    case .off: .all
+    case .all: .one
+    case .one: .off
+    }
+  }
+}
+
+/// The native player operations, injectable so tests never script the
+/// user's real Music or Spotify app.
+struct NativePlayerClient: Sendable {
+  var runningSources: @MainActor @Sendable () -> [MusicSource]
+  var query: @Sendable ([MusicSource], TimeInterval) async -> MusicQueryBatch
+  var control: @Sendable (MusicControl, MusicSource) async -> String?
+  var artwork: @Sendable (String) async -> NativeArtworkResult
+  var observesSystemNotifications = true
+
+  static let live = NativePlayerClient(
+    runningSources: {
+      let running = Set(
+        NSWorkspace.shared.runningApplications
+          .filter { !$0.isTerminated }
+          .compactMap(\.bundleIdentifier)
+      )
+      return MusicSource.nativeCases.filter { running.contains($0.bundleIdentifier) }
+    },
+    query: { await MusicScriptRunner.query(sources: $0, timeout: $1) },
+    control: { await MusicScriptRunner.control($0, source: $1, timeout: 2) },
+    artwork: { await MusicScriptRunner.appleMusicArtwork(trackID: $0, timeout: 4) }
+  )
 }
 
 /// Runs native Music/Spotify controls one at a time, in order: each is a
@@ -754,13 +965,21 @@ private enum BrowserMediaValidationError: LocalizedError {
   }
 }
 
-private struct MusicQueryBatch: Sendable {
+struct MusicQueryBatch: Sendable {
   let snapshots: [NowPlayingSnapshot]
   let errorMessage: String?
 }
 
+enum NativeArtworkResult: Equatable, Sendable {
+  case artwork(Data)
+  /// The track has no cover, or it stopped being the current track.
+  case unavailable
+  /// The player timed out or the script failed. A later poll retries.
+  case failed
+}
+
 enum MusicScriptRunner {
-  nonisolated fileprivate static func query(
+  nonisolated static func query(
     sources: [MusicSource],
     timeout: TimeInterval
   ) async -> MusicQueryBatch {
@@ -768,7 +987,7 @@ enum MusicScriptRunner {
     var firstError: String?
 
     for source in sources {
-      let result = run(script: queryScript(for: source), timeout: timeout)
+      let result = await run(script: queryScript(for: source), timeout: timeout)
       if let snapshot = parse(result.output, source: source) {
         snapshots.append(snapshot)
       } else if firstError == nil {
@@ -782,36 +1001,140 @@ enum MusicScriptRunner {
     )
   }
 
-  nonisolated fileprivate static func control(
+  nonisolated static func control(
     _ control: MusicControl,
     source: MusicSource,
     timeout: TimeInterval
   ) async -> String? {
+    let result = await run(script: controlScript(control, source: source), timeout: timeout)
+    return result.exitStatus == 0 ? nil : userFacingError(from: result)
+  }
+
+  nonisolated static func controlScript(_ control: MusicControl, source: MusicSource) -> String {
     let command: String
     switch control {
     case .playPause: command = "playpause"
     case .next: command = "next track"
     case .previous: command = "previous track"
     case .seek(let position): command = "set player position to \(position)"
+    case .setShuffle(let enabled): command = "set shuffle enabled to \(enabled)"
+    case .setRepeat(let mode): command = "set song repeat to \(mode.rawValue)"
+    // `pLov` is "favorited" in current Music and "loved" in older versions.
+    case .setFavorite(let favorite): command = "set «class pLov» of current track to \(favorite)"
     }
+    return "tell application id \"\(source.bundleIdentifier)\" to \(command)"
+  }
 
-    let result = run(
-      script: "tell application id \"\(source.bundleIdentifier)\" to \(command)",
-      timeout: timeout
+  /// Reads the current Apple Music cover, but only while `trackID` is still
+  /// the current track, so a cover is never stored under the wrong song.
+  nonisolated static func appleMusicArtwork(
+    trackID: String,
+    timeout: TimeInterval
+  ) async -> NativeArtworkResult {
+    guard let trackID = validTrackID(trackID) else { return .unavailable }
+    let script = """
+      tell application id "\(MusicSource.appleMusic.bundleIdentifier)"
+        if (player state as text) is "stopped" then return ""
+        set activeTrack to current track
+        if (persistent ID of activeTrack) is not "\(trackID)" then return ""
+        if (count of artworks of activeTrack) is 0 then return ""
+        return raw data of artwork 1 of activeTrack
+      end tell
+      """
+    // Covers are printed as hex, so allow twice the decoded size limit.
+    let result = await run(
+      script: script,
+      timeout: timeout,
+      outputLimit: ArtworkLoader.maximumDownloadBytes * 2 + 1_024
     )
-    return result.exitStatus == 0 ? nil : userFacingError(from: result)
+    if result.outputTooLarge { return .unavailable }
+    guard result.exitStatus == 0 else { return .failed }
+    let output = result.output.trimmingCharacters(in: .whitespacesAndNewlines)
+    if output.isEmpty { return .unavailable }
+    guard let original = parseRawData(output) else { return .failed }
+    // Keep a small thumbnail instead of the original, which is often close
+    // to a megabyte. An undecodable cover will not improve on retry.
+    return ArtworkLoader.thumbnailJPEG(from: original).map(NativeArtworkResult.artwork)
+      ?? .unavailable
+  }
+
+  /// Decodes AppleScript's display form of raw data, `«data JPEGFFD8…»`: a
+  /// four-character type code followed by the bytes in hexadecimal.
+  nonisolated static func parseRawData(_ output: String) -> Data? {
+    let bytes = Array(output.trimmingCharacters(in: .whitespacesAndNewlines).utf8)
+    let prefix = Array("«data ".utf8)
+    let suffix = Array("»".utf8)
+    let typeCodeLength = 4
+    guard bytes.count > prefix.count + typeCodeLength + suffix.count,
+      bytes.starts(with: prefix), bytes.suffix(suffix.count).elementsEqual(suffix)
+    else { return nil }
+    let hex = bytes[(prefix.count + typeCodeLength)..<(bytes.count - suffix.count)]
+    guard !hex.isEmpty, hex.count % 2 == 0,
+      hex.count / 2 <= ArtworkLoader.maximumDownloadBytes
+    else { return nil }
+
+    func nibble(_ byte: UInt8) -> UInt8? {
+      switch byte {
+      case UInt8(ascii: "0")...UInt8(ascii: "9"): byte - UInt8(ascii: "0")
+      case UInt8(ascii: "A")...UInt8(ascii: "F"): byte - UInt8(ascii: "A") + 10
+      case UInt8(ascii: "a")...UInt8(ascii: "f"): byte - UInt8(ascii: "a") + 10
+      default: nil
+      }
+    }
+    var data = Data(capacity: hex.count / 2)
+    var index = hex.startIndex
+    while index < hex.endIndex {
+      guard let high = nibble(hex[index]), let low = nibble(hex[index + 1]) else { return nil }
+      data.append(high << 4 | low)
+      index += 2
+    }
+    return data
+  }
+
+  /// Apple Music persistent IDs are hexadecimal. Anything else is dropped
+  /// before it can be placed in a script.
+  nonisolated private static func validTrackID(_ value: String) -> String? {
+    guard (1...32).contains(value.utf8.count),
+      value.utf8.allSatisfy({ $0 < 0x80 && Character(UnicodeScalar($0)).isHexDigit })
+    else { return nil }
+    return value
   }
 
   nonisolated private static func queryScript(for source: MusicSource) -> String {
     let durationExpression: String
     let artworkExpression: String
+    let trackLines: String
+    let playerLines: String
     switch source {
     case .appleMusic:
       durationExpression = "(duration of activeTrack) as text"
       artworkExpression = "\"\""
+      // Each optional field fails on its own: a stream item without an ID
+      // loses only its cover, and one that cannot be favorited loses only
+      // that button. `pLov` is "favorited" now and "loved" in older Music.
+      trackLines = """
+        try
+              set trackID to (persistent ID of activeTrack) as text
+            end try
+            try
+              set favoriteState to («class pLov» of activeTrack) as text
+            end try
+        """
+      playerLines = """
+        try
+            set shuffleState to shuffle enabled as text
+          end try
+          try
+            set repeatState to song repeat as text
+          end try
+        """
     case .spotify:
+      // Spotify's dictionary has no such terms, so they must not appear in
+      // its script at all; an unknown term fails compilation of everything.
       durationExpression = "((duration of activeTrack) / 1000) as text"
       artworkExpression = "(artwork url of activeTrack) as text"
+      trackLines = ""
+      playerLines = ""
     case .browser:
       return ""
     }
@@ -819,11 +1142,17 @@ enum MusicScriptRunner {
     return """
       tell application id "\(source.bundleIdentifier)"
         set playbackState to player state as text
+        set trackID to ""
+        set shuffleState to ""
+        set repeatState to ""
+        set favoriteState to ""
+        \(playerLines)
         if playbackState is "stopped" then
-          set outputValues to {playbackState, "", "", "", "0", "0", ""}
+          set outputValues to {playbackState, "", "", "", "0", "0", "", "", "", "", ""}
         else
           set activeTrack to current track
-          set outputValues to {playbackState, name of activeTrack, artist of activeTrack, album of activeTrack, \(durationExpression), (player position) as text, \(artworkExpression)}
+          \(trackLines)
+          set outputValues to {playbackState, name of activeTrack, artist of activeTrack, album of activeTrack, \(durationExpression), (player position) as text, \(artworkExpression), trackID, shuffleState, repeatState, favoriteState}
         end if
       end tell
       set previousDelimiters to AppleScript's text item delimiters
@@ -860,7 +1189,11 @@ enum MusicScriptRunner {
       sourceURL: nil,
       browserSessionID: nil,
       supportsPrevious: true,
-      supportsNext: true
+      supportsNext: true,
+      trackID: values.count >= 8 ? validTrackID(values[7]) : nil,
+      shuffleEnabled: values.count >= 9 ? Bool(values[8]) : nil,
+      repeatMode: values.count >= 10 ? MusicRepeatMode(rawValue: values[9]) : nil,
+      isFavorite: values.count >= 11 ? Bool(values[10]) : nil
     )
   }
 
@@ -871,18 +1204,23 @@ enum MusicScriptRunner {
     return value.isFinite && value >= 0 ? value : 0
   }
 
-  nonisolated private static func run(
+  /// Runs one script without occupying a thread while it waits: the exit,
+  /// the timeout, and both pipes each signal a latch instead of being polled.
+  nonisolated static func run(
     script: String,
-    timeout: TimeInterval
-  ) -> ScriptProcessResult {
+    timeout: TimeInterval,
+    outputLimit: Int = 262_144
+  ) async -> ScriptProcessResult {
     let process = Process()
     let standardOutput = Pipe()
     let standardError = Pipe()
+    let exited = AsyncLatch()
 
     process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
     process.arguments = ["-e", script]
     process.standardOutput = standardOutput
     process.standardError = standardError
+    process.terminationHandler = { _ in exited.open() }
 
     do {
       try process.run()
@@ -895,25 +1233,27 @@ enum MusicScriptRunner {
       )
     }
 
-    let deadline = Date().addingTimeInterval(timeout)
-    while process.isRunning, Date() < deadline {
-      Thread.sleep(forTimeInterval: 0.04)
-    }
+    // Both pipes are drained while the script runs. A reply larger than the
+    // pipe buffer would otherwise block osascript until the timeout.
+    let output = PipeReader(standardOutput, limit: outputLimit)
+    let errors = PipeReader(standardError, limit: 65_536)
 
-    let timedOut = process.isRunning
+    let timedOut = await !exited.wait(timeout: timeout)
+    var didExit = !timedOut
     if timedOut {
       process.terminate()
-      process.waitUntilExit()
+      didExit = await exited.wait(timeout: 2)
     }
 
-    let outputData = standardOutput.fileHandleForReading.readDataToEndOfFile()
-    let errorData = standardError.fileHandleForReading.readDataToEndOfFile()
+    let (outputData, outputTooLarge) = await output.finish()
+    let (errorData, _) = await errors.finish()
 
     return ScriptProcessResult(
-      output: String(decoding: outputData, as: UTF8.self),
+      output: outputTooLarge ? "" : String(decoding: outputData, as: UTF8.self),
       error: String(decoding: errorData, as: UTF8.self),
-      exitStatus: timedOut ? -1 : process.terminationStatus,
-      timedOut: timedOut
+      exitStatus: timedOut || !didExit ? -1 : process.terminationStatus,
+      timedOut: timedOut,
+      outputTooLarge: outputTooLarge
     )
   }
 
@@ -936,9 +1276,85 @@ enum MusicScriptRunner {
   }
 }
 
-private struct ScriptProcessResult: Sendable {
+struct ScriptProcessResult: Sendable {
   let output: String
   let error: String
   let exitStatus: Int32
   let timedOut: Bool
+  var outputTooLarge = false
+}
+
+/// A one-way gate that async callers can wait on with a deadline. Opening it
+/// releases current and future waiters; a waiter whose deadline passes first
+/// is released with `false`. No thread is held while waiting.
+final class AsyncLatch: @unchecked Sendable {
+  private let lock = NSLock()
+  private var isOpen = false
+  private var waiters: [UUID: CheckedContinuation<Bool, Never>] = [:]
+
+  func open() {
+    let released = lock.withLock {
+      isOpen = true
+      defer { waiters.removeAll() }
+      return Array(waiters.values)
+    }
+    released.forEach { $0.resume(returning: true) }
+  }
+
+  /// Returns whether the latch opened before `timeout` elapsed.
+  func wait(timeout: TimeInterval) async -> Bool {
+    await withCheckedContinuation { continuation in
+      let id = UUID()
+      let alreadyOpen = lock.withLock {
+        if isOpen { return true }
+        waiters[id] = continuation
+        return false
+      }
+      if alreadyOpen {
+        continuation.resume(returning: true)
+        return
+      }
+      DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + max(0, timeout)) {
+        [self] in
+        lock.withLock { waiters.removeValue(forKey: id) }?.resume(returning: false)
+      }
+    }
+  }
+}
+
+/// Reads a pipe as data arrives, using a dispatch source rather than a
+/// blocked thread. Bytes beyond `limit` are discarded, but still read, so the
+/// writer is never blocked.
+private final class PipeReader: @unchecked Sendable {
+  private let lock = NSLock()
+  private let done = AsyncLatch()
+  private var data = Data()
+  private var overflowed = false
+
+  init(_ pipe: Pipe, limit: Int) {
+    pipe.fileHandleForReading.readabilityHandler = { [self] handle in
+      let chunk = handle.availableData
+      guard !chunk.isEmpty else {
+        handle.readabilityHandler = nil
+        done.open()
+        return
+      }
+      lock.withLock {
+        guard !overflowed else { return }
+        if chunk.count <= limit - data.count {
+          data.append(chunk)
+        } else {
+          overflowed = true
+          data = Data()
+        }
+      }
+    }
+  }
+
+  /// Call after the process exits. The write end is then closed, so the
+  /// reader reaches end of file promptly; the wait is bounded regardless.
+  func finish() async -> (Data, overflowed: Bool) {
+    _ = await done.wait(timeout: 2)
+    return lock.withLock { (data, overflowed) }
+  }
 }

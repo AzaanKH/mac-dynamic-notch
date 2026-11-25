@@ -147,6 +147,7 @@ struct MusicSectionView: View {
         .buttonStyle(NotchSubtleButtonStyle())
         .help("Open \(snapshot.sourceName)")
         Spacer()
+        playerOptions(snapshot)
         Menu {
           Button("Open \(snapshot.sourceName)") {
             controller.openSource(snapshot.source)
@@ -166,6 +167,50 @@ struct MusicSectionView: View {
     }
     .padding(14)
     .dashboardSurface(cornerRadius: 16, normalOpacity: 0.045)
+  }
+
+  /// Shuffle, repeat, and favorite appear only when the player reports them
+  /// (Apple Music). An active option takes the artwork accent.
+  @ViewBuilder
+  private func playerOptions(_ snapshot: NowPlayingSnapshot) -> some View {
+    HStack(spacing: 6) {
+      if let shuffle = snapshot.shuffleEnabled {
+        optionButton(
+          symbol: "shuffle", isOn: shuffle, label: "Shuffle",
+          action: controller.toggleShuffle
+        )
+      }
+      if let mode = snapshot.repeatMode {
+        optionButton(
+          symbol: mode == .one ? "repeat.1" : "repeat", isOn: mode != .off,
+          label: "Repeat", value: mode == .one ? "One" : mode == .all ? "All" : "Off",
+          action: controller.cycleRepeat
+        )
+      }
+      if let favorite = snapshot.isFavorite {
+        optionButton(
+          symbol: favorite ? "star.fill" : "star", isOn: favorite, label: "Favorite",
+          action: controller.toggleFavorite
+        )
+      }
+    }
+  }
+
+  private func optionButton(
+    symbol: String,
+    isOn: Bool,
+    label: String,
+    value: String? = nil,
+    action: @escaping () -> Void
+  ) -> some View {
+    Button(action: action) {
+      Image(systemName: symbol)
+        .foregroundStyle(isOn ? accent : Color.white.opacity(0.7))
+    }
+    .buttonStyle(NotchCircularButtonStyle(size: 26))
+    .accessibilityLabel(label)
+    .accessibilityValue(value ?? (isOn ? "On" : "Off"))
+    .help(value.map { "\(label): \($0)" } ?? label)
   }
 
   private var noMusic: some View {
